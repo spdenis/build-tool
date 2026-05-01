@@ -29,13 +29,13 @@ public class MavenParserImpl implements MavenParser {
     @Override
     public RepositoryProject parse(Path repoDir) {
         List<Module> modules = new ArrayList<>();
+        List<Artifact> aggregatorParents = new ArrayList<>();
         try (Stream<Path> paths = Files.walk(repoDir)) {
             paths.filter(p -> p.getFileName().toString().equals("pom.xml"))
                  .sorted()
                  .forEach(pomPath -> {
                      try {
-                         Module module = parsePom(pomPath, repoDir);
-                         if (module != null) modules.add(module);
+                         parsePom(pomPath, repoDir, modules, aggregatorParents);
                      } catch (Exception e) {
                          log.warn("Skipping {}: {}", pomPath, e.getMessage());
                      }
@@ -43,29 +43,50 @@ public class MavenParserImpl implements MavenParser {
         } catch (IOException e) {
             throw new RuntimeException("Failed to scan " + repoDir, e);
         }
-        return new RepositoryProject(repoDir.getFileName().toString(), modules);
+        return new RepositoryProject(repoDir.getFileName().toString(), modules, aggregatorParents);
     }
 
-    private Module parsePom(Path pomPath, Path repoRoot) throws IOException, XmlPullParserException {
+    private void parsePom(Path pomPath, Path repoRoot,
+                          List<Module> modules, List<Artifact> aggregatorParents)
+            throws IOException, XmlPullParserException {
         Model model;
         try (FileReader fr = new FileReader(pomPath.toFile())) {
             model = reader.read(fr);
         }
 
-        // Skip aggregator POMs (packaging=pom with declared submodules)
         if ("pom".equals(model.getPackaging()) && !model.getModules().isEmpty()) {
-            return null;
+            // Aggregator POM — not a buildable module, but its <parent> establishes a
+            // cross-repo dependency that must be reflected in the build order.
+            if (model.getParent() != null) {
+                org.apache.maven.model.Parent p = model.getParent();
+                if (p.getGroupId() != null && p.getArtifactId() != null && p.getVersion() != null) {
+                    aggregatorParents.add(new Artifact(p.getGroupId(), p.getArtifactId(), p.getVersion()));
+                }
+            }
+            return;
         }
 
         String groupId = resolve(model.getGroupId(), model.getParent() != null ? model.getParent().getGroupId() : null);
         String artifactId = model.getArtifactId();
         String version = resolve(model.getVersion(), model.getParent() != null ? model.getParent().getVersion() : null);
 
-        if (groupId == null || artifactId == null) return null;
+        if (groupId == null || artifactId == null) return;
 
         Artifact artifact = new Artifact(groupId, artifactId, version != null ? version : "unknown");
 
         List<Dependency> dependencies = new ArrayList<>();
+
+        // Include <parent> as a dependency so that an external parent from another repo
+        // is reflected as a graph edge. Internal parents (aggregator roots skipped above)
+        // won't match any internal artifact and are harmlessly ignored in buildGraph.
+        if (model.getParent() != null) {
+            org.apache.maven.model.Parent p = model.getParent();
+            if (p.getGroupId() != null && p.getArtifactId() != null && p.getVersion() != null) {
+                dependencies.add(new Dependency(
+                    new Artifact(p.getGroupId(), p.getArtifactId(), p.getVersion())));
+            }
+        }
+
         for (org.apache.maven.model.Dependency dep : model.getDependencies()) {
             dependencies.add(new Dependency(
                 new Artifact(dep.getGroupId(), dep.getArtifactId(),
@@ -73,7 +94,7 @@ public class MavenParserImpl implements MavenParser {
             ));
         }
 
-        return new Module(artifact, dependencies, pomPath.getParent(), repoRoot);
+        modules.add(new Module(artifact, dependencies, pomPath.getParent(), repoRoot));
     }
 
     private String resolve(String value, String fallback) {

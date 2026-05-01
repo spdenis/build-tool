@@ -11,9 +11,16 @@ public interface GitService {
 
     void commitAll(Path repoDir, String message);
 
+    // Stages all changes and commits only if there is something to commit.
+    // Returns true if a commit was made, false if the working tree was already clean.
+    boolean commitAllIfDirty(Path repoDir, String message);
+
     void push(Path repoDir);
 
     void createTag(Path repoDir, String tagName, String message);
+
+    // Deletes the tag locally and from the remote if it exists. No-op if it doesn't exist.
+    void deleteTagIfExists(Path repoDir, String tagName);
 
     void pushTag(Path repoDir, String tagName);
 }

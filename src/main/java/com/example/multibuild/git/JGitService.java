@@ -103,6 +103,18 @@ public class JGitService implements GitService {
     }
 
     @Override
+    public boolean commitAllIfDirty(Path repoDir, String message) {
+        try (Git git = Git.open(repoDir.toFile())) {
+            git.add().addFilepattern(".").call();
+            if (git.status().call().isClean()) return false;
+            git.commit().setMessage(message).call();
+            return true;
+        } catch (GitAPIException | IOException e) {
+            throw new RuntimeException("Failed to commit in " + repoDir, e);
+        }
+    }
+
+    @Override
     public void push(Path repoDir) {
         try (Git git = Git.open(repoDir.toFile())) {
             String branch = git.getRepository().getBranch();
@@ -129,6 +141,29 @@ public class JGitService implements GitService {
             log.info("Created tag {} in {}", tagName, repoDir.getFileName());
         } catch (GitAPIException | IOException e) {
             throw new RuntimeException("Failed to create tag " + tagName + " in " + repoDir, e);
+        }
+    }
+
+    @Override
+    public void deleteTagIfExists(Path repoDir, String tagName) {
+        try (Git git = Git.open(repoDir.toFile())) {
+            boolean localExists = git.tagList().call().stream()
+                    .anyMatch(ref -> ref.getName().equals("refs/tags/" + tagName));
+            if (!localExists) return;
+
+            log.info("Tag {} already exists in {}, deleting local and remote", tagName, repoDir.getFileName());
+            git.tagDelete().setTags(tagName).call();
+
+            var push = git.push()
+                    .setRemote("origin")
+                    .setRefSpecs(new RefSpec(":refs/tags/" + tagName));
+            if (!githubToken.isBlank()) {
+                push.setCredentialsProvider(credentials());
+            }
+            push.call();
+            log.info("Deleted remote tag {} in {}", tagName, repoDir.getFileName());
+        } catch (GitAPIException | IOException e) {
+            throw new RuntimeException("Failed to delete tag " + tagName + " in " + repoDir, e);
         }
     }
 

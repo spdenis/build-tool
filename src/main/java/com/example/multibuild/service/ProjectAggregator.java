@@ -63,6 +63,18 @@ public class ProjectAggregator {
                     }
                 }
             }
+
+            // Aggregator-pom parents are not attached to any module. Add edges from all
+            // modules in this project to the parent so the repo build order is correct.
+            for (Artifact parent : project.getAggregatorParents()) {
+                Artifact internal = internalArtifacts.get(parent.key());
+                if (internal == null) continue;
+                for (Module module : project.getModules()) {
+                    if (!internal.equals(module.getArtifact())) {
+                        graph.addDependency(module.getArtifact(), internal);
+                    }
+                }
+            }
         }
 
         return graph;

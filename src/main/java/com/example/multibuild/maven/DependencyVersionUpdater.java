@@ -34,9 +34,10 @@ public class DependencyVersionUpdater {
 
     private static final Logger log = LoggerFactory.getLogger(DependencyVersionUpdater.class);
 
-    // Updates <dependency> and <dependencyManagement> versions across all pom.xml files
-    // for every in-scope artifact. Returns the repo roots that had at least one change.
-    // Versions specified via property placeholders (${prop}) are resolved through <properties>.
+    // Updates <parent>, <dependency>, and <dependencyManagement> versions across all pom.xml
+    // files for every in-scope artifact. Returns the repo roots that had at least one change.
+    // Dependency versions specified via property placeholders (${prop}) are resolved through
+    // <properties>. Parent versions are always inline — placeholders are not supported there.
     public Set<Path> update(List<Path> repoRoots, Map<String, String> versionByKey) {
         Set<Path> modifiedRepos = new LinkedHashSet<>();
         for (Path repoRoot : repoRoots) {
@@ -64,7 +65,8 @@ public class DependencyVersionUpdater {
             // the same property is referenced by more than one dependency.
             Map<String, String> updatedProps = new HashMap<>();
 
-            boolean changed = updateDepNodes(
+            boolean changed = updateParent(doc, xp, versionByKey);
+            changed |= updateDepNodes(
                     (NodeList) xp.evaluate("/project/dependencies/dependency", doc, XPathConstants.NODESET),
                     xp, versionByKey, doc, updatedProps);
             changed |= updateDepNodes(
@@ -80,6 +82,24 @@ public class DependencyVersionUpdater {
             log.error("Failed to update dependency versions in {}: {}", pomPath, e.getMessage());
             return false;
         }
+    }
+
+    private boolean updateParent(Document doc, XPath xp, Map<String, String> versionByKey) throws Exception {
+        Node gId = (Node) xp.evaluate("/project/parent/groupId", doc, XPathConstants.NODE);
+        Node aId = (Node) xp.evaluate("/project/parent/artifactId", doc, XPathConstants.NODE);
+        Node ver = (Node) xp.evaluate("/project/parent/version", doc, XPathConstants.NODE);
+        if (gId == null || aId == null || ver == null) return false;
+
+        String key = gId.getTextContent().trim() + ":" + aId.getTextContent().trim();
+        String newVersion = versionByKey.get(key);
+        if (newVersion == null) return false;
+
+        String current = ver.getTextContent().trim();
+        if (newVersion.equals(current)) return false;
+
+        log.info("  {}:{} (parent) {} -> {}", gId.getTextContent().trim(), aId.getTextContent().trim(), current, newVersion);
+        ver.setTextContent(newVersion);
+        return true;
     }
 
     private boolean updateDepNodes(NodeList nodes, XPath xp, Map<String, String> versionByKey,

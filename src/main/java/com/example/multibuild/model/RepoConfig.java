@@ -7,6 +7,7 @@ public class RepoConfig {
 
     private String url;
     private String sourceBranch;
+    private String version;
     private String teamcitySnapshotConfigId;
     private String teamcityReleaseConfigId;
 
@@ -18,6 +19,14 @@ public class RepoConfig {
 
     public String getEffectiveSourceBranch() {
         return sourceBranch != null && !sourceBranch.isBlank() ? sourceBranch : "main";
+    }
+
+    // When set, overrides the version read from pom.xml for all modules in this repo.
+    public String getVersion() { return version; }
+    public void setVersion(String version) { this.version = version; }
+
+    public boolean hasVersionOverride() {
+        return version != null && !version.isBlank();
     }
 
     public String getTeamcitySnapshotConfigId() { return teamcitySnapshotConfigId; }

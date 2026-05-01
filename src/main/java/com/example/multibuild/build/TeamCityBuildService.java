@@ -19,8 +19,11 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 @Service
@@ -47,37 +50,52 @@ public class TeamCityBuildService implements BuildService {
 
     @Override
     public void buildAll(List<List<Artifact>> layers, Map<Artifact, Module> moduleMap,
-                         Map<Path, RepoConfig> repoConfigs) {
+                         Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
+                         Map<Path, String> buildBranchByRepo) {
+        Set<Path> overallSucceeded = new LinkedHashSet<>();
+
         for (List<Artifact> layer : layers) {
-            // Trigger all builds in this layer simultaneously
             record QueuedBuild(String buildId, String configId, Artifact artifact, Module module) {}
+
+            // Trigger all non-completed builds in this layer simultaneously
             List<QueuedBuild> queued = new ArrayList<>();
             for (Artifact artifact : layer) {
                 Module module = moduleMap.get(artifact);
                 if (module == null) continue;
+                if (completedRepoNames.contains(module.getRepoRoot().getFileName().toString())) continue;
                 String configId = resolveConfigId(artifact, repoConfigs.get(module.getRepoRoot()));
-                log.info("Triggering TeamCity build config {} for {}", configId, artifact);
-                String buildId = triggerBuild(configId);
+                String branch = buildBranchByRepo.getOrDefault(module.getRepoRoot(), integrationBranch);
+                log.info("Triggering TeamCity build config {} for {} on branch/tag {}", configId, artifact, branch);
+                String buildId = triggerBuild(configId, branch);
                 log.info("Build queued: id={}", buildId);
                 queued.add(new QueuedBuild(buildId, configId, artifact, module));
             }
+            if (queued.isEmpty()) continue;
 
-            // Wait for all builds in this layer to finish; collect failures
+            // Wait for all; track per-repo success (a repo succeeds only if all its artifacts succeed)
+            Map<Path, Boolean> repoSuccess = new LinkedHashMap<>();
             List<String> failures = new ArrayList<>();
+
             for (QueuedBuild b : queued) {
                 try {
                     waitForCompletion(b.buildId(), b.artifact());
+                    repoSuccess.merge(b.module().getRepoRoot(), true, Boolean::logicalAnd);
                 } catch (RuntimeException e) {
+                    repoSuccess.put(b.module().getRepoRoot(), false);
                     failures.add("Build failed in repository: " + b.module().getRepoRoot() + "\n" +
                             "  Artifact  : " + b.artifact() + "\n" +
                             "  Config ID : " + b.configId() + "\n" +
                             "  Reason    : " + e.getMessage());
                 }
             }
+
+            repoSuccess.forEach((repo, ok) -> { if (ok) overallSucceeded.add(repo); });
+
             if (!failures.isEmpty()) {
-                throw new RuntimeException(
+                throw new BuildFailedException(
                         failures.size() + " build(s) failed in parallel layer:\n" +
-                        String.join("\n---\n", failures));
+                        String.join("\n---\n", failures),
+                        overallSucceeded);
             }
         }
     }
@@ -98,12 +116,12 @@ public class TeamCityBuildService implements BuildService {
                 .replace("{version}", artifact.getVersion());
     }
 
-    private String triggerBuild(String configId) {
+    private String triggerBuild(String configId, String branchName) {
         try {
             Map<String, Object> payload = new java.util.LinkedHashMap<>();
             payload.put("buildType", Map.of("id", configId));
-            if (!integrationBranch.isBlank()) {
-                payload.put("branchName", integrationBranch);
+            if (!branchName.isBlank()) {
+                payload.put("branchName", branchName);
             }
             String body = objectMapper.writeValueAsString(payload);
 

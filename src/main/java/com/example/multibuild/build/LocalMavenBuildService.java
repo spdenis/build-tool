@@ -13,11 +13,14 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Service
@@ -31,55 +34,74 @@ public class LocalMavenBuildService implements BuildService {
 
     @Override
     public void buildAll(List<List<Artifact>> layers, Map<Artifact, Module> moduleMap,
-                         Map<Path, RepoConfig> repoConfigs) {
+                         Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
+                         Map<Path, String> buildBranchByRepo) {
+        Set<Path> overallSucceeded = new LinkedHashSet<>();
+
         for (List<Artifact> layer : layers) {
-            LinkedHashSet<Path> repoRoots = new LinkedHashSet<>();
+            LinkedHashMap<Path, List<String>> repoArtifacts = new LinkedHashMap<>();
             for (Artifact a : layer) {
                 Module m = moduleMap.get(a);
-                if (m != null) repoRoots.add(m.getRepoRoot());
+                if (m == null) continue;
+                if (completedRepoNames.contains(m.getRepoRoot().getFileName().toString())) continue;
+                repoArtifacts.computeIfAbsent(m.getRepoRoot(), k -> new ArrayList<>())
+                             .add(a.toString());
             }
-            if (repoRoots.isEmpty()) continue;
+            if (repoArtifacts.isEmpty()) continue;
 
-            if (repoRoots.size() == 1) {
-                buildRepo(repoRoots.iterator().next(), layer, moduleMap);
+            Set<Path> layerSucceeded;
+            List<String> layerFailures;
+
+            if (repoArtifacts.size() == 1) {
+                Map.Entry<Path, List<String>> entry = repoArtifacts.entrySet().iterator().next();
+                layerSucceeded = new LinkedHashSet<>();
+                layerFailures = new ArrayList<>();
+                try {
+                    buildRepo(entry.getKey(), entry.getValue());
+                    layerSucceeded.add(entry.getKey());
+                } catch (RuntimeException e) {
+                    layerFailures.add(e.getMessage());
+                }
             } else {
-                log.info("Building {} repos in parallel: {}", repoRoots.size(),
-                        repoRoots.stream().map(p -> p.getFileName().toString()).collect(Collectors.joining(", ")));
-                List<CompletableFuture<Void>> futures = repoRoots.stream()
-                        .map(repoRoot -> CompletableFuture.runAsync(
-                                () -> buildRepo(repoRoot, layer, moduleMap)))
+                log.info("Building {} repos in parallel: {}", repoArtifacts.size(),
+                        repoArtifacts.keySet().stream()
+                                .map(p -> p.getFileName().toString())
+                                .collect(Collectors.joining(", ")));
+
+                Set<Path> concurrentSucceeded = ConcurrentHashMap.newKeySet();
+                List<String> concurrentFailures = new ArrayList<>();
+
+                List<CompletableFuture<Void>> futures = repoArtifacts.entrySet().stream()
+                        .map(e -> CompletableFuture.runAsync(() -> {
+                            buildRepo(e.getKey(), e.getValue());
+                            concurrentSucceeded.add(e.getKey());
+                        }))
                         .toList();
 
-                List<Throwable> failures = new ArrayList<>();
                 for (CompletableFuture<Void> f : futures) {
                     try {
                         f.join();
                     } catch (CompletionException e) {
-                        failures.add(e.getCause());
+                        synchronized (concurrentFailures) {
+                            concurrentFailures.add(e.getCause().getMessage());
+                        }
                     }
                 }
-                if (!failures.isEmpty()) {
-                    String messages = failures.stream()
-                            .map(Throwable::getMessage)
-                            .collect(Collectors.joining("\n---\n"));
-                    RuntimeException combined = new RuntimeException(
-                            failures.size() + " repo(s) failed in parallel build layer:\n" + messages);
-                    failures.subList(1, failures.size()).forEach(t -> combined.addSuppressed(t));
-                    throw combined;
-                }
+                layerSucceeded = new LinkedHashSet<>(concurrentSucceeded);
+                layerFailures = concurrentFailures;
+            }
+
+            overallSucceeded.addAll(layerSucceeded);
+
+            if (!layerFailures.isEmpty()) {
+                String msg = layerFailures.size() + " repo(s) failed:\n" +
+                        String.join("\n---\n", layerFailures);
+                throw new BuildFailedException(msg, overallSucceeded);
             }
         }
     }
 
-    private void buildRepo(Path repoRoot, List<Artifact> layer, Map<Artifact, Module> moduleMap) {
-        List<String> artifactIds = layer.stream()
-                .filter(a -> {
-                    Module m = moduleMap.get(a);
-                    return m != null && repoRoot.equals(m.getRepoRoot());
-                })
-                .map(Artifact::toString)
-                .collect(Collectors.toList());
-
+    private void buildRepo(Path repoRoot, List<String> artifactIds) {
         log.info("Building {} from root pom (artifacts: {})", repoRoot.getFileName(), artifactIds);
         try {
             runMaven(repoRoot);
