@@ -50,21 +50,23 @@ public class ReleaseService {
     public void execute(List<List<Artifact>> buildLayers, Map<Artifact, Module> moduleMap,
                         List<Path> repoRoots, Map<Path, RepoConfig> repoConfigs,
                         ResumeState resumeState) {
-        List<Artifact> buildOrder = buildLayers.stream().flatMap(List::stream).toList();
 
-        // --- Phase 1: compute release versions, tag, push ---
+        // ── Release Phase 1: pin versions, tag, push ────────────────
+        log.info("── Release Phase 1: pin versions, tag & push ({} repo(s)) ──", repoRoots.size());
+        long phase1Start = System.currentTimeMillis();
+
         Map<String, String> releaseVersionByKey = new LinkedHashMap<>();
         Map<Path, String> releaseVersionByRepo = new LinkedHashMap<>();
 
         for (Path repoRoot : repoRoots) {
             String current = pomVersionUpdater.getRootVersion(repoRoot);
             if (current == null) {
-                log.warn("Could not determine version for {}, skipping", repoRoot.getFileName());
+                log.warn("  [{}] Could not determine version, skipping", repoRoot.getFileName());
                 continue;
             }
             String release = baseVersion(current);
             releaseVersionByRepo.put(repoRoot, release);
-            log.info("Release version for {}: {}", repoRoot.getFileName(), release);
+            log.info("  [{}] {} → {}", repoRoot.getFileName(), current, release);
         }
 
         for (Map.Entry<Artifact, Module> entry : moduleMap.entrySet()) {
@@ -73,37 +75,41 @@ public class ReleaseService {
         }
 
         if (!resumeState.isReleasePhase1Complete()) {
+            log.info("  Setting release versions in pom.xml files...");
             for (Path repoRoot : repoRoots) {
                 String release = releaseVersionByRepo.get(repoRoot);
                 if (release == null) continue;
                 pomVersionUpdater.setVersions(repoRoot, release);
             }
+
+            log.info("  Updating cross-repo dependency versions...");
             dependencyVersionUpdater.update(repoRoots, releaseVersionByKey);
 
             for (Path repoRoot : repoRoots) {
                 String release = releaseVersionByRepo.get(repoRoot);
                 if (release == null) continue;
-                String tagName = "v" + release;
+                String tagName = release;
                 gitService.deleteTagIfExists(repoRoot, tagName);
-                log.info("Tagging {} as {}", repoRoot.getFileName(), tagName);
+                log.info("  [{}] Committing, tagging {}", repoRoot.getFileName(), tagName);
                 gitService.commitAll(repoRoot, "chore: release " + release);
                 gitService.createTag(repoRoot, tagName, "Release " + release);
                 if (dryMode) {
-                    log.info("Dry mode — skipping push/pushTag for {}", repoRoot.getFileName());
+                    log.info("  [{}] Dry mode — skipping push/pushTag", repoRoot.getFileName());
                 } else {
                     gitService.push(repoRoot);
                     gitService.pushTag(repoRoot, tagName);
+                    log.info("  [{}] Pushed branch and tag {}", repoRoot.getFileName(), tagName);
                 }
             }
             resumeState.setReleasePhase1Complete(true);
+            log.info("── Release Phase 1 complete in {} ──────────────────────", elapsed(phase1Start));
         } else {
-            log.info("Skipping release Phase 1 — already completed in previous run");
-            // Re-derive release versions from pom files (they were set and pushed in Phase 1)
+            log.info("  Skipping — already completed in a previous run, re-deriving versions from pom files");
             for (Path repoRoot : repoRoots) {
                 String v = pomVersionUpdater.getRootVersion(repoRoot);
                 if (v != null) {
                     releaseVersionByRepo.put(repoRoot, v);
-                    log.info("Resumed release version for {}: {}", repoRoot.getFileName(), v);
+                    log.info("  [{}] Resumed at version {}", repoRoot.getFileName(), v);
                 }
             }
             releaseVersionByKey.clear();
@@ -113,13 +119,16 @@ public class ReleaseService {
             }
         }
 
-        // --- Phase 2: build each layer, then bump to next dev SNAPSHOT ---
-        Map<Path, String> tagByRepo = new LinkedHashMap<>();
-        releaseVersionByRepo.forEach((repo, ver) -> tagByRepo.put(repo, "v" + ver));
+        // ── Release Phase 2: build layers, bump to next SNAPSHOT ────
+        log.info("── Release Phase 2: build & bump ({} layer(s)) ──────────", buildLayers.size());
+        long phase2Start = System.currentTimeMillis();
 
+        Map<Path, String> tagByRepo = new LinkedHashMap<>(releaseVersionByRepo);
         Map<String, String> currentVersionByKey = new HashMap<>(releaseVersionByKey);
+        int layerNum = 0;
 
         for (List<Artifact> layer : buildLayers) {
+            layerNum++;
             LinkedHashSet<Path> layerRepos = new LinkedHashSet<>();
             for (Artifact a : layer) {
                 Module m = moduleMap.get(a);
@@ -128,33 +137,40 @@ public class ReleaseService {
 
             boolean allSkipped = layerRepos.stream().allMatch(resumeState::isCompleted);
             if (allSkipped) {
-                log.info("Skipping layer — all {} repo(s) already completed", layerRepos.size());
+                log.info("  Layer {}/{}: all {} repo(s) already completed — skipping",
+                        layerNum, buildLayers.size(), layerRepos.size());
                 continue;
             }
 
-            log.info("Building release layer with {} repo(s): {}", layerRepos.size(),
-                    layerRepos.stream().map(p -> p.getFileName().toString()).collect(Collectors.joining(", ")));
+            String repoNames = layerRepos.stream()
+                    .map(p -> p.getFileName().toString())
+                    .collect(Collectors.joining(", "));
+            log.info("  Layer {}/{}: building {} repo(s): {}",
+                    layerNum, buildLayers.size(), layerRepos.size(), repoNames);
 
-            // Build; catch partial failures so we can bump the repos that did succeed
             Set<Path> newlyBuilt;
             BuildFailedException buildError = null;
+            long layerStart = System.currentTimeMillis();
             try {
                 buildService.buildAll(List.of(layer), moduleMap, repoConfigs,
                         resumeState.getCompletedRepoNames(), tagByRepo);
                 newlyBuilt = layerRepos.stream()
                         .filter(r -> !resumeState.isCompleted(r))
                         .collect(Collectors.toCollection(LinkedHashSet::new));
+                log.info("  Layer {}/{}: all builds succeeded in {}",
+                        layerNum, buildLayers.size(), elapsed(layerStart));
             } catch (BuildFailedException e) {
                 newlyBuilt = e.getSucceeded();
                 buildError = e;
+                log.warn("  Layer {}/{}: {} succeeded, continuing with version bump before re-throwing",
+                        layerNum, buildLayers.size(), newlyBuilt.size());
             }
 
-            // Bump version for every repo that was newly built (even if others in the layer failed)
             for (Path repoRoot : newlyBuilt) {
                 String release = releaseVersionByRepo.get(repoRoot);
                 if (release == null) continue;
                 String nextSnapshot = incrementPatch(release) + "-SNAPSHOT";
-                log.info("Bumping {} to {}", repoRoot.getFileName(), nextSnapshot);
+                log.info("  [{}] Bumping {} → {}", repoRoot.getFileName(), release, nextSnapshot);
 
                 pomVersionUpdater.setVersions(repoRoot, nextSnapshot);
 
@@ -168,16 +184,18 @@ public class ReleaseService {
 
                 gitService.commitAll(repoRoot, "chore: prepare next development version " + nextSnapshot);
                 if (dryMode) {
-                    log.info("Dry mode — skipping push for {}", repoRoot.getFileName());
+                    log.info("  [{}] Dry mode — skipping push", repoRoot.getFileName());
                 } else {
                     gitService.push(repoRoot);
+                    log.info("  [{}] Pushed next dev version {}", repoRoot.getFileName(), nextSnapshot);
                 }
-                // Only mark completed after the full cycle (build + bump + push) succeeds
                 resumeState.markCompleted(repoRoot);
             }
 
             if (buildError != null) throw buildError;
         }
+
+        log.info("── Release Phase 2 complete in {} ──────────────────────", elapsed(phase2Start));
     }
 
     private String baseVersion(String version) {
@@ -196,5 +214,10 @@ public class ReleaseService {
             return version + ".1";
         }
         return String.join(".", parts);
+    }
+
+    private static String elapsed(long startMs) {
+        long s = (System.currentTimeMillis() - startMs) / 1000;
+        return String.format("%d:%02d", s / 60, s % 60);
     }
 }

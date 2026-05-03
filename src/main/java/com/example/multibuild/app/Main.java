@@ -6,6 +6,7 @@ import com.example.multibuild.git.GitService;
 import com.example.multibuild.graph.DependencyGraph;
 import com.example.multibuild.maven.PomVersionUpdater;
 import com.example.multibuild.model.Artifact;
+import com.example.multibuild.model.BuildMode;
 import com.example.multibuild.model.Module;
 import com.example.multibuild.model.RepoConfig;
 import com.example.multibuild.model.RepositoryProject;
@@ -47,8 +48,8 @@ public class Main implements CommandLineRunner {
     @Value("${build.enabled:false}")
     private boolean buildEnabled;
 
-    @Value("${build.mode:snapshot}")
-    private String buildMode;
+    @Value("${build.mode:SNAPSHOT}")
+    private BuildMode buildMode;
 
     @Value("${build.resume.state.file:}")
     private String resumeStateFile;
@@ -93,6 +94,12 @@ public class Main implements CommandLineRunner {
         List<RepoConfig> repoEntries = objectMapper.readValue(
                 Paths.get(args[0]).toFile(), new TypeReference<List<RepoConfig>>() {});
 
+        log.info("══════════════════════════════════════════════════════");
+        log.info("  MultiBuild  mode={}  repos={}  build={}  dryMode={}",
+                buildMode, repoEntries.size(),
+                buildEnabled ? buildMode : "disabled", dryMode);
+        log.info("══════════════════════════════════════════════════════");
+
         Path workDir = Paths.get(cloneDir);
         Files.createDirectories(workDir);
 
@@ -102,11 +109,15 @@ public class Main implements CommandLineRunner {
 
         ResumeState resumeState = loadResumeState(stateFile);
 
+        // ── Phase: clone & branch ──────────────────────────────────
+        log.info("── Phase 1/3: clone & branch ─────────────────────────");
         List<Path> clonedPaths = new ArrayList<>();
         Map<Path, RepoConfig> repoConfigByPath = new LinkedHashMap<>();
-        for (RepoConfig entry : repoEntries) {
+        for (int i = 0; i < repoEntries.size(); i++) {
+            RepoConfig entry = repoEntries.get(i);
             String url = entry.getUrl();
             String repoName = url.substring(url.lastIndexOf('/') + 1).replace(".git", "");
+            log.info("  [{}/{}] {}", i + 1, repoEntries.size(), repoName);
             Path cloned = gitService.cloneRepo(url, workDir.resolve(repoName));
             branchService.apply(cloned, entry.getEffectiveSourceBranch());
             if (entry.hasVersionOverride()) {
@@ -116,10 +127,7 @@ public class Main implements CommandLineRunner {
             repoConfigByPath.put(cloned, entry);
         }
 
-        // Validate/fix versions before parsing pom.xml files so that moduleMap
-        // and cross-repo dependency updates see the correct feature-branch versions.
-        // Repos with an explicit version override are excluded — the override IS the version.
-        if (buildEnabled && !"release".equalsIgnoreCase(buildMode)) {
+        if (buildEnabled && buildMode != BuildMode.RELEASE) {
             List<Path> pathsToValidate = clonedPaths.stream()
                     .filter(p -> !repoConfigByPath.get(p).hasVersionOverride())
                     .toList();
@@ -131,18 +139,35 @@ public class Main implements CommandLineRunner {
             }
         }
 
+        // ── Phase: parse & graph ───────────────────────────────────
+        log.info("── Phase 2/3: parse pom.xml & resolve dependency graph ");
         List<RepositoryProject> projects = aggregator.aggregate(clonedPaths);
         DependencyGraph graph = aggregator.buildGraph(projects);
         List<List<Artifact>> buildLayers = graph.topologicalLayers();
         List<Artifact> buildOrder = buildLayers.stream().flatMap(List::stream).toList();
 
+        log.info("  {} artifact(s) across {} repo(s) in {} layer(s):",
+                buildOrder.size(), clonedPaths.size(), buildLayers.size());
+        for (int i = 0; i < buildLayers.size(); i++) {
+            List<Artifact> layer = buildLayers.get(i);
+            String repos = layer.stream()
+                    .map(a -> { Module m = projects.stream().flatMap(p -> p.getModules().stream())
+                            .filter(mod -> mod.getArtifact().equals(a)).findFirst().orElse(null);
+                        return m != null ? m.getRepoRoot().getFileName().toString() : a.getArtifactId(); })
+                    .distinct().collect(Collectors.joining(", "));
+            log.info("    Layer {}/{}: {} artifact(s) — {}", i + 1, buildLayers.size(), layer.size(), repos);
+        }
+
         Map<Artifact, Module> moduleMap = projects.stream()
                 .flatMap(p -> p.getModules().stream())
                 .collect(Collectors.toMap(Module::getArtifact, m -> m));
 
+        // ── Phase: build ───────────────────────────────────────────
         if (buildEnabled) {
+            log.info("── Phase 3/3: build ({}) ─────────────────────────────", buildMode);
+            long buildStart = System.currentTimeMillis();
             try {
-                if ("release".equalsIgnoreCase(buildMode)) {
+                if (buildMode == BuildMode.RELEASE) {
                     releaseService.execute(buildLayers, moduleMap, clonedPaths, repoConfigByPath, resumeState);
                 } else {
                     dependencyVersionService.apply(moduleMap, clonedPaths);
@@ -154,8 +179,8 @@ public class Main implements CommandLineRunner {
                         throw e;
                     }
                 }
-                // Success — remove stale state file if present
                 Files.deleteIfExists(stateFile);
+                log.info("══ Build complete in {} ══════════════════════════════", elapsed(buildStart));
             } catch (RuntimeException e) {
                 saveResumeState(resumeState, stateFile);
                 System.err.println("\n[BUILD FAILED]\n" + e.getMessage());
@@ -187,12 +212,12 @@ public class Main implements CommandLineRunner {
     }
 
     private void applyVersionOverride(Path repoDir, String version) {
-        log.info("Applying version override {} in {}", version, repoDir.getFileName());
+        log.info("    Applying version override {} in {}", version, repoDir.getFileName());
         pomVersionUpdater.setVersions(repoDir, version);
         boolean committed = gitService.commitAllIfDirty(repoDir, "chore: set version to " + version);
         if (committed) {
             if (dryMode) {
-                log.info("Dry mode — skipping push for {}", repoDir.getFileName());
+                log.info("    Dry mode — skipping push for {}", repoDir.getFileName());
             } else {
                 gitService.push(repoDir);
             }
@@ -203,11 +228,14 @@ public class Main implements CommandLineRunner {
         if (Files.exists(stateFile)) {
             try {
                 ResumeState state = objectMapper.readValue(stateFile.toFile(), ResumeState.class);
-                System.out.println("Resuming from state file: " + stateFile.toAbsolutePath());
-                System.out.println("Already completed repos: " + state.getCompletedRepoNames());
+                log.info("Resuming from state file: {}", stateFile.toAbsolutePath());
+                log.info("  Already completed: {}", state.getCompletedRepoNames());
+                if (state.isReleasePhase1Complete()) {
+                    log.info("  Release phase 1 already complete");
+                }
                 return state;
             } catch (IOException e) {
-                System.err.println("Warning: could not read resume state from " + stateFile + ": " + e.getMessage());
+                log.warn("Could not read resume state from {}: {}", stateFile, e.getMessage());
             }
         }
         return new ResumeState();
@@ -216,9 +244,14 @@ public class Main implements CommandLineRunner {
     private void saveResumeState(ResumeState state, Path stateFile) {
         try {
             objectMapper.writerWithDefaultPrettyPrinter().writeValue(stateFile.toFile(), state);
-            System.err.println("Resume state saved to: " + stateFile.toAbsolutePath());
+            log.info("Resume state saved to: {}", stateFile.toAbsolutePath());
         } catch (IOException e) {
-            System.err.println("Warning: could not save resume state to " + stateFile + ": " + e.getMessage());
+            log.warn("Could not save resume state to {}: {}", stateFile, e.getMessage());
         }
+    }
+
+    static String elapsed(long startMs) {
+        long s = (System.currentTimeMillis() - startMs) / 1000;
+        return String.format("%d:%02d", s / 60, s % 60);
     }
 }

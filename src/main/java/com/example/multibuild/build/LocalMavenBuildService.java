@@ -5,8 +5,8 @@ import com.example.multibuild.model.Module;
 import com.example.multibuild.model.RepoConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -24,7 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Service
-@ConditionalOnProperty(name = "build.service", havingValue = "local", matchIfMissing = true)
+@Qualifier("local")
 public class LocalMavenBuildService implements BuildService {
 
     private static final Logger log = LoggerFactory.getLogger(LocalMavenBuildService.class);
@@ -37,8 +37,10 @@ public class LocalMavenBuildService implements BuildService {
                          Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
                          Map<Path, String> buildBranchByRepo) {
         Set<Path> overallSucceeded = new LinkedHashSet<>();
+        int layerNum = 0;
 
         for (List<Artifact> layer : layers) {
+            layerNum++;
             LinkedHashMap<Path, List<String>> repoArtifacts = new LinkedHashMap<>();
             for (Artifact a : layer) {
                 Module m = moduleMap.get(a);
@@ -49,8 +51,15 @@ public class LocalMavenBuildService implements BuildService {
             }
             if (repoArtifacts.isEmpty()) continue;
 
+            String repoNames = repoArtifacts.keySet().stream()
+                    .map(p -> p.getFileName().toString())
+                    .collect(Collectors.joining(", "));
+            log.info("  [LOCAL] Layer {}/{}: {} repo(s): {}", layerNum, layers.size(), repoArtifacts.size(), repoNames);
+
             Set<Path> layerSucceeded;
             List<String> layerFailures;
+
+            long layerStart = System.currentTimeMillis();
 
             if (repoArtifacts.size() == 1) {
                 Map.Entry<Path, List<String>> entry = repoArtifacts.entrySet().iterator().next();
@@ -63,10 +72,7 @@ public class LocalMavenBuildService implements BuildService {
                     layerFailures.add(e.getMessage());
                 }
             } else {
-                log.info("Building {} repos in parallel: {}", repoArtifacts.size(),
-                        repoArtifacts.keySet().stream()
-                                .map(p -> p.getFileName().toString())
-                                .collect(Collectors.joining(", ")));
+                log.info("  [LOCAL] Running {} repo(s) in parallel", repoArtifacts.size());
 
                 Set<Path> concurrentSucceeded = ConcurrentHashMap.newKeySet();
                 List<String> concurrentFailures = new ArrayList<>();
@@ -98,11 +104,17 @@ public class LocalMavenBuildService implements BuildService {
                         String.join("\n---\n", layerFailures);
                 throw new BuildFailedException(msg, overallSucceeded);
             }
+            log.info("  [LOCAL] Layer {}/{}: done in {}", layerNum, layers.size(), elapsed(layerStart));
         }
     }
 
+    private static String elapsed(long startMs) {
+        long s = (System.currentTimeMillis() - startMs) / 1000;
+        return String.format("%d:%02d", s / 60, s % 60);
+    }
+
     private void buildRepo(Path repoRoot, List<String> artifactIds) {
-        log.info("Building {} from root pom (artifacts: {})", repoRoot.getFileName(), artifactIds);
+        log.info("  [LOCAL] Building {} ({} artifact(s))", repoRoot.getFileName(), artifactIds.size());
         try {
             runMaven(repoRoot);
         } catch (RuntimeException e) {

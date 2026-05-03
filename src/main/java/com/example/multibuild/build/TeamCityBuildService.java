@@ -1,14 +1,15 @@
 package com.example.multibuild.build;
 
 import com.example.multibuild.model.Artifact;
+import com.example.multibuild.model.BuildMode;
 import com.example.multibuild.model.Module;
 import com.example.multibuild.model.RepoConfig;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.stereotype.Service;
 
@@ -27,14 +28,14 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 @Service
-@ConditionalOnProperty(name = "build.service", havingValue = "teamcity")
+@Qualifier("teamcity")
 @EnableConfigurationProperties(TeamCityProperties.class)
 public class TeamCityBuildService implements BuildService {
 
     private static final Logger log = LoggerFactory.getLogger(TeamCityBuildService.class);
 
-    @Value("${build.mode:snapshot}")
-    private String buildMode;
+    @Value("${build.mode:SNAPSHOT}")
+    private BuildMode buildMode;
 
     @Value("${integration.branch:}")
     private String integrationBranch;
@@ -102,7 +103,7 @@ public class TeamCityBuildService implements BuildService {
 
     private String resolveConfigId(Artifact artifact, RepoConfig repoConfig) {
         if (repoConfig != null) {
-            boolean release = "release".equalsIgnoreCase(buildMode);
+            boolean release = buildMode == BuildMode.RELEASE;
             String explicit = release
                     ? repoConfig.getTeamcityReleaseConfigId()
                     : repoConfig.getTeamcitySnapshotConfigId();
@@ -117,6 +118,9 @@ public class TeamCityBuildService implements BuildService {
     }
 
     private String triggerBuild(String configId, String branchName) {
+        if (props.getUrl().isBlank()) {
+            throw new RuntimeException("TeamCity is not configured: set teamcity.url and teamcity.token");
+        }
         try {
             Map<String, Object> payload = new java.util.LinkedHashMap<>();
             payload.put("buildType", Map.of("id", configId));
@@ -137,8 +141,10 @@ public class TeamCityBuildService implements BuildService {
     }
 
     private void waitForCompletion(String buildId, Artifact artifact) {
-        long deadline = System.currentTimeMillis() + props.getTimeoutMs();
+        long startMs = System.currentTimeMillis();
+        long deadline = startMs + props.getTimeoutMs();
         String url = props.getUrl() + "/app/rest/builds/id:" + buildId + "?fields=state,status";
+        String lastState = "";
 
         while (System.currentTimeMillis() < deadline) {
             try {
@@ -152,14 +158,21 @@ public class TeamCityBuildService implements BuildService {
                 JsonNode json = objectMapper.readTree(response.body());
                 String state = json.path("state").asText();
                 String status = json.path("status").asText();
-                log.debug("Build {}: state={} status={}", buildId, state, status);
+
+                if (!state.equals(lastState)) {
+                    log.info("  [TC] Build {} ({}) → state={} status={} elapsed={}",
+                            buildId, artifact.getArtifactId(), state, status, elapsed(startMs));
+                    lastState = state;
+                } else {
+                    log.debug("Build {}: state={} status={} elapsed={}", buildId, state, status, elapsed(startMs));
+                }
 
                 if ("finished".equalsIgnoreCase(state)) {
                     if (!"SUCCESS".equalsIgnoreCase(status)) {
                         throw new RuntimeException(
                                 "TeamCity build " + buildId + " for " + artifact + " finished with status: " + status);
                     }
-                    log.info("Build {} for {} succeeded", buildId, artifact);
+                    log.info("  [TC] Build {} for {} succeeded in {}", buildId, artifact.getArtifactId(), elapsed(startMs));
                     return;
                 }
             } catch (InterruptedException e) {
@@ -170,6 +183,11 @@ public class TeamCityBuildService implements BuildService {
             }
         }
         throw new RuntimeException("Timeout waiting for TeamCity build " + buildId + " (" + artifact + ")");
+    }
+
+    private static String elapsed(long startMs) {
+        long s = (System.currentTimeMillis() - startMs) / 1000;
+        return String.format("%d:%02d", s / 60, s % 60);
     }
 
     private HttpRequest jsonRequest(String method, String url, String body) {
