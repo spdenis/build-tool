@@ -18,8 +18,8 @@ public class RepoConfig {
     public String getSourceBranch() { return sourceBranch; }
     public void setSourceBranch(String sourceBranch) { this.sourceBranch = sourceBranch; }
 
-    public String getEffectiveSourceBranch() {
-        return sourceBranch != null && !sourceBranch.isBlank() ? sourceBranch : "main";
+    public String getEffectiveSourceBranch(String defaultBranch) {
+        return sourceBranch != null && !sourceBranch.isBlank() ? sourceBranch : defaultBranch;
     }
 
     // When set, overrides the version read from pom.xml for all modules in this repo.

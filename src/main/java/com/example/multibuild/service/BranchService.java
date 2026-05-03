@@ -35,8 +35,8 @@ public class BranchService {
         this.versionUpdater = versionUpdater;
     }
 
-    public boolean isEnabled() {
-        return !integrationBranch.isBlank();
+    public String getIntegrationBranch() {
+        return integrationBranch;
     }
 
     // Enforces that every repo's root version ends with -<branch>-SNAPSHOT.
@@ -44,8 +44,6 @@ public class BranchService {
     //   "fail" — collect all violations and throw (default)
     //   "fix"  — correct the version, commit, and push
     public void validateVersions(List<Path> repoDirs) {
-        if (!isEnabled()) return;
-
         boolean fixMode = "fix".equalsIgnoreCase(versionMismatchMode);
         String requiredSuffix = "-" + integrationBranch + "-SNAPSHOT";
         List<String> violations = new ArrayList<>();
@@ -86,8 +84,6 @@ public class BranchService {
     // If the branch is newly created, bumps all pom.xml versions to <branch>-SNAPSHOT and commits.
     // sourceBranch is the branch used as the start point when the integration branch doesn't exist yet.
     public void apply(Path repoDir, String sourceBranch) {
-        if (!isEnabled()) return;
-
         boolean created = gitService.checkoutOrCreateBranch(repoDir, integrationBranch, sourceBranch);
         if (created) {
             log.info("Created branch {} in {}, updating pom versions", integrationBranch, repoDir.getFileName());

@@ -9,6 +9,8 @@ public interface GitService {
     // sourceBranch is used as the start point when creating a new branch.
     boolean checkoutOrCreateBranch(Path repoDir, String branchName, String sourceBranch);
 
+    boolean hasRemoteBranch(Path repoDir, String branchName);
+
     void commitAll(Path repoDir, String message);
 
     // Stages all changes and commits only if there is something to commit.

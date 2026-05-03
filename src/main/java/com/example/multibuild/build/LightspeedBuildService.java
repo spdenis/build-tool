@@ -108,7 +108,7 @@ public class LightspeedBuildService implements BuildService {
             List<CompletableFuture<Void>> futures = repoArtifacts.entrySet().stream()
                     .map(e -> CompletableFuture.runAsync(() -> {
                         try {
-                            buildRepo(e.getKey(), e.getValue(), release);
+                            buildRepo(e.getKey(), e.getValue(), release, buildBranchByRepo);
                             layerSucceeded.add(e.getKey());
                         } catch (RuntimeException ex) {
                             layerFailures.add(
@@ -132,16 +132,25 @@ public class LightspeedBuildService implements BuildService {
         }
     }
 
-    private void buildRepo(Path repoRoot, List<Artifact> artifacts, boolean release) {
+    private void buildRepo(Path repoRoot, List<Artifact> artifacts, boolean release,
+                           Map<Path, String> buildBranchByRepo) {
         if (dryMode) {
             log.info("Dry mode — skipping Lightspeed build/poll for {}", repoRoot.getFileName());
             return;
         }
 
         if (release) {
-            log.info("Polling Maven releases for {} artifact(s) in {}",
-                    artifacts.size(), repoRoot.getFileName());
-            pollUntilReleasePublished(repoRoot, artifacts);
+            String releaseVersion = buildBranchByRepo.get(repoRoot);
+            if (releaseVersion == null) {
+                throw new RuntimeException(
+                        "No release version found for " + repoRoot.getFileName() + " in buildBranchByRepo");
+            }
+            List<Artifact> releaseArtifacts = artifacts.stream()
+                    .map(a -> new Artifact(a.getGroupId(), a.getArtifactId(), releaseVersion))
+                    .toList();
+            log.info("Polling Maven releases for {} artifact(s) in {} (version {})",
+                    releaseArtifacts.size(), repoRoot.getFileName(), releaseVersion);
+            pollUntilReleasePublished(repoRoot, releaseArtifacts);
         } else {
             log.info("Triggering and polling Maven snapshots for {} artifact(s) in {}",
                     artifacts.size(), repoRoot.getFileName());

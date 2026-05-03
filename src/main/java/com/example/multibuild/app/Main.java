@@ -57,6 +57,9 @@ public class Main implements CommandLineRunner {
     @Value("${dry.mode:false}")
     private boolean dryMode;
 
+    @Value("${default.source.branch:main}")
+    private String defaultSourceBranch;
+
     private final GitService gitService;
     private final BranchService branchService;
     private final PomVersionUpdater pomVersionUpdater;
@@ -91,6 +94,11 @@ public class Main implements CommandLineRunner {
             System.exit(1);
         }
 
+        if (branchService.getIntegrationBranch().isBlank()) {
+            System.err.println("[ERROR] integration.branch is required but not set.");
+            System.exit(1);
+        }
+
         List<RepoConfig> repoEntries = objectMapper.readValue(
                 Paths.get(args[0]).toFile(), new TypeReference<List<RepoConfig>>() {});
 
@@ -119,7 +127,7 @@ public class Main implements CommandLineRunner {
             String repoName = url.substring(url.lastIndexOf('/') + 1).replace(".git", "");
             log.info("  [{}/{}] {}", i + 1, repoEntries.size(), repoName);
             Path cloned = gitService.cloneRepo(url, workDir.resolve(repoName));
-            branchService.apply(cloned, entry.getEffectiveSourceBranch());
+            branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)));
             if (entry.hasVersionOverride()) {
                 applyVersionOverride(cloned, entry.getVersion());
             }
@@ -209,6 +217,13 @@ public class Main implements CommandLineRunner {
         }
 
         System.out.println(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(result));
+    }
+
+    private String resolveSourceBranch(Path repoDir, String requested) {
+        if (!"main".equals(requested)) return requested;
+        if (gitService.hasRemoteBranch(repoDir, "main")) return "main";
+        log.info("    Branch 'main' not found in {}, falling back to 'master'", repoDir.getFileName());
+        return "master";
     }
 
     private void applyVersionOverride(Path repoDir, String version) {
