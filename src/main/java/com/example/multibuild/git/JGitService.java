@@ -19,17 +19,27 @@ import org.eclipse.jgit.transport.sshd.SshdSessionFactoryBuilder;
 import org.eclipse.jgit.util.FS;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.FileSystemUtils;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.Authenticator;
 import java.net.InetSocketAddress;
+import java.net.PasswordAuthentication;
+import java.net.Proxy;
+import java.net.ProxySelector;
+import java.net.SocketAddress;
+import java.net.URI;
 import java.nio.file.Path;
 import java.security.PublicKey;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @Service
 public class JGitService implements GitService {
@@ -48,7 +58,94 @@ public class JGitService implements GitService {
     @Value("${ssh.strict.host.key.checking:true}")
     private boolean sshStrictHostKeyChecking;
 
+    @Value("${git.proxy.host:}")
+    private String proxyHost;
+
+    @Value("${git.proxy.port:8080}")
+    private int proxyPort;
+
+    @Value("${git.proxy.username:}")
+    private String proxyUsername;
+
+    @Value("${git.proxy.password:}")
+    private String proxyPassword;
+
+    // Comma-separated domains that should use the proxy. Empty = all HTTPS.
+    @Value("${git.proxy.domains:}")
+    private String proxyDomains;
+
+    // Comma-separated domains that bypass the proxy.
+    @Value("${git.proxy.bypass:}")
+    private String proxyBypass;
+
     private volatile SshdSessionFactory sshdFactory;
+
+    @PostConstruct
+    private void configureProxy() {
+        if (proxyHost.isBlank()) return;
+
+        Proxy proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyHost, proxyPort));
+        Set<String> includeDomains = parseDomainList(proxyDomains);
+        Set<String> bypassDomainSet = parseDomainList(proxyBypass);
+        ProxySelector original = ProxySelector.getDefault();
+
+        ProxySelector.setDefault(new ProxySelector() {
+            @Override
+            public List<Proxy> select(URI uri) {
+                String scheme = uri.getScheme();
+                if (!"https".equalsIgnoreCase(scheme) && !"http".equalsIgnoreCase(scheme)) {
+                    return original.select(uri);
+                }
+                String host = uri.getHost();
+                if (host == null) return original.select(uri);
+                if (!bypassDomainSet.isEmpty() && matchesDomain(host, bypassDomainSet)) {
+                    return List.of(Proxy.NO_PROXY);
+                }
+                if (!includeDomains.isEmpty() && !matchesDomain(host, includeDomains)) {
+                    return List.of(Proxy.NO_PROXY);
+                }
+                return List.of(proxy);
+            }
+
+            @Override
+            public void connectFailed(URI uri, SocketAddress sa, IOException ioe) {
+                original.connectFailed(uri, sa, ioe);
+            }
+        });
+
+        if (!proxyUsername.isBlank()) {
+            String user = proxyUsername;
+            char[] pass = proxyPassword.toCharArray();
+            Authenticator.setDefault(new Authenticator() {
+                @Override
+                protected PasswordAuthentication getPasswordAuthentication() {
+                    if (getRequestorType() == RequestorType.PROXY) {
+                        return new PasswordAuthentication(user, pass);
+                    }
+                    return null;
+                }
+            });
+        }
+
+        log.info("Git HTTP proxy: {}:{} (domains={}, bypass={})",
+                proxyHost, proxyPort,
+                includeDomains.isEmpty() ? "all" : includeDomains,
+                bypassDomainSet.isEmpty() ? "none" : bypassDomainSet);
+    }
+
+    private static Set<String> parseDomainList(String csv) {
+        if (csv == null || csv.isBlank()) return Set.of();
+        return Arrays.stream(csv.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isBlank())
+                .map(String::toLowerCase)
+                .collect(Collectors.toUnmodifiableSet());
+    }
+
+    private static boolean matchesDomain(String host, Set<String> patterns) {
+        String lower = host.toLowerCase();
+        return patterns.stream().anyMatch(p -> lower.equals(p) || lower.endsWith("." + p));
+    }
 
     @Override
     public Path cloneRepo(String url, Path targetDir) {
