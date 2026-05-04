@@ -64,6 +64,9 @@ public class JGitService implements GitService {
     @Value("${git.clone.depth:0}")
     private int cloneDepth;
 
+    @Value("${git.timeout:120}")
+    private int gitTimeoutSeconds;
+
     @Value("${git.proxy.host:}")
     private String proxyHost;
 
@@ -177,7 +180,8 @@ public class JGitService implements GitService {
 
             var fetch = git.fetch()
                     .setRemote("origin")
-                    .setTransportConfigCallback(sshTransportCallback());
+                    .setTransportConfigCallback(sshTransportCallback())
+                    .setTimeout(gitTimeoutSeconds);
             if (!isSsh(url) && !githubToken.isBlank()) {
                 fetch.setCredentialsProvider(httpCredentials());
             }
@@ -198,7 +202,8 @@ public class JGitService implements GitService {
             CloneCommand cmd = Git.cloneRepository()
                     .setURI(url)
                     .setDirectory(targetDir.toFile())
-                    .setTransportConfigCallback(sshTransportCallback());
+                    .setTransportConfigCallback(sshTransportCallback())
+                    .setTimeout(gitTimeoutSeconds);
 
             if (!isSsh(url) && !githubToken.isBlank()) {
                 cmd.setCredentialsProvider(httpCredentials());
@@ -299,7 +304,8 @@ public class JGitService implements GitService {
             var push = git.push()
                     .setRemote("origin")
                     .setRefSpecs(new RefSpec("refs/heads/" + branch + ":refs/heads/" + branch))
-                    .setTransportConfigCallback(sshTransportCallback());
+                    .setTransportConfigCallback(sshTransportCallback())
+                    .setTimeout(gitTimeoutSeconds);
 
             if (!isSshRemote(git) && !githubToken.isBlank()) {
                 push.setCredentialsProvider(httpCredentials());
@@ -340,7 +346,8 @@ public class JGitService implements GitService {
             var push = git.push()
                     .setRemote("origin")
                     .setRefSpecs(new RefSpec(":refs/tags/" + tagName))
-                    .setTransportConfigCallback(sshTransportCallback());
+                    .setTransportConfigCallback(sshTransportCallback())
+                    .setTimeout(gitTimeoutSeconds);
             if (!isSshRemote(git) && !githubToken.isBlank()) {
                 push.setCredentialsProvider(httpCredentials());
             }
@@ -358,7 +365,8 @@ public class JGitService implements GitService {
             var push = git.push()
                     .setRemote("origin")
                     .setRefSpecs(new RefSpec("refs/tags/" + tagName + ":refs/tags/" + tagName))
-                    .setTransportConfigCallback(sshTransportCallback());
+                    .setTransportConfigCallback(sshTransportCallback())
+                    .setTimeout(gitTimeoutSeconds);
             if (!isSshRemote(git) && !githubToken.isBlank()) {
                 push.setCredentialsProvider(httpCredentials());
             }
