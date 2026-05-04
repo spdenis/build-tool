@@ -8,6 +8,7 @@ import org.eclipse.jgit.api.ResetCommand;
 import org.eclipse.jgit.api.TransportConfigCallback;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.lib.StoredConfig;
 import org.eclipse.jgit.transport.CredentialsProvider;
 import org.eclipse.jgit.transport.RefSpec;
 import org.eclipse.jgit.transport.SshTransport;
@@ -305,6 +306,12 @@ public class JGitService implements GitService {
             }
 
             push.call();
+
+            // Set upstream tracking so the branch behaves like `git push -u origin <branch>`
+            StoredConfig config = git.getRepository().getConfig();
+            config.setString("branch", branch, "remote", "origin");
+            config.setString("branch", branch, "merge", "refs/heads/" + branch);
+            config.save();
         } catch (GitAPIException | IOException e) {
             throw new RuntimeException("Failed to push in " + repoDir, e);
         }
