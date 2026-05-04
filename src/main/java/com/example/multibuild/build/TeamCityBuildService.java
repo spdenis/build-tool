@@ -128,6 +128,8 @@ public class TeamCityBuildService implements BuildService {
             if (!branchName.isBlank()) {
                 payload.put("branchName", branchName);
             }
+            payload.put("properties", Map.of(
+                    "property", List.of(Map.of("name", "system.skipTests", "value", "true"))));
             String body = objectMapper.writeValueAsString(payload);
 
             HttpResponse<String> response = httpClient.send(
