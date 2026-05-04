@@ -56,41 +56,42 @@ public class TeamCityBuildService implements BuildService {
         Set<Path> overallSucceeded = new LinkedHashSet<>();
 
         for (List<Artifact> layer : layers) {
-            record QueuedBuild(String buildId, String configId, Artifact artifact, Module module) {}
+            record QueuedBuild(String buildId, String configId, Path repoRoot) {}
 
-            // Trigger all non-completed builds in this layer simultaneously
-            List<QueuedBuild> queued = new ArrayList<>();
+            // Group artifacts by repo; trigger one build per repo
+            Map<Path, List<Artifact>> repoArtifacts = new LinkedHashMap<>();
             for (Artifact artifact : layer) {
                 Module module = moduleMap.get(artifact);
                 if (module == null) continue;
                 if (completedRepoNames.contains(module.getRepoRoot().getFileName().toString())) continue;
-                String configId = resolveConfigId(artifact, repoConfigs.get(module.getRepoRoot()));
-                String branch = buildBranchByRepo.getOrDefault(module.getRepoRoot(), integrationBranch);
-                log.info("Triggering TeamCity build config {} for {} on branch/tag {}", configId, artifact, branch);
-                String buildId = triggerBuild(configId, branch);
-                log.info("Build queued: id={}", buildId);
-                queued.add(new QueuedBuild(buildId, configId, artifact, module));
+                repoArtifacts.computeIfAbsent(module.getRepoRoot(), k -> new ArrayList<>()).add(artifact);
             }
-            if (queued.isEmpty()) continue;
+            if (repoArtifacts.isEmpty()) continue;
 
-            // Wait for all; track per-repo success (a repo succeeds only if all its artifacts succeed)
-            Map<Path, Boolean> repoSuccess = new LinkedHashMap<>();
+            List<QueuedBuild> queued = new ArrayList<>();
+            for (Map.Entry<Path, List<Artifact>> entry : repoArtifacts.entrySet()) {
+                Path repoRoot = entry.getKey();
+                Artifact representative = entry.getValue().get(0);
+                String configId = resolveConfigId(representative, repoConfigs.get(repoRoot));
+                String branch = buildBranchByRepo.getOrDefault(repoRoot, integrationBranch);
+                log.info("Triggering TeamCity build config {} for {} on branch/tag {}",
+                        configId, repoRoot.getFileName(), branch);
+                String buildId = triggerBuild(configId, branch);
+                log.info("Build queued: id={} repo={}", buildId, repoRoot.getFileName());
+                queued.add(new QueuedBuild(buildId, configId, repoRoot));
+            }
+
             List<String> failures = new ArrayList<>();
-
             for (QueuedBuild b : queued) {
                 try {
-                    waitForCompletion(b.buildId(), b.artifact());
-                    repoSuccess.merge(b.module().getRepoRoot(), true, Boolean::logicalAnd);
+                    waitForCompletion(b.buildId(), b.repoRoot().getFileName().toString());
+                    overallSucceeded.add(b.repoRoot());
                 } catch (RuntimeException e) {
-                    repoSuccess.put(b.module().getRepoRoot(), false);
-                    failures.add("Build failed in repository: " + b.module().getRepoRoot() + "\n" +
-                            "  Artifact  : " + b.artifact() + "\n" +
+                    failures.add("Build failed in repository: " + b.repoRoot() + "\n" +
                             "  Config ID : " + b.configId() + "\n" +
                             "  Reason    : " + e.getMessage());
                 }
             }
-
-            repoSuccess.forEach((repo, ok) -> { if (ok) overallSucceeded.add(repo); });
 
             if (!failures.isEmpty()) {
                 throw new BuildFailedException(
@@ -140,7 +141,7 @@ public class TeamCityBuildService implements BuildService {
         }
     }
 
-    private void waitForCompletion(String buildId, Artifact artifact) {
+    private void waitForCompletion(String buildId, String repoName) {
         long startMs = System.currentTimeMillis();
         long deadline = startMs + props.getTimeoutMs();
         String url = props.getUrl() + "/app/rest/builds/id:" + buildId + "?fields=state,status";
@@ -161,7 +162,7 @@ public class TeamCityBuildService implements BuildService {
 
                 if (!state.equals(lastState)) {
                     log.info("  [TC] Build {} ({}) → state={} status={} elapsed={}",
-                            buildId, artifact.getArtifactId(), state, status, elapsed(startMs));
+                            buildId, repoName, state, status, elapsed(startMs));
                     lastState = state;
                 } else {
                     log.debug("Build {}: state={} status={} elapsed={}", buildId, state, status, elapsed(startMs));
@@ -170,9 +171,9 @@ public class TeamCityBuildService implements BuildService {
                 if ("finished".equalsIgnoreCase(state)) {
                     if (!"SUCCESS".equalsIgnoreCase(status)) {
                         throw new RuntimeException(
-                                "TeamCity build " + buildId + " for " + artifact + " finished with status: " + status);
+                                "TeamCity build " + buildId + " for " + repoName + " finished with status: " + status);
                     }
-                    log.info("  [TC] Build {} for {} succeeded in {}", buildId, artifact.getArtifactId(), elapsed(startMs));
+                    log.info("  [TC] Build {} for {} succeeded in {}", buildId, repoName, elapsed(startMs));
                     return;
                 }
             } catch (InterruptedException e) {
@@ -182,7 +183,7 @@ public class TeamCityBuildService implements BuildService {
                 log.warn("Error polling build {}: {}", buildId, e.getMessage());
             }
         }
-        throw new RuntimeException("Timeout waiting for TeamCity build " + buildId + " (" + artifact + ")");
+        throw new RuntimeException("Timeout waiting for TeamCity build " + buildId + " (" + repoName + ")");
     }
 
     private static String elapsed(long startMs) {
