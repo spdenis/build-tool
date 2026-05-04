@@ -4,6 +4,7 @@ import org.eclipse.jgit.api.CloneCommand;
 import org.eclipse.jgit.api.CreateBranchCommand;
 import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.api.ListBranchCommand;
+import org.eclipse.jgit.api.ResetCommand;
 import org.eclipse.jgit.api.TransportConfigCallback;
 import org.eclipse.jgit.api.errors.GitAPIException;
 import org.eclipse.jgit.lib.Ref;
@@ -57,6 +58,10 @@ public class JGitService implements GitService {
 
     @Value("${ssh.strict.host.key.checking:true}")
     private boolean sshStrictHostKeyChecking;
+
+    // 0 means full clone; any positive value enables shallow clone with that depth.
+    @Value("${git.clone.depth:0}")
+    private int cloneDepth;
 
     @Value("${git.proxy.host:}")
     private String proxyHost;
@@ -149,6 +154,43 @@ public class JGitService implements GitService {
 
     @Override
     public Path cloneRepo(String url, Path targetDir) {
+        File repoDir = targetDir.toFile();
+        if (repoDir.exists() && new File(repoDir, ".git").exists()) {
+            return reuseRepo(url, targetDir);
+        }
+        return doClone(url, targetDir);
+    }
+
+    private Path reuseRepo(String url, Path targetDir) {
+        log.info("Reusing existing repo {} — fetching latest", targetDir.getFileName());
+        try (Git git = Git.open(targetDir.toFile())) {
+            String configuredUrl = git.getRepository().getConfig().getString("remote", "origin", "url");
+            if (!url.equals(configuredUrl)) {
+                log.warn("  Remote URL mismatch in {} (expected '{}', found '{}') — re-cloning",
+                        targetDir.getFileName(), url, configuredUrl);
+                return doClone(url, targetDir);
+            }
+            // Discard any uncommitted changes left by a previous run
+            git.reset().setMode(ResetCommand.ResetType.HARD).call();
+            git.clean().setCleanDirectories(true).setForce(true).call();
+
+            var fetch = git.fetch()
+                    .setRemote("origin")
+                    .setTransportConfigCallback(sshTransportCallback());
+            if (!isSsh(url) && !githubToken.isBlank()) {
+                fetch.setCredentialsProvider(httpCredentials());
+            }
+            if (cloneDepth > 0) {
+                fetch.setDepth(cloneDepth);
+            }
+            fetch.call();
+            return targetDir;
+        } catch (GitAPIException | IOException e) {
+            throw new RuntimeException("Failed to update " + url, e);
+        }
+    }
+
+    private Path doClone(String url, Path targetDir) {
         FileSystemUtils.deleteRecursively(targetDir.toFile());
         log.info("Cloning {} into {}", url, targetDir.toAbsolutePath());
         try {
@@ -159,6 +201,9 @@ public class JGitService implements GitService {
 
             if (!isSsh(url) && !githubToken.isBlank()) {
                 cmd.setCredentialsProvider(httpCredentials());
+            }
+            if (cloneDepth > 0) {
+                cmd.setDepth(cloneDepth);
             }
 
             cmd.call().close();
