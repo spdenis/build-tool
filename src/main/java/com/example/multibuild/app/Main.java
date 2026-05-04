@@ -60,6 +60,12 @@ public class Main implements CommandLineRunner {
     @Value("${default.source.branch:main}")
     private String defaultSourceBranch;
 
+    @Value("${github.token:}")
+    private String githubToken;
+
+    @Value("${git.auth.token.in.url:false}")
+    private boolean gitAuthTokenInUrl;
+
     private final GitService gitService;
     private final BranchService branchService;
     private final PomVersionUpdater pomVersionUpdater;
@@ -126,7 +132,8 @@ public class Main implements CommandLineRunner {
             String url = entry.getUrl();
             String repoName = url.substring(url.lastIndexOf('/') + 1).replace(".git", "");
             log.info("  [{}/{}] {}", i + 1, repoEntries.size(), repoName);
-            Path cloned = gitService.cloneRepo(url, workDir.resolve(repoName));
+            String cloneUrl = gitAuthTokenInUrl ? withToken(url, githubToken) : url;
+            Path cloned = gitService.cloneRepo(cloneUrl, workDir.resolve(repoName));
             branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)));
             if (entry.hasVersionOverride()) {
                 applyVersionOverride(cloned, entry.getVersion());
@@ -217,6 +224,19 @@ public class Main implements CommandLineRunner {
         }
 
         System.out.println(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(result));
+    }
+
+    private static String withToken(String url, String token) {
+        if (token == null || token.isBlank() || url == null) return url;
+        try {
+            java.net.URI uri = new java.net.URI(url);
+            String scheme = uri.getScheme();
+            if (!"https".equalsIgnoreCase(scheme) && !"http".equalsIgnoreCase(scheme)) return url;
+            return new java.net.URI(scheme, "token:" + token, uri.getHost(), uri.getPort(),
+                    uri.getPath(), uri.getQuery(), uri.getFragment()).toString();
+        } catch (java.net.URISyntaxException e) {
+            return url;
+        }
     }
 
     private String resolveSourceBranch(Path repoDir, String requested) {

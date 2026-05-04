@@ -182,7 +182,7 @@ public class JGitService implements GitService {
                     .setRemote("origin")
                     .setTransportConfigCallback(sshTransportCallback())
                     .setTimeout(gitTimeoutSeconds);
-            if (!isSsh(url) && !githubToken.isBlank()) {
+            if (!isSsh(url) && !githubToken.isBlank() && !hasEmbeddedCredentials(url)) {
                 fetch.setCredentialsProvider(httpCredentials());
             }
             if (cloneDepth > 0) {
@@ -205,7 +205,7 @@ public class JGitService implements GitService {
                     .setTransportConfigCallback(sshTransportCallback())
                     .setTimeout(gitTimeoutSeconds);
 
-            if (!isSsh(url) && !githubToken.isBlank()) {
+            if (!isSsh(url) && !githubToken.isBlank() && !hasEmbeddedCredentials(url)) {
                 cmd.setCredentialsProvider(httpCredentials());
             }
             if (cloneDepth > 0) {
@@ -307,7 +307,7 @@ public class JGitService implements GitService {
                     .setTransportConfigCallback(sshTransportCallback())
                     .setTimeout(gitTimeoutSeconds);
 
-            if (!isSshRemote(git) && !githubToken.isBlank()) {
+            if (!isSshRemote(git) && !githubToken.isBlank() && !remoteHasEmbeddedCredentials(git)) {
                 push.setCredentialsProvider(httpCredentials());
             }
 
@@ -348,7 +348,7 @@ public class JGitService implements GitService {
                     .setRefSpecs(new RefSpec(":refs/tags/" + tagName))
                     .setTransportConfigCallback(sshTransportCallback())
                     .setTimeout(gitTimeoutSeconds);
-            if (!isSshRemote(git) && !githubToken.isBlank()) {
+            if (!isSshRemote(git) && !githubToken.isBlank() && !remoteHasEmbeddedCredentials(git)) {
                 push.setCredentialsProvider(httpCredentials());
             }
             push.call();
@@ -367,7 +367,7 @@ public class JGitService implements GitService {
                     .setRefSpecs(new RefSpec("refs/tags/" + tagName + ":refs/tags/" + tagName))
                     .setTransportConfigCallback(sshTransportCallback())
                     .setTimeout(gitTimeoutSeconds);
-            if (!isSshRemote(git) && !githubToken.isBlank()) {
+            if (!isSshRemote(git) && !githubToken.isBlank() && !remoteHasEmbeddedCredentials(git)) {
                 push.setCredentialsProvider(httpCredentials());
             }
             push.call();
@@ -450,6 +450,20 @@ public class JGitService implements GitService {
     private static boolean isSshRemote(Git git) {
         String url = git.getRepository().getConfig().getString("remote", "origin", "url");
         return url != null && isSsh(url);
+    }
+
+    private static boolean hasEmbeddedCredentials(String url) {
+        try {
+            String userInfo = new java.net.URI(url).getUserInfo();
+            return userInfo != null && !userInfo.isBlank();
+        } catch (java.net.URISyntaxException e) {
+            return false;
+        }
+    }
+
+    private static boolean remoteHasEmbeddedCredentials(Git git) {
+        String url = git.getRepository().getConfig().getString("remote", "origin", "url");
+        return url != null && hasEmbeddedCredentials(url);
     }
 
     private UsernamePasswordCredentialsProvider httpCredentials() {
