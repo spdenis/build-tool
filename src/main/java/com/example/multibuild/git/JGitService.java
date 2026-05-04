@@ -18,6 +18,8 @@ import org.eclipse.jgit.transport.sshd.KeyPasswordProvider;
 import org.eclipse.jgit.transport.sshd.ServerKeyDatabase;
 import org.eclipse.jgit.transport.sshd.SshdSessionFactory;
 import org.eclipse.jgit.transport.sshd.SshdSessionFactoryBuilder;
+import org.eclipse.jgit.transport.HttpTransport;
+import org.eclipse.jgit.transport.http.apache.HttpClientConnectionFactory;
 import org.eclipse.jgit.util.FS;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -89,6 +91,10 @@ public class JGitService implements GitService {
     @PostConstruct
     private void configureProxy() {
         if (proxyHost.isBlank()) return;
+
+        // Apache HttpClient correctly retries POST requests (push) after a 407 proxy challenge.
+        // Java's default HttpURLConnection does not, causing "authentication not supported" on push.
+        HttpTransport.setConnectionFactory(new HttpClientConnectionFactory());
 
         Proxy proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyHost, proxyPort));
         Set<String> includeDomains = parseDomainList(proxyDomains);
