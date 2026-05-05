@@ -137,7 +137,7 @@ public class Main implements CommandLineRunner {
             log.info("  [{}/{}] {}", i + 1, repoEntries.size(), repoName);
             String cloneUrl = gitAuthTokenInUrl ? withToken(url, githubToken) : url;
             Path cloned = gitService.cloneRepo(cloneUrl, workDir.resolve(repoName));
-            branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)));
+            branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry);
             if (entry.hasVersionOverride()) {
                 applyVersionOverride(cloned, entry.getVersion());
             }
@@ -150,7 +150,7 @@ public class Main implements CommandLineRunner {
                     .filter(p -> !repoConfigByPath.get(p).hasVersionOverride())
                     .toList();
             try {
-                branchService.validateVersions(pathsToValidate);
+                branchService.validateVersions(pathsToValidate, repoConfigByPath);
             } catch (RuntimeException e) {
                 System.err.println("\n[BUILD FAILED]\n" + e.getMessage());
                 System.exit(1);
@@ -189,7 +189,7 @@ public class Main implements CommandLineRunner {
                 if (buildMode == BuildMode.RELEASE) {
                     releaseService.execute(buildLayers, moduleMap, clonedPaths, repoConfigByPath, resumeState);
                 } else {
-                    dependencyVersionService.apply(moduleMap, clonedPaths);
+                    dependencyVersionService.apply(moduleMap, clonedPaths, repoConfigByPath);
                     try {
                         buildService.buildAll(buildLayers, moduleMap, repoConfigByPath,
                                 resumeState.getCompletedRepoNames(), Collections.emptyMap());

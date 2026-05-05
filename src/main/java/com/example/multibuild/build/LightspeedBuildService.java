@@ -61,6 +61,9 @@ public class LightspeedBuildService implements BuildService {
     @Value("${dry.mode:false}")
     private boolean dryMode;
 
+    @Value("${integration.branch:}")
+    private String integrationBranch;
+
     private final LightspeedProperties props;
     private final GitService gitService;
     private final HttpClient httpClient = HttpClient.newHttpClient();
@@ -152,11 +155,15 @@ public class LightspeedBuildService implements BuildService {
                     releaseArtifacts.size(), repoRoot.getFileName(), releaseVersion);
             pollUntilReleasePublished(repoRoot, releaseArtifacts);
         } else {
-            log.info("Triggering and polling Maven snapshots for {} artifact(s) in {}",
-                    artifacts.size(), repoRoot.getFileName());
-            List<SnapshotMeta> baselines = captureSnapshotBaselines(artifacts);
+            // POM carries bare version (e.g. 1.0.1-SNAPSHOT); the pipeline publishes
+            // under the full version (e.g. 1.0.1-integration-SNAPSHOT). Poll using that.
+            List<Artifact> pollArtifacts = expandVersions(artifacts);
+            log.info("Triggering and polling Maven snapshots for {} artifact(s) in {} (version {})",
+                    pollArtifacts.size(), repoRoot.getFileName(),
+                    pollArtifacts.isEmpty() ? "?" : pollArtifacts.get(0).getVersion());
+            List<SnapshotMeta> baselines = captureSnapshotBaselines(pollArtifacts);
             injectTriggerAndPush(repoRoot);
-            pollUntilSnapshotsUpdated(repoRoot, artifacts, baselines);
+            pollUntilSnapshotsUpdated(repoRoot, pollArtifacts, baselines);
         }
     }
 
@@ -375,6 +382,20 @@ public class LightspeedBuildService implements BuildService {
 
     private static void sleep(long ms) {
         try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    private List<Artifact> expandVersions(List<Artifact> artifacts) {
+        if (integrationBranch.isBlank()) return artifacts;
+        return artifacts.stream()
+                .map(a -> {
+                    String v = a.getVersion();
+                    if (v.endsWith("-SNAPSHOT")) {
+                        v = v.substring(0, v.length() - "-SNAPSHOT".length())
+                                + "-" + integrationBranch + "-SNAPSHOT";
+                    }
+                    return new Artifact(a.getGroupId(), a.getArtifactId(), v);
+                })
+                .toList();
     }
 
     private static String elapsed(long startMs) {

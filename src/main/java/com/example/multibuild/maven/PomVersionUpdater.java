@@ -33,6 +33,26 @@ public class PomVersionUpdater {
 
     private static final Logger log = LoggerFactory.getLogger(PomVersionUpdater.class);
 
+    // Updates all pom.xml versions to <baseVersion>-SNAPSHOT (no branch qualifier).
+    // Used for Lightspeed repos where the CI pipeline appends the branch name itself.
+    // Returns the new version string.
+    public String updateVersionsBare(Path repoDir) {
+        List<Path> pomFiles = findPomFiles(repoDir);
+        if (pomFiles.isEmpty()) {
+            throw new RuntimeException("No pom.xml files found in " + repoDir);
+        }
+        RootInfo root = findRootInfo(pomFiles);
+        if (root == null) {
+            throw new RuntimeException("Could not determine root artifact in " + repoDir);
+        }
+        String newVersion = baseVersion(root.oldVersion()) + "-SNAPSHOT";
+        log.info("Updating versions in {} from {} to {}", repoDir.getFileName(), root.oldVersion(), newVersion);
+        for (Path pomFile : pomFiles) {
+            updatePom(pomFile, root, newVersion);
+        }
+        return newVersion;
+    }
+
     // Updates all pom.xml versions to <baseVersion>-<branchName>-SNAPSHOT,
     // preserving the numeric part of the existing version.
     // Returns the new version string (for use in the commit message).

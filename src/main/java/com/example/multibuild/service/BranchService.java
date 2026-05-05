@@ -2,6 +2,8 @@ package com.example.multibuild.service;
 
 import com.example.multibuild.git.GitService;
 import com.example.multibuild.maven.PomVersionUpdater;
+import com.example.multibuild.model.BuildServiceType;
+import com.example.multibuild.model.RepoConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -10,6 +12,7 @@ import org.springframework.stereotype.Service;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 @Service
 public class BranchService {
@@ -21,6 +24,9 @@ public class BranchService {
 
     @Value("${dry.mode:false}")
     private boolean dryMode;
+
+    @Value("${build.service:LOCAL}")
+    private BuildServiceType defaultBuildService;
 
     // "fail" (default) — abort if any repo version violates the guideline.
     // "fix"            — auto-correct the version, commit, and push.
@@ -39,11 +45,11 @@ public class BranchService {
         return integrationBranch;
     }
 
-    // Enforces that every repo's root version ends with -<branch>-SNAPSHOT.
-    // Behaviour on mismatch is controlled by snapshot.version.mismatch:
-    //   "fail" — collect all violations and throw (default)
-    //   "fix"  — correct the version, commit, and push
-    public void validateVersions(List<Path> repoDirs) {
+    // Enforces correct pom versions for all repos on the integration branch.
+    // Lightspeed repos must have bare -SNAPSHOT (e.g. 1.0.1-SNAPSHOT) because the
+    // CI pipeline appends the branch name itself; all others must end with -<branch>-SNAPSHOT.
+    // Behaviour on mismatch controlled by snapshot.version.mismatch ("fail" or "fix").
+    public void validateVersions(List<Path> repoDirs, Map<Path, RepoConfig> repoConfigByPath) {
         boolean fixMode = "fix".equalsIgnoreCase(versionMismatchMode);
         String requiredSuffix = "-" + integrationBranch + "-SNAPSHOT";
         List<String> violations = new ArrayList<>();
@@ -54,40 +60,58 @@ public class BranchService {
                 violations.add("  " + repoDir.getFileName() + ": could not read version");
                 continue;
             }
-            if (version.endsWith(requiredSuffix)) continue;
+
+            boolean lightspeed = isLightspeed(repoConfigByPath.get(repoDir));
+            boolean valid = lightspeed
+                    ? version.endsWith("-SNAPSHOT") && !version.endsWith(requiredSuffix)
+                    : version.endsWith(requiredSuffix);
+            if (valid) continue;
 
             if (fixMode) {
-                log.info("Fixing version in {} ('{}' does not end with '{}')",
-                        repoDir.getFileName(), version, requiredSuffix);
-                String newVersion = versionUpdater.updateVersions(repoDir, integrationBranch);
-                gitService.commitAll(repoDir, "chore: set version to " + newVersion);
+                if (lightspeed) {
+                    log.info("Fixing version in {} ('{}' must be bare -SNAPSHOT for Lightspeed)",
+                            repoDir.getFileName(), version);
+                    String newVersion = versionUpdater.updateVersionsBare(repoDir);
+                    gitService.commitAll(repoDir, "chore: set version to " + newVersion);
+                } else {
+                    log.info("Fixing version in {} ('{}' does not end with '{}')",
+                            repoDir.getFileName(), version, requiredSuffix);
+                    String newVersion = versionUpdater.updateVersions(repoDir, integrationBranch);
+                    gitService.commitAll(repoDir, "chore: set version to " + newVersion);
+                }
                 if (dryMode) {
                     log.info("Dry mode — skipping push for {}", repoDir.getFileName());
                 } else {
                     gitService.push(repoDir);
                 }
             } else {
-                violations.add("  " + repoDir.getFileName() + ": version is '" + version +
-                        "' (expected suffix '" + requiredSuffix + "')");
+                if (lightspeed) {
+                    violations.add("  " + repoDir.getFileName() + ": version is '" + version +
+                            "' (Lightspeed repos must use bare -SNAPSHOT, e.g. '1.0.1-SNAPSHOT'" +
+                            " — the pipeline appends the branch name)");
+                } else {
+                    violations.add("  " + repoDir.getFileName() + ": version is '" + version +
+                            "' (expected suffix '" + requiredSuffix + "')");
+                }
             }
         }
 
         if (!violations.isEmpty()) {
-            throw new RuntimeException(
-                    "Version guideline violation — all repos on branch '" + integrationBranch +
-                    "' must have versions ending with '" + requiredSuffix + "':\n" +
+            throw new RuntimeException("Version guideline violation on branch '" + integrationBranch + "':\n" +
                     String.join("\n", violations));
         }
     }
 
     // Checks out the integration branch in the cloned repo.
-    // If the branch is newly created, bumps all pom.xml versions to <branch>-SNAPSHOT and commits.
-    // sourceBranch is the branch used as the start point when the integration branch doesn't exist yet.
-    public void apply(Path repoDir, String sourceBranch) {
+    // If newly created: Lightspeed repos get a bare -SNAPSHOT version; others get -<branch>-SNAPSHOT.
+    // sourceBranch is the start point when the integration branch doesn't exist yet.
+    public void apply(Path repoDir, String sourceBranch, RepoConfig repoConfig) {
         boolean created = gitService.checkoutOrCreateBranch(repoDir, integrationBranch, sourceBranch);
         if (created) {
             log.info("Created branch {} in {}, updating pom versions", integrationBranch, repoDir.getFileName());
-            String newVersion = versionUpdater.updateVersions(repoDir, integrationBranch);
+            String newVersion = isLightspeed(repoConfig)
+                    ? versionUpdater.updateVersionsBare(repoDir)
+                    : versionUpdater.updateVersions(repoDir, integrationBranch);
             gitService.commitAll(repoDir, "chore: set version to " + newVersion);
             if (dryMode) {
                 log.info("Dry mode — skipping push for {}", repoDir.getFileName());
@@ -97,5 +121,11 @@ public class BranchService {
         } else {
             log.info("Branch {} already exists in {}, keeping current versions", integrationBranch, repoDir.getFileName());
         }
+    }
+
+    private boolean isLightspeed(RepoConfig config) {
+        BuildServiceType type = (config != null && config.getBuildService() != null)
+                ? config.getBuildService() : defaultBuildService;
+        return type == BuildServiceType.LIGHTSPEED;
     }
 }
