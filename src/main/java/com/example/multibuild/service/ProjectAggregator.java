@@ -13,6 +13,7 @@ import org.springframework.stereotype.Service;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -37,48 +38,48 @@ public class ProjectAggregator {
         return projects;
     }
 
-    public DependencyGraph buildGraph(List<RepositoryProject> projects) {
-        // Index all scanned artifacts by groupId:artifactId for internal resolution
-        Map<String, Artifact> internalArtifacts = new HashMap<>();
+    // Builds a repository-level dependency graph. Each node is a repo root path.
+    // An edge fromRepo → toRepo means fromRepo has at least one artifact that depends on
+    // an artifact produced by toRepo. Dependencies on artifacts not produced by any
+    // in-scope repo are ignored.
+    public DependencyGraph<Path> buildGraph(List<RepositoryProject> projects) {
+        // Map artifact key → repo root for all in-scope artifacts
         Map<String, Path> repoByKey = new HashMap<>();
+        // Map repo root → canonical project for deduplication
+        Map<Path, RepositoryProject> projectByRepo = new LinkedHashMap<>();
 
         for (RepositoryProject project : projects) {
             for (Module module : project.getModules()) {
-                Artifact a = module.getArtifact();
-                internalArtifacts.put(a.key(), a);
-                repoByKey.put(a.key(), module.getRepoRoot());
+                repoByKey.put(module.getArtifact().key(), module.getRepoRoot());
+            }
+            if (!project.getModules().isEmpty()) {
+                projectByRepo.putIfAbsent(project.getModules().get(0).getRepoRoot(), project);
             }
         }
 
-        DependencyGraph graph = new DependencyGraph();
-        for (Artifact a : internalArtifacts.values()) {
-            graph.addArtifact(a);
+        DependencyGraph<Path> graph = new DependencyGraph<>();
+        for (Path repoRoot : projectByRepo.keySet()) {
+            graph.addNode(repoRoot);
         }
 
-        // Only add cross-repo dependency edges. All artifacts within the same repo are
-        // built together from the root pom.xml, so intra-repo edges are irrelevant.
         for (RepositoryProject project : projects) {
+            if (project.getModules().isEmpty()) continue;
+            Path fromRepo = project.getModules().get(0).getRepoRoot();
+
             for (Module module : project.getModules()) {
-                Artifact from = module.getArtifact();
-                Path fromRepo = module.getRepoRoot();
                 for (Dependency dep : module.getDependencies()) {
-                    Artifact internal = internalArtifacts.get(dep.getArtifact().key());
-                    if (internal == null || internal.equals(from)) continue;
-                    if (fromRepo.equals(repoByKey.get(internal.key()))) continue; // same repo
-                    graph.addDependency(from, internal);
+                    Path toRepo = repoByKey.get(dep.getArtifact().key());
+                    // Ignore: not in scope, or same repo
+                    if (toRepo == null || toRepo.equals(fromRepo)) continue;
+                    graph.addEdge(fromRepo, toRepo);
                 }
             }
 
-            // Aggregator-pom parents: add cross-repo edges from all modules in this project
-            // to the parent artifact (if it lives in a different repo).
+            // Aggregator-pom parents declared in this project that live in another repo
             for (Artifact parent : project.getAggregatorParents()) {
-                Artifact internal = internalArtifacts.get(parent.key());
-                if (internal == null) continue;
-                Path parentRepo = repoByKey.get(internal.key());
-                for (Module module : project.getModules()) {
-                    if (module.getRepoRoot().equals(parentRepo)) continue; // same repo
-                    graph.addDependency(module.getArtifact(), internal);
-                }
+                Path parentRepo = repoByKey.get(parent.key());
+                if (parentRepo == null || parentRepo.equals(fromRepo)) continue;
+                graph.addEdge(fromRepo, parentRepo);
             }
         }
 

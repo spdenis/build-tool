@@ -50,28 +50,28 @@ public class TeamCityBuildService implements BuildService {
     }
 
     @Override
-    public void buildAll(List<List<Artifact>> layers, Map<Artifact, Module> moduleMap,
+    public void buildAll(List<List<Path>> layers, Map<Artifact, Module> moduleMap,
                          Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
                          Map<Path, String> buildBranchByRepo) {
+        // Build reverse lookup: repo root → first artifact (for build-config-pattern fallback)
+        Map<Path, Artifact> representativeByRepo = new LinkedHashMap<>();
+        for (Map.Entry<Artifact, Module> e : moduleMap.entrySet()) {
+            representativeByRepo.putIfAbsent(e.getValue().getRepoRoot(), e.getKey());
+        }
+
         Set<Path> overallSucceeded = new LinkedHashSet<>();
 
-        for (List<Artifact> layer : layers) {
+        for (List<Path> layer : layers) {
             record QueuedBuild(String buildId, String configId, Path repoRoot) {}
 
-            // Group artifacts by repo; trigger one build per repo
-            Map<Path, List<Artifact>> repoArtifacts = new LinkedHashMap<>();
-            for (Artifact artifact : layer) {
-                Module module = moduleMap.get(artifact);
-                if (module == null) continue;
-                if (completedRepoNames.contains(module.getRepoRoot().getFileName().toString())) continue;
-                repoArtifacts.computeIfAbsent(module.getRepoRoot(), k -> new ArrayList<>()).add(artifact);
-            }
-            if (repoArtifacts.isEmpty()) continue;
+            List<Path> repos = layer.stream()
+                    .filter(p -> !completedRepoNames.contains(p.getFileName().toString()))
+                    .toList();
+            if (repos.isEmpty()) continue;
 
             List<QueuedBuild> queued = new ArrayList<>();
-            for (Map.Entry<Path, List<Artifact>> entry : repoArtifacts.entrySet()) {
-                Path repoRoot = entry.getKey();
-                Artifact representative = entry.getValue().get(0);
+            for (Path repoRoot : repos) {
+                Artifact representative = representativeByRepo.get(repoRoot);
                 String configId = resolveConfigId(representative, repoConfigs.get(repoRoot));
                 String branch = buildBranchByRepo.getOrDefault(repoRoot, integrationBranch);
                 log.info("Triggering TeamCity build config {} for {} on branch/tag {}",
@@ -112,10 +112,13 @@ public class TeamCityBuildService implements BuildService {
                 return explicit;
             }
         }
-        return props.getBuildConfigPattern()
-                .replace("{groupId}", artifact.getGroupId())
-                .replace("{artifactId}", artifact.getArtifactId())
-                .replace("{version}", artifact.getVersion());
+        if (artifact != null) {
+            return props.getBuildConfigPattern()
+                    .replace("{groupId}", artifact.getGroupId())
+                    .replace("{artifactId}", artifact.getArtifactId())
+                    .replace("{version}", artifact.getVersion());
+        }
+        throw new RuntimeException("Cannot resolve TeamCity config ID: no RepoConfig and no artifacts found for repo");
     }
 
     private String triggerBuild(String configId, String branchName) {

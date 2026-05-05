@@ -81,7 +81,7 @@ public class LightspeedBuildService implements BuildService {
     }
 
     @Override
-    public void buildAll(List<List<Artifact>> layers, Map<Artifact, Module> moduleMap,
+    public void buildAll(List<List<Path>> layers, Map<Artifact, Module> moduleMap,
                          Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
                          Map<Path, String> buildBranchByRepo) {
         boolean release = buildMode == BuildMode.RELEASE;
@@ -97,32 +97,32 @@ public class LightspeedBuildService implements BuildService {
             }
         }
 
+        // Build repo → artifacts lookup for Maven polling
+        Map<Path, List<Artifact>> artifactsByRepo = new LinkedHashMap<>();
+        for (Map.Entry<Artifact, Module> e : moduleMap.entrySet()) {
+            artifactsByRepo.computeIfAbsent(e.getValue().getRepoRoot(), k -> new ArrayList<>()).add(e.getKey());
+        }
+
         Set<Path> overallSucceeded = new LinkedHashSet<>();
 
-        for (List<Artifact> layer : layers) {
-            Map<Path, List<Artifact>> repoArtifacts = new LinkedHashMap<>();
-            for (Artifact a : layer) {
-                Module m = moduleMap.get(a);
-                if (m == null) continue;
-                if (completedRepoNames.contains(m.getRepoRoot().getFileName().toString())) continue;
-                repoArtifacts.computeIfAbsent(m.getRepoRoot(), k -> new ArrayList<>()).add(a);
-            }
-            if (repoArtifacts.isEmpty()) continue;
+        for (List<Path> layer : layers) {
+            List<Path> repos = layer.stream()
+                    .filter(p -> !completedRepoNames.contains(p.getFileName().toString()))
+                    .toList();
+            if (repos.isEmpty()) continue;
 
             Set<Path> layerSucceeded = ConcurrentHashMap.newKeySet();
             List<String> layerFailures = Collections.synchronizedList(new ArrayList<>());
 
-            List<CompletableFuture<Void>> futures = repoArtifacts.entrySet().stream()
-                    .map(e -> CompletableFuture.runAsync(() -> {
+            List<CompletableFuture<Void>> futures = repos.stream()
+                    .map(repoRoot -> CompletableFuture.runAsync(() -> {
+                        List<Artifact> artifacts = artifactsByRepo.getOrDefault(repoRoot, List.of());
                         try {
-                            buildRepo(e.getKey(), e.getValue(), release, buildBranchByRepo);
-                            layerSucceeded.add(e.getKey());
+                            buildRepo(repoRoot, artifacts, release, buildBranchByRepo);
+                            layerSucceeded.add(repoRoot);
                         } catch (RuntimeException ex) {
-                            layerFailures.add(
-                                    "Build failed in repository: " + e.getKey() + "\n" +
-                                    "  Artifacts : " + e.getValue().stream()
-                                            .map(Artifact::toString).collect(Collectors.joining(", ")) + "\n" +
-                                    "  Reason    : " + ex.getMessage());
+                            layerFailures.add("Build failed in repository: " + repoRoot + "\n" +
+                                    "  Reason : " + ex.getMessage());
                         }
                     }, executor))
                     .toList();

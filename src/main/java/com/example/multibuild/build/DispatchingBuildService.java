@@ -50,37 +50,33 @@ public class DispatchingBuildService implements BuildService {
     }
 
     @Override
-    public void buildAll(List<List<Artifact>> layers, Map<Artifact, Module> moduleMap,
+    public void buildAll(List<List<Path>> layers, Map<Artifact, Module> moduleMap,
                          Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
                          Map<Path, String> buildBranchByRepo) {
         Set<Path> overallSucceeded = new LinkedHashSet<>();
 
-        for (List<Artifact> layer : layers) {
-            // Group artifacts by service type so we can log the routing and run groups concurrently
-            Map<BuildServiceType, List<Artifact>> byType = new LinkedHashMap<>();
-            for (Artifact a : layer) {
-                Module m = moduleMap.get(a);
-                if (m == null) continue;
-                BuildServiceType type = resolveType(repoConfigs.get(m.getRepoRoot()));
-                byType.computeIfAbsent(type, k -> new ArrayList<>()).add(a);
+        for (List<Path> layer : layers) {
+            // Group repos by service type so different services in the same layer run concurrently
+            Map<BuildServiceType, List<Path>> byType = new LinkedHashMap<>();
+            for (Path repoRoot : layer) {
+                if (completedRepoNames.contains(repoRoot.getFileName().toString())) continue;
+                BuildServiceType type = resolveType(repoConfigs.get(repoRoot));
+                byType.computeIfAbsent(type, k -> new ArrayList<>()).add(repoRoot);
             }
             if (byType.isEmpty()) continue;
 
-            // Log routing summary for this layer
-            byType.forEach((type, artifacts) -> {
-                String repos = artifacts.stream()
-                        .map(a -> { Module m = moduleMap.get(a);
-                            return m != null ? m.getRepoRoot().getFileName().toString() : a.getArtifactId(); })
-                        .distinct().collect(Collectors.joining(", "));
-                log.info("  [{}] {}", type, repos);
+            byType.forEach((type, repos) -> {
+                String names = repos.stream().map(p -> p.getFileName().toString())
+                        .collect(Collectors.joining(", "));
+                log.info("  [{}] {}", type, names);
             });
 
             if (byType.size() == 1) {
-                Map.Entry<BuildServiceType, List<Artifact>> entry = byType.entrySet().iterator().next();
+                Map.Entry<BuildServiceType, List<Path>> entry = byType.entrySet().iterator().next();
                 try {
                     resolve(entry.getKey()).buildAll(List.of(entry.getValue()), moduleMap, repoConfigs,
                             completedRepoNames, buildBranchByRepo);
-                    collectSucceeded(entry.getValue(), moduleMap, completedRepoNames, overallSucceeded);
+                    overallSucceeded.addAll(entry.getValue());
                 } catch (BuildFailedException e) {
                     overallSucceeded.addAll(e.getSucceeded());
                     throw new BuildFailedException(e.getMessage(), overallSucceeded);
@@ -95,7 +91,7 @@ public class DispatchingBuildService implements BuildService {
                             try {
                                 resolve(e.getKey()).buildAll(List.of(e.getValue()), moduleMap, repoConfigs,
                                         completedRepoNames, buildBranchByRepo);
-                                collectSucceeded(e.getValue(), moduleMap, completedRepoNames, layerSucceeded);
+                                layerSucceeded.addAll(e.getValue());
                             } catch (BuildFailedException ex) {
                                 layerSucceeded.addAll(ex.getSucceeded());
                                 layerFailures.add(ex.getMessage());
@@ -105,7 +101,7 @@ public class DispatchingBuildService implements BuildService {
                         }))
                         .toList();
 
-                futures.forEach(CompletableFuture::join);
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[]{})).join();
                 overallSucceeded.addAll(layerSucceeded);
 
                 if (!layerFailures.isEmpty()) {
@@ -132,14 +128,4 @@ public class DispatchingBuildService implements BuildService {
         };
     }
 
-    private static void collectSucceeded(List<Artifact> artifacts, Map<Artifact, Module> moduleMap,
-                                         Set<String> completedRepoNames, Set<Path> target) {
-        artifacts.stream()
-                .map(moduleMap::get)
-                .filter(m -> m != null &&
-                        !completedRepoNames.contains(m.getRepoRoot().getFileName().toString()))
-                .map(Module::getRepoRoot)
-                .distinct()
-                .forEach(target::add);
-    }
 }

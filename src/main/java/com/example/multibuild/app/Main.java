@@ -32,7 +32,6 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -164,22 +163,18 @@ public class Main implements CommandLineRunner {
         // ── Phase: parse & graph ───────────────────────────────────
         log.info("── Phase 2/3: parse pom.xml & resolve dependency graph ");
         List<RepositoryProject> projects = aggregator.aggregate(clonedPaths);
-        DependencyGraph graph = aggregator.buildGraph(projects);
-        List<List<Artifact>> buildLayers = graph.topologicalLayers();
-        List<Artifact> buildOrder = buildLayers.stream().flatMap(List::stream).toList();
+        DependencyGraph<Path> graph = aggregator.buildGraph(projects);
+        List<List<Path>> buildLayers = graph.topologicalLayers();
+        List<Path> buildOrder = buildLayers.stream().flatMap(List::stream).toList();
 
-        log.info("  {} artifact(s) across {} repo(s) in {} layer(s):",
-                buildOrder.size(), clonedPaths.size(), buildLayers.size());
+        log.info("  {} repo(s) in {} layer(s):", clonedPaths.size(), buildLayers.size());
         for (int i = 0; i < buildLayers.size(); i++) {
-            List<Artifact> layer = buildLayers.get(i);
-            String repos = layer.stream()
-                    .map(a -> { Module m = projects.stream().flatMap(p -> p.getModules().stream())
-                            .filter(mod -> mod.getArtifact().equals(a)).findFirst().orElse(null);
-                        return m != null ? m.getRepoRoot().getFileName().toString() : a.getArtifactId(); })
-                    .distinct().collect(Collectors.joining(", "));
-            log.info("    Layer {}/{}: {} artifact(s) — {}", i + 1, buildLayers.size(), layer.size(), repos);
+            List<Path> layer = buildLayers.get(i);
+            String repos = layer.stream().map(p -> p.getFileName().toString())
+                    .collect(Collectors.joining(", "));
+            log.info("    Layer {}/{}: {} repo(s) — {}", i + 1, buildLayers.size(), layer.size(), repos);
         }
-        logDependencyTree(projects, graph);
+        logDependencyTree(graph);
 
         Map<Artifact, Module> moduleMap = projects.stream()
                 .flatMap(p -> p.getModules().stream())
@@ -218,82 +213,68 @@ public class Main implements CommandLineRunner {
         result.dependencies = new ArrayList<>();
         result.buildOrder = new ArrayList<>();
 
-        for (Map.Entry<Artifact, List<Artifact>> entry : graph.getAdjacencyList().entrySet()) {
-            result.artifacts.add(new BuildResult.ArtifactDto(entry.getKey()));
-            for (Artifact dep : entry.getValue()) {
-                result.dependencies.add(new BuildResult.DependencyDto(
-                    entry.getKey().toString(), dep.toString()
-                ));
+        for (Artifact a : moduleMap.keySet()) {
+            result.artifacts.add(new BuildResult.ArtifactDto(a));
+        }
+
+        for (Map.Entry<Path, List<Path>> entry : graph.getAdjacencyList().entrySet()) {
+            String from = entry.getKey().getFileName().toString();
+            for (Path dep : entry.getValue()) {
+                result.dependencies.add(new BuildResult.DependencyDto(from, dep.getFileName().toString()));
             }
         }
 
-        for (Artifact a : buildOrder) {
-            result.buildOrder.add(a.toString());
+        for (Path p : buildOrder) {
+            result.buildOrder.add(p.getFileName().toString());
         }
 
         System.out.println(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(result));
     }
 
-    private void logDependencyTree(List<RepositoryProject> projects, DependencyGraph graph) {
-        // artifact key → repo name
-        Map<String, String> repoByKey = new HashMap<>();
-        for (RepositoryProject p : projects) {
-            for (Module m : p.getModules()) {
-                repoByKey.put(m.getArtifact().key(), p.getName());
+    private void logDependencyTree(DependencyGraph<Path> graph) {
+        Map<Path, List<Path>> adjacency = graph.getAdjacencyList();
+
+        Map<Path, Set<Path>> repoDependents = new LinkedHashMap<>();
+        for (Path repo : adjacency.keySet()) {
+            repoDependents.putIfAbsent(repo, new LinkedHashSet<>());
+        }
+        for (Map.Entry<Path, List<Path>> e : adjacency.entrySet()) {
+            for (Path dep : e.getValue()) {
+                repoDependents.computeIfAbsent(dep, k -> new LinkedHashSet<>()).add(e.getKey());
             }
         }
 
-        // repoDeps[A] = repos A depends on (cross-repo); repoDependents[B] = repos that depend on B
-        Map<String, Set<String>> repoDeps = new LinkedHashMap<>();
-        Map<String, Set<String>> repoDependents = new LinkedHashMap<>();
-        for (RepositoryProject p : projects) {
-            repoDeps.put(p.getName(), new LinkedHashSet<>());
-            repoDependents.put(p.getName(), new LinkedHashSet<>());
-        }
-        for (Map.Entry<Artifact, List<Artifact>> e : graph.getAdjacencyList().entrySet()) {
-            String from = repoByKey.get(e.getKey().key());
-            if (from == null) continue;
-            for (Artifact dep : e.getValue()) {
-                String to = repoByKey.get(dep.key());
-                if (to != null && !to.equals(from)) {
-                    repoDeps.get(from).add(to);
-                    repoDependents.get(to).add(from);
-                }
-            }
-        }
-
-        // roots = repos with no external dependencies (foundation repos)
-        List<String> roots = projects.stream()
-                .map(RepositoryProject::getName)
-                .filter(r -> repoDeps.get(r).isEmpty())
+        List<Path> roots = adjacency.entrySet().stream()
+                .filter(e -> e.getValue().isEmpty())
+                .map(Map.Entry::getKey)
                 .collect(Collectors.toList());
         if (roots.isEmpty()) {
-            roots = projects.stream().map(RepositoryProject::getName).collect(Collectors.toList());
+            roots = new ArrayList<>(adjacency.keySet());
         }
 
         log.info("── Dependency tree ───────────────────────────────────");
-        Set<String> printed = new LinkedHashSet<>();
-        for (String root : roots) {
-            log.info("  {}", root);
+        Set<Path> printed = new LinkedHashSet<>();
+        for (Path root : roots) {
+            log.info("  {}", root.getFileName());
             printed.add(root);
-            List<String> dependents = new ArrayList<>(repoDependents.getOrDefault(root, Set.of()));
+            List<Path> dependents = new ArrayList<>(repoDependents.getOrDefault(root, Set.of()));
             for (int i = 0; i < dependents.size(); i++) {
                 renderTreeNode(dependents.get(i), "", i == dependents.size() - 1, repoDependents, printed);
             }
         }
     }
 
-    private void renderTreeNode(String repo, String prefix, boolean last,
-                                Map<String, Set<String>> repoDependents,
-                                Set<String> printed) {
+    private void renderTreeNode(Path repo, String prefix, boolean last,
+                                Map<Path, Set<Path>> repoDependents,
+                                Set<Path> printed) {
         String connector = last ? "└── " : "├── ";
         if (printed.contains(repo)) {
-            log.info("  {}{}{} ↑", prefix, connector, repo);
+            log.info("  {}{}{} ↑", prefix, connector, repo.getFileName());
             return;
         }
-        log.info("  {}{}{}", prefix, connector, repo);
+        log.info("  {}{}{}", prefix, connector, repo.getFileName());
         printed.add(repo);
-        List<String> dependents = new ArrayList<>(repoDependents.getOrDefault(repo, Set.of()));
+        List<Path> dependents = new ArrayList<>(repoDependents.getOrDefault(repo, Set.of()));
         String childPrefix = prefix + (last ? "    " : "│   ");
         for (int i = 0; i < dependents.size(); i++) {
             renderTreeNode(dependents.get(i), childPrefix, i == dependents.size() - 1, repoDependents, printed);

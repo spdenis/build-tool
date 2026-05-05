@@ -47,7 +47,7 @@ public class ReleaseService {
         this.buildService = buildService;
     }
 
-    public void execute(List<List<Artifact>> buildLayers, Map<Artifact, Module> moduleMap,
+    public void execute(List<List<Path>> buildLayers, Map<Artifact, Module> moduleMap,
                         List<Path> repoRoots, Map<Path, RepoConfig> repoConfigs,
                         ResumeState resumeState) {
 
@@ -127,13 +127,9 @@ public class ReleaseService {
         Map<String, String> currentVersionByKey = new HashMap<>(releaseVersionByKey);
         int layerNum = 0;
 
-        for (List<Artifact> layer : buildLayers) {
+        for (List<Path> layer : buildLayers) {
             layerNum++;
-            LinkedHashSet<Path> layerRepos = new LinkedHashSet<>();
-            for (Artifact a : layer) {
-                Module m = moduleMap.get(a);
-                if (m != null) layerRepos.add(m.getRepoRoot());
-            }
+            List<Path> layerRepos = layer;
 
             boolean allSkipped = layerRepos.stream().allMatch(resumeState::isCompleted);
             if (allSkipped) {
@@ -174,12 +170,10 @@ public class ReleaseService {
 
                 pomVersionUpdater.setVersions(repoRoot, nextSnapshot);
 
-                for (Artifact a : layer) {
-                    Module m = moduleMap.get(a);
-                    if (m != null && repoRoot.equals(m.getRepoRoot())) {
-                        currentVersionByKey.put(a.key(), nextSnapshot);
-                    }
-                }
+                // Update version map for all artifacts that belong to this repo
+                moduleMap.entrySet().stream()
+                        .filter(e -> repoRoot.equals(e.getValue().getRepoRoot()))
+                        .forEach(e -> currentVersionByKey.put(e.getKey().key(), nextSnapshot));
                 dependencyVersionUpdater.update(List.of(repoRoot), currentVersionByKey);
 
                 gitService.commitAll(repoRoot, "chore: prepare next development version " + nextSnapshot);
