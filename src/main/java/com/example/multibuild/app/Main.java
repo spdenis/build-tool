@@ -12,6 +12,7 @@ import com.example.multibuild.model.RepoConfig;
 import com.example.multibuild.model.RepositoryProject;
 import com.example.multibuild.model.ResumeState;
 import com.example.multibuild.service.BranchService;
+import com.example.multibuild.service.CommitMessageFormatter;
 import com.example.multibuild.service.DependencyVersionService;
 import com.example.multibuild.service.ProjectAggregator;
 import com.example.multibuild.service.ReleaseService;
@@ -77,11 +78,13 @@ public class Main implements CommandLineRunner {
     private final BuildService buildService;
     private final ReleaseService releaseService;
     private final ObjectMapper objectMapper;
+    private final CommitMessageFormatter commitFormatter;
 
     public Main(GitService gitService, BranchService branchService,
                 PomVersionUpdater pomVersionUpdater,
                 ProjectAggregator aggregator, DependencyVersionService dependencyVersionService,
-                BuildService buildService, ReleaseService releaseService, ObjectMapper objectMapper) {
+                BuildService buildService, ReleaseService releaseService, ObjectMapper objectMapper,
+                CommitMessageFormatter commitFormatter) {
         this.gitService = gitService;
         this.branchService = branchService;
         this.pomVersionUpdater = pomVersionUpdater;
@@ -90,6 +93,7 @@ public class Main implements CommandLineRunner {
         this.buildService = buildService;
         this.releaseService = releaseService;
         this.objectMapper = objectMapper;
+        this.commitFormatter = commitFormatter;
     }
 
     public static void main(String[] args) {
@@ -319,7 +323,7 @@ public class Main implements CommandLineRunner {
     private void applyVersionOverride(Path repoDir, String version) {
         log.info("    Applying version override {} in {}", version, repoDir.getFileName());
         pomVersionUpdater.setVersions(repoDir, version);
-        boolean committed = gitService.commitAllIfDirty(repoDir, "chore: set version to " + version);
+        boolean committed = gitService.commitAllIfDirty(repoDir, commitFormatter.format("chore: set version to " + version));
         if (committed) {
             if (dryMode) {
                 log.info("    Dry mode — skipping push for {}", repoDir.getFileName());

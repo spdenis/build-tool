@@ -35,10 +35,13 @@ public class BranchService {
 
     private final GitService gitService;
     private final PomVersionUpdater versionUpdater;
+    private final CommitMessageFormatter commitFormatter;
 
-    public BranchService(GitService gitService, PomVersionUpdater versionUpdater) {
+    public BranchService(GitService gitService, PomVersionUpdater versionUpdater,
+                         CommitMessageFormatter commitFormatter) {
         this.gitService = gitService;
         this.versionUpdater = versionUpdater;
+        this.commitFormatter = commitFormatter;
     }
 
     public String getIntegrationBranch() {
@@ -72,12 +75,12 @@ public class BranchService {
                     log.info("Fixing version in {} ('{}' must be bare -SNAPSHOT for Lightspeed)",
                             repoDir.getFileName(), version);
                     String newVersion = versionUpdater.updateVersionsBare(repoDir);
-                    gitService.commitAll(repoDir, "chore: set version to " + newVersion);
+                    gitService.commitAll(repoDir, commitFormatter.format("chore: set version to " + newVersion));
                 } else {
                     log.info("Fixing version in {} ('{}' does not end with '{}')",
                             repoDir.getFileName(), version, requiredSuffix);
                     String newVersion = versionUpdater.updateVersions(repoDir, integrationBranch);
-                    gitService.commitAll(repoDir, "chore: set version to " + newVersion);
+                    gitService.commitAll(repoDir, commitFormatter.format("chore: set version to " + newVersion));
                 }
                 if (dryMode) {
                     log.info("Dry mode — skipping push for {}", repoDir.getFileName());
@@ -112,7 +115,7 @@ public class BranchService {
             String newVersion = isLightspeed(repoConfig)
                     ? versionUpdater.updateVersionsBare(repoDir)
                     : versionUpdater.updateVersions(repoDir, integrationBranch);
-            gitService.commitAll(repoDir, "chore: set version to " + newVersion);
+            gitService.commitAll(repoDir, commitFormatter.format("chore: set version to " + newVersion));
             if (dryMode) {
                 log.info("Dry mode — skipping push for {}", repoDir.getFileName());
             } else {

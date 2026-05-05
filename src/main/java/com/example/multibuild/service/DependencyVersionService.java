@@ -33,10 +33,13 @@ public class DependencyVersionService {
 
     private final DependencyVersionUpdater updater;
     private final GitService gitService;
+    private final CommitMessageFormatter commitFormatter;
 
-    public DependencyVersionService(DependencyVersionUpdater updater, GitService gitService) {
+    public DependencyVersionService(DependencyVersionUpdater updater, GitService gitService,
+                                    CommitMessageFormatter commitFormatter) {
         this.updater = updater;
         this.gitService = gitService;
+        this.commitFormatter = commitFormatter;
     }
 
     // Updates dependency versions across all repos for every in-scope artifact,
@@ -69,7 +72,7 @@ public class DependencyVersionService {
         }
 
         String suffix = integrationBranch.isBlank() ? "" : " for " + integrationBranch;
-        String commitMessage = "chore: update dependency versions" + suffix;
+        String commitMessage = commitFormatter.format("chore: update dependency versions" + suffix);
 
         for (Path repoRoot : modified) {
             log.info("Committing dependency version updates in {}", repoRoot.getFileName());

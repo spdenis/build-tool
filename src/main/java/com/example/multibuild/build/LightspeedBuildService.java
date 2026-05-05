@@ -2,6 +2,7 @@ package com.example.multibuild.build;
 
 import com.example.multibuild.git.GitService;
 import com.example.multibuild.model.Artifact;
+import com.example.multibuild.service.CommitMessageFormatter;
 import com.example.multibuild.model.BuildMode;
 import com.example.multibuild.model.Module;
 import com.example.multibuild.model.RepoConfig;
@@ -66,14 +67,17 @@ public class LightspeedBuildService implements BuildService {
 
     private final LightspeedProperties props;
     private final GitService gitService;
+    private final CommitMessageFormatter commitFormatter;
     private final HttpClient httpClient = HttpClient.newHttpClient();
     // Cached thread pool because poll loops are long-running blocking IO tasks
     private final java.util.concurrent.ExecutorService executor =
             Executors.newCachedThreadPool();
 
-    public LightspeedBuildService(LightspeedProperties props, GitService gitService) {
+    public LightspeedBuildService(LightspeedProperties props, GitService gitService,
+                                  CommitMessageFormatter commitFormatter) {
         this.props = props;
         this.gitService = gitService;
+        this.commitFormatter = commitFormatter;
     }
 
     @Override
@@ -192,7 +196,7 @@ public class LightspeedBuildService implements BuildService {
         } catch (Exception e) {
             log.warn("Could not inject build trigger into {}: {}", pomPath, e.getMessage());
         }
-        gitService.commitAllIfDirty(repoRoot, "chore: trigger ci build");
+        gitService.commitAllIfDirty(repoRoot, commitFormatter.format("chore: trigger ci build"));
         gitService.push(repoRoot);
         log.info("Pushed trigger commit for {}", repoRoot.getFileName());
     }
