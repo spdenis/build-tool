@@ -31,9 +31,12 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 @SpringBootApplication
@@ -172,6 +175,7 @@ public class Main implements CommandLineRunner {
                     .distinct().collect(Collectors.joining(", "));
             log.info("    Layer {}/{}: {} artifact(s) — {}", i + 1, buildLayers.size(), layer.size(), repos);
         }
+        logDependencyTree(projects, graph);
 
         Map<Artifact, Module> moduleMap = projects.stream()
                 .flatMap(p -> p.getModules().stream())
@@ -224,6 +228,72 @@ public class Main implements CommandLineRunner {
         }
 
         System.out.println(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(result));
+    }
+
+    private void logDependencyTree(List<RepositoryProject> projects, DependencyGraph graph) {
+        // artifact key → repo name
+        Map<String, String> repoByKey = new HashMap<>();
+        for (RepositoryProject p : projects) {
+            for (Module m : p.getModules()) {
+                repoByKey.put(m.getArtifact().key(), p.getName());
+            }
+        }
+
+        // repoDeps[A] = repos A depends on (cross-repo); repoDependents[B] = repos that depend on B
+        Map<String, Set<String>> repoDeps = new LinkedHashMap<>();
+        Map<String, Set<String>> repoDependents = new LinkedHashMap<>();
+        for (RepositoryProject p : projects) {
+            repoDeps.put(p.getName(), new LinkedHashSet<>());
+            repoDependents.put(p.getName(), new LinkedHashSet<>());
+        }
+        for (Map.Entry<Artifact, List<Artifact>> e : graph.getAdjacencyList().entrySet()) {
+            String from = repoByKey.get(e.getKey().key());
+            if (from == null) continue;
+            for (Artifact dep : e.getValue()) {
+                String to = repoByKey.get(dep.key());
+                if (to != null && !to.equals(from)) {
+                    repoDeps.get(from).add(to);
+                    repoDependents.get(to).add(from);
+                }
+            }
+        }
+
+        // roots = repos with no external dependencies (foundation repos)
+        List<String> roots = projects.stream()
+                .map(RepositoryProject::getName)
+                .filter(r -> repoDeps.get(r).isEmpty())
+                .collect(Collectors.toList());
+        if (roots.isEmpty()) {
+            roots = projects.stream().map(RepositoryProject::getName).collect(Collectors.toList());
+        }
+
+        log.info("── Dependency tree ───────────────────────────────────");
+        Set<String> printed = new LinkedHashSet<>();
+        for (String root : roots) {
+            log.info("  {}", root);
+            printed.add(root);
+            List<String> dependents = new ArrayList<>(repoDependents.getOrDefault(root, Set.of()));
+            for (int i = 0; i < dependents.size(); i++) {
+                renderTreeNode(dependents.get(i), "", i == dependents.size() - 1, repoDependents, printed);
+            }
+        }
+    }
+
+    private void renderTreeNode(String repo, String prefix, boolean last,
+                                Map<String, Set<String>> repoDependents,
+                                Set<String> printed) {
+        String connector = last ? "└── " : "├── ";
+        if (printed.contains(repo)) {
+            log.info("  {}{}{} ↑", prefix, connector, repo);
+            return;
+        }
+        log.info("  {}{}{}", prefix, connector, repo);
+        printed.add(repo);
+        List<String> dependents = new ArrayList<>(repoDependents.getOrDefault(repo, Set.of()));
+        String childPrefix = prefix + (last ? "    " : "│   ");
+        for (int i = 0; i < dependents.size(); i++) {
+            renderTreeNode(dependents.get(i), childPrefix, i == dependents.size() - 1, repoDependents, printed);
+        }
     }
 
     private static String withToken(String url, String token) {
