@@ -11,17 +11,17 @@ class DependencyGraphTest {
 
     @Test
     void topologicalSortRespectsOrder() {
-        DependencyGraph graph = new DependencyGraph();
+        DependencyGraph<Artifact> graph = new DependencyGraph<>();
         Artifact a = new Artifact("com.example", "a", "1.0");
         Artifact b = new Artifact("com.example", "b", "1.0");
         Artifact c = new Artifact("com.example", "c", "1.0");
 
-        graph.addArtifact(a);
-        graph.addArtifact(b);
-        graph.addArtifact(c);
-        graph.addDependency(b, a); // b depends on a → a built first
-        graph.addDependency(c, a); // c depends on a
-        graph.addDependency(c, b); // c depends on b → b built before c
+        graph.addNode(a);
+        graph.addNode(b);
+        graph.addNode(c);
+        graph.addEdge(b, a); // b depends on a → a built first
+        graph.addEdge(c, a); // c depends on a
+        graph.addEdge(c, b); // c depends on b → b built before c
 
         List<Artifact> order = graph.topologicalSort();
 
@@ -33,11 +33,11 @@ class DependencyGraphTest {
 
     @Test
     void independentArtifactsAreAllIncluded() {
-        DependencyGraph graph = new DependencyGraph();
+        DependencyGraph<Artifact> graph = new DependencyGraph<>();
         Artifact a = new Artifact("com.example", "a", "1.0");
         Artifact b = new Artifact("com.example", "b", "1.0");
-        graph.addArtifact(a);
-        graph.addArtifact(b);
+        graph.addNode(a);
+        graph.addNode(b);
 
         List<Artifact> order = graph.topologicalSort();
         assertEquals(2, order.size());
@@ -47,31 +47,31 @@ class DependencyGraphTest {
 
     @Test
     void cycleDetectionThrows() {
-        DependencyGraph graph = new DependencyGraph();
+        DependencyGraph<Artifact> graph = new DependencyGraph<>();
         Artifact a = new Artifact("com.example", "a", "1.0");
         Artifact b = new Artifact("com.example", "b", "1.0");
-        graph.addArtifact(a);
-        graph.addArtifact(b);
-        graph.addDependency(a, b);
-        graph.addDependency(b, a);
+        graph.addNode(a);
+        graph.addNode(b);
+        graph.addEdge(a, b);
+        graph.addEdge(b, a);
 
         assertThrows(RuntimeException.class, graph::topologicalSort);
     }
 
     @Test
     void topologicalLayersGroupsIndependentArtifacts() {
-        DependencyGraph graph = new DependencyGraph();
+        DependencyGraph<Artifact> graph = new DependencyGraph<>();
         Artifact a = new Artifact("com.example", "a", "1.0");
         Artifact b = new Artifact("com.example", "b", "1.0");
         Artifact c = new Artifact("com.example", "c", "1.0");
         Artifact d = new Artifact("com.example", "d", "1.0");
 
-        graph.addArtifact(a);
-        graph.addArtifact(b);
-        graph.addArtifact(c);
-        graph.addArtifact(d);
-        graph.addDependency(c, a); // c depends on a
-        graph.addDependency(d, b); // d depends on b
+        graph.addNode(a);
+        graph.addNode(b);
+        graph.addNode(c);
+        graph.addNode(d);
+        graph.addEdge(c, a); // c depends on a
+        graph.addEdge(d, b); // d depends on b
         // a and b are independent → layer 0; c and d are independent → layer 1
 
         List<List<Artifact>> layers = graph.topologicalLayers();
@@ -84,14 +84,14 @@ class DependencyGraphTest {
     }
 
     @Test
-    void duplicateDependencyEdgeIgnored() {
-        DependencyGraph graph = new DependencyGraph();
+    void duplicateEdgeIgnored() {
+        DependencyGraph<Artifact> graph = new DependencyGraph<>();
         Artifact a = new Artifact("com.example", "a", "1.0");
         Artifact b = new Artifact("com.example", "b", "1.0");
-        graph.addArtifact(a);
-        graph.addArtifact(b);
-        graph.addDependency(b, a);
-        graph.addDependency(b, a); // duplicate
+        graph.addNode(a);
+        graph.addNode(b);
+        graph.addEdge(b, a);
+        graph.addEdge(b, a); // duplicate
 
         List<Artifact> order = graph.topologicalSort();
         assertEquals(2, order.size());

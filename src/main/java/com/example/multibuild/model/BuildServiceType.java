@@ -3,7 +3,7 @@ package com.example.multibuild.model;
 import com.fasterxml.jackson.annotation.JsonCreator;
 
 public enum BuildServiceType {
-    LOCAL, TEAMCITY, LIGHTSPEED;
+    LOCAL, TEAMCITY, LIGHTSPEED, DUMMY;
 
     @JsonCreator
     public static BuildServiceType fromValue(String value) {
@@ -12,8 +12,9 @@ public enum BuildServiceType {
             case "LOCAL" -> LOCAL;
             case "TEAMCITY" -> TEAMCITY;
             case "LIGHTSPEED" -> LIGHTSPEED;
+            case "DUMMY" -> DUMMY;
             default -> throw new IllegalArgumentException("Unknown build service type: '" + value +
-                    "'. Valid values: local, teamcity, lightspeed");
+                    "'. Valid values: local, teamcity, lightspeed, dummy");
         };
     }
 }

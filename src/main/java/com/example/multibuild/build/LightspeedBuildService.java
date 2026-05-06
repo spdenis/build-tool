@@ -217,7 +217,7 @@ public class LightspeedBuildService implements BuildService {
                 if (!current.isNewerThan(baseline)) {
                     pending++;
                 } else {
-                    log.debug("Snapshot updated: {} build#{}", a.getArtifactId(), current.buildNumber());
+                    log.info("  [LS] Snapshot updated: {} build#{}", a.getArtifactId(), current.buildNumber());
                 }
             }
             if (pending == 0) {

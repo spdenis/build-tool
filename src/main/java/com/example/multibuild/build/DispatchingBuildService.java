@@ -40,13 +40,16 @@ public class DispatchingBuildService implements BuildService {
     private final BuildService localService;
     private final BuildService teamCityService;
     private final BuildService lightspeedService;
+    private final BuildService dummyService;
 
     public DispatchingBuildService(@Qualifier("local") BuildService localService,
                                    @Qualifier("teamcity") BuildService teamCityService,
-                                   @Qualifier("lightspeed") BuildService lightspeedService) {
+                                   @Qualifier("lightspeed") BuildService lightspeedService,
+                                   @Qualifier("dummy") BuildService dummyService) {
         this.localService = localService;
         this.teamCityService = teamCityService;
         this.lightspeedService = lightspeedService;
+        this.dummyService = dummyService;
     }
 
     @Override
@@ -124,6 +127,7 @@ public class DispatchingBuildService implements BuildService {
         return switch (type) {
             case TEAMCITY -> teamCityService;
             case LIGHTSPEED -> lightspeedService;
+            case DUMMY -> dummyService;
             default -> localService;
         };
     }

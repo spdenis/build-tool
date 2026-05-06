@@ -82,7 +82,7 @@ public class BranchService {
                     String newVersion = versionUpdater.updateVersions(repoDir, integrationBranch);
                     gitService.commitAll(repoDir, commitFormatter.format("chore: set version to " + newVersion));
                 }
-                if (dryMode) {
+                if (isDryRun(dryMode, repoConfigByPath.get(repoDir))) {
                     log.info("Dry mode — skipping push for {}", repoDir.getFileName());
                 } else {
                     gitService.push(repoDir);
@@ -116,7 +116,7 @@ public class BranchService {
                     ? versionUpdater.updateVersionsBare(repoDir)
                     : versionUpdater.updateVersions(repoDir, integrationBranch);
             gitService.commitAll(repoDir, commitFormatter.format("chore: set version to " + newVersion));
-            if (dryMode) {
+            if (isDryRun(dryMode, repoConfig)) {
                 log.info("Dry mode — skipping push for {}", repoDir.getFileName());
             } else {
                 gitService.push(repoDir);
@@ -130,5 +130,9 @@ public class BranchService {
         BuildServiceType type = (config != null && config.getBuildService() != null)
                 ? config.getBuildService() : defaultBuildService;
         return type == BuildServiceType.LIGHTSPEED;
+    }
+
+    private static boolean isDryRun(boolean globalDryMode, RepoConfig config) {
+        return globalDryMode || (config != null && config.isDryRun());
     }
 }

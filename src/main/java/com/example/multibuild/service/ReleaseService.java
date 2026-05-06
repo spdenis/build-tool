@@ -93,7 +93,7 @@ public class ReleaseService {
                 log.info("  [{}] Committing, tagging {}", repoRoot.getFileName(), tagName);
                 gitService.commitAll(repoRoot, "chore: release " + release);
                 gitService.createTag(repoRoot, tagName, "Release " + release);
-                if (dryMode) {
+                if (isDryRun(repoConfigs.get(repoRoot))) {
                     log.info("  [{}] Dry mode — skipping push/pushTag", repoRoot.getFileName());
                 } else {
                     gitService.push(repoRoot);
@@ -177,7 +177,7 @@ public class ReleaseService {
                 dependencyVersionUpdater.update(List.of(repoRoot), currentVersionByKey);
 
                 gitService.commitAll(repoRoot, "chore: prepare next development version " + nextSnapshot);
-                if (dryMode) {
+                if (isDryRun(repoConfigs.get(repoRoot))) {
                     log.info("  [{}] Dry mode — skipping push", repoRoot.getFileName());
                 } else {
                     gitService.push(repoRoot);
@@ -195,6 +195,10 @@ public class ReleaseService {
     private String baseVersion(String version) {
         int idx = version.indexOf('-');
         return idx >= 0 ? version.substring(0, idx) : version;
+    }
+
+    private boolean isDryRun(RepoConfig config) {
+        return dryMode || (config != null && config.isDryRun());
     }
 
     private String incrementPatch(String version) {

@@ -11,6 +11,7 @@ public class RepoConfig {
     private BuildServiceType buildService;
     private String teamcitySnapshotConfigId;
     private String teamcityReleaseConfigId;
+    private boolean dryRun;
 
     public String getUrl() { return url; }
     public void setUrl(String url) { this.url = url; }
@@ -39,4 +40,7 @@ public class RepoConfig {
 
     public String getTeamcityReleaseConfigId() { return teamcityReleaseConfigId; }
     public void setTeamcityReleaseConfigId(String id) { this.teamcityReleaseConfigId = id; }
+
+    public boolean isDryRun() { return dryRun; }
+    public void setDryRun(boolean dryRun) { this.dryRun = dryRun; }
 }

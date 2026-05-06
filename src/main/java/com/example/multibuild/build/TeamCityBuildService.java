@@ -152,7 +152,6 @@ public class TeamCityBuildService implements BuildService {
         long startMs = System.currentTimeMillis();
         long deadline = startMs + props.getTimeoutMs();
         String url = props.getUrl() + "/app/rest/builds/id:" + buildId + "?fields=state,status";
-        String lastState = "";
 
         while (System.currentTimeMillis() < deadline) {
             try {
@@ -167,13 +166,8 @@ public class TeamCityBuildService implements BuildService {
                 String state = json.path("state").asText();
                 String status = json.path("status").asText();
 
-                if (!state.equals(lastState)) {
-                    log.info("  [TC] Build {} ({}) → state={} status={} elapsed={}",
-                            buildId, repoName, state, status, elapsed(startMs));
-                    lastState = state;
-                } else {
-                    log.debug("Build {}: state={} status={} elapsed={}", buildId, state, status, elapsed(startMs));
-                }
+                log.info("  [TC] Build {} ({}) state={} status={} elapsed={}",
+                        buildId, repoName, state, status, elapsed(startMs));
 
                 if ("finished".equalsIgnoreCase(state)) {
                     if (!"SUCCESS".equalsIgnoreCase(status)) {

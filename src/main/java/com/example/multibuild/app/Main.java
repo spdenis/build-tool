@@ -142,7 +142,7 @@ public class Main implements CommandLineRunner {
             Path cloned = gitService.cloneRepo(cloneUrl, workDir.resolve(repoName));
             branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry);
             if (entry.hasVersionOverride()) {
-                applyVersionOverride(cloned, entry.getVersion());
+                applyVersionOverride(cloned, entry.getVersion(), entry);
             }
             clonedPaths.add(cloned);
             repoConfigByPath.put(cloned, entry);
@@ -301,12 +301,12 @@ public class Main implements CommandLineRunner {
         return "master";
     }
 
-    private void applyVersionOverride(Path repoDir, String version) {
+    private void applyVersionOverride(Path repoDir, String version, RepoConfig repoConfig) {
         log.info("    Applying version override {} in {}", version, repoDir.getFileName());
         pomVersionUpdater.setVersions(repoDir, version);
         boolean committed = gitService.commitAllIfDirty(repoDir, commitFormatter.format("chore: set version to " + version));
         if (committed) {
-            if (dryMode) {
+            if (dryMode || repoConfig.isDryRun()) {
                 log.info("    Dry mode — skipping push for {}", repoDir.getFileName());
             } else {
                 gitService.push(repoDir);
