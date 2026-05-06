@@ -58,13 +58,19 @@ public class BranchService {
         List<String> violations = new ArrayList<>();
 
         for (Path repoDir : repoDirs) {
+            RepoConfig config = repoConfigByPath.get(repoDir);
+            if (config != null && config.isPreserveVersion()) {
+                log.info("Skipping version validation for {} (preserveVersion=true)", repoDir.getFileName());
+                continue;
+            }
+
             String version = versionUpdater.getRootVersion(repoDir);
             if (version == null) {
                 violations.add("  " + repoDir.getFileName() + ": could not read version");
                 continue;
             }
 
-            boolean lightspeed = isLightspeed(repoConfigByPath.get(repoDir));
+            boolean lightspeed = isLightspeed(config);
             boolean valid = lightspeed
                     ? version.endsWith("-SNAPSHOT") && !version.endsWith(requiredSuffix)
                     : version.endsWith(requiredSuffix);
@@ -111,15 +117,20 @@ public class BranchService {
     public void apply(Path repoDir, String sourceBranch, RepoConfig repoConfig) {
         boolean created = gitService.checkoutOrCreateBranch(repoDir, integrationBranch, sourceBranch);
         if (created) {
-            log.info("Created branch {} in {}, updating pom versions", integrationBranch, repoDir.getFileName());
-            String newVersion = isLightspeed(repoConfig)
-                    ? versionUpdater.updateVersionsBare(repoDir)
-                    : versionUpdater.updateVersions(repoDir, integrationBranch);
-            gitService.commitAll(repoDir, commitFormatter.format("chore: set version to " + newVersion));
-            if (isDryRun(dryMode, repoConfig)) {
-                log.info("Dry mode — skipping push for {}", repoDir.getFileName());
+            if (repoConfig != null && repoConfig.isPreserveVersion()) {
+                log.info("Created branch {} in {}, preserveVersion=true — skipping version update",
+                        integrationBranch, repoDir.getFileName());
             } else {
-                gitService.push(repoDir);
+                log.info("Created branch {} in {}, updating pom versions", integrationBranch, repoDir.getFileName());
+                String newVersion = isLightspeed(repoConfig)
+                        ? versionUpdater.updateVersionsBare(repoDir)
+                        : versionUpdater.updateVersions(repoDir, integrationBranch);
+                gitService.commitAll(repoDir, commitFormatter.format("chore: set version to " + newVersion));
+                if (isDryRun(dryMode, repoConfig)) {
+                    log.info("Dry mode — skipping push for {}", repoDir.getFileName());
+                } else {
+                    gitService.push(repoDir);
+                }
             }
         } else {
             log.info("Branch {} already exists in {}, keeping current versions", integrationBranch, repoDir.getFileName());

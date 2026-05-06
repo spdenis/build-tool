@@ -12,6 +12,7 @@ public class RepoConfig {
     private String teamcitySnapshotConfigId;
     private String teamcityReleaseConfigId;
     private boolean dryRun;
+    private boolean preserveVersion;
 
     public String getUrl() { return url; }
     public void setUrl(String url) { this.url = url; }
@@ -43,4 +44,7 @@ public class RepoConfig {
 
     public boolean isDryRun() { return dryRun; }
     public void setDryRun(boolean dryRun) { this.dryRun = dryRun; }
+
+    public boolean isPreserveVersion() { return preserveVersion; }
+    public void setPreserveVersion(boolean preserveVersion) { this.preserveVersion = preserveVersion; }
 }

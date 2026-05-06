@@ -56,8 +56,11 @@ public class DependencyVersionService {
                         e -> {
                             Artifact a = e.getKey();
                             Module m = e.getValue();
-                            if (isLightspeed(repoConfigByPath.get(m.getRepoRoot()))
-                                    && !integrationBranch.isBlank()) {
+                            RepoConfig config = repoConfigByPath.get(m.getRepoRoot());
+                            if (config != null && config.isPreserveVersion()) {
+                                return a.getVersion();
+                            }
+                            if (isLightspeed(config) && !integrationBranch.isBlank()) {
                                 return expandVersion(a.getVersion(), integrationBranch);
                             }
                             return a.getVersion();
