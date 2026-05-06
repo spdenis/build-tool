@@ -118,7 +118,7 @@ public class LightspeedBuildService implements BuildService {
                     .map(repoRoot -> CompletableFuture.runAsync(() -> {
                         List<Artifact> artifacts = artifactsByRepo.getOrDefault(repoRoot, List.of());
                         try {
-                            buildRepo(repoRoot, artifacts, release, buildBranchByRepo);
+                            buildRepo(repoRoot, artifacts, release, buildBranchByRepo, repoConfigs.get(repoRoot));
                             layerSucceeded.add(repoRoot);
                         } catch (RuntimeException ex) {
                             layerFailures.add("Build failed in repository: " + repoRoot + "\n" +
@@ -140,8 +140,8 @@ public class LightspeedBuildService implements BuildService {
     }
 
     private void buildRepo(Path repoRoot, List<Artifact> artifacts, boolean release,
-                           Map<Path, String> buildBranchByRepo) {
-        if (dryMode) {
+                           Map<Path, String> buildBranchByRepo, RepoConfig repoConfig) {
+        if (dryMode || (repoConfig != null && repoConfig.isDryRun())) {
             log.info("Dry mode — skipping Lightspeed build/poll for {}", repoRoot.getFileName());
             return;
         }

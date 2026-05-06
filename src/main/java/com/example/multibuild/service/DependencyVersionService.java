@@ -80,7 +80,8 @@ public class DependencyVersionService {
         for (Path repoRoot : modified) {
             log.info("Committing dependency version updates in {}", repoRoot.getFileName());
             gitService.commitAll(repoRoot, commitMessage);
-            if (dryMode) {
+            RepoConfig config = repoConfigByPath.get(repoRoot);
+            if (dryMode || (config != null && config.isDryRun())) {
                 log.info("Dry mode — skipping push for {}", repoRoot.getFileName());
             } else {
                 gitService.push(repoRoot);
