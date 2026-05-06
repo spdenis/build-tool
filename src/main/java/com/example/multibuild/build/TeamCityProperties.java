@@ -18,6 +18,7 @@ public class TeamCityProperties {
     /** Extra build parameters sent with every triggered build.
      *  teamcity.build-parameters.system.myParam=value */
     private Map<String, String> buildParameters = new LinkedHashMap<>();
+    private int maxRetries = 2;
 
     public String getUrl() { return url; }
     public void setUrl(String url) { this.url = url; }
@@ -36,4 +37,7 @@ public class TeamCityProperties {
 
     public Map<String, String> getBuildParameters() { return buildParameters; }
     public void setBuildParameters(Map<String, String> buildParameters) { this.buildParameters = buildParameters; }
+
+    public int getMaxRetries() { return maxRetries; }
+    public void setMaxRetries(int maxRetries) { this.maxRetries = maxRetries; }
 }

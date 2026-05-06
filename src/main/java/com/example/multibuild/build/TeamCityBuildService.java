@@ -62,7 +62,7 @@ public class TeamCityBuildService implements BuildService {
         Set<Path> overallSucceeded = new LinkedHashSet<>();
 
         for (List<Path> layer : layers) {
-            record QueuedBuild(String buildId, String configId, Path repoRoot) {}
+            record QueuedBuild(String buildId, String configId, Path repoRoot, String branch) {}
 
             List<Path> repos = layer.stream()
                     .filter(p -> !completedRepoNames.contains(p.getFileName().toString()))
@@ -78,13 +78,13 @@ public class TeamCityBuildService implements BuildService {
                         configId, repoRoot.getFileName(), branch);
                 String buildId = triggerBuild(configId, branch);
                 log.info("Build queued: id={} repo={}", buildId, repoRoot.getFileName());
-                queued.add(new QueuedBuild(buildId, configId, repoRoot));
+                queued.add(new QueuedBuild(buildId, configId, repoRoot, branch));
             }
 
             List<String> failures = new ArrayList<>();
             for (QueuedBuild b : queued) {
                 try {
-                    waitForCompletion(b.buildId(), b.repoRoot().getFileName().toString());
+                    waitForCompletionWithRetry(b.buildId(), b.configId(), b.repoRoot(), b.branch());
                     overallSucceeded.add(b.repoRoot());
                 } catch (RuntimeException e) {
                     failures.add("Build failed in repository: " + b.repoRoot() + "\n" +
@@ -99,6 +99,85 @@ public class TeamCityBuildService implements BuildService {
                         String.join("\n---\n", failures),
                         overallSucceeded);
             }
+        }
+    }
+
+    private void waitForCompletionWithRetry(String buildId, String configId, Path repoRoot, String branch) {
+        int maxAttempts = props.getMaxRetries() + 1;
+        String repoName = repoRoot.getFileName().toString();
+        String currentBuildId = buildId;
+        Set<Integer> excludedAgentIds = new LinkedHashSet<>();
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                waitForCompletion(currentBuildId, repoName);
+                return;
+            } catch (RuntimeException e) {
+                if (attempt == maxAttempts) throw e;
+                Integer failedAgentId = getAgentId(currentBuildId);
+                if (failedAgentId != null) {
+                    excludedAgentIds.add(failedAgentId);
+                    log.warn("  [TC] Build {} for {} failed on agent id={} (attempt {}/{}): {}",
+                            currentBuildId, repoName, failedAgentId, attempt, maxAttempts, e.getMessage());
+                } else {
+                    log.warn("  [TC] Build {} for {} failed (attempt {}/{}): {}",
+                            currentBuildId, repoName, attempt, maxAttempts, e.getMessage());
+                }
+                Integer alternativeAgentId = pickAlternativeAgent(configId, excludedAgentIds);
+                if (alternativeAgentId != null) {
+                    log.info("  [TC] Retriggering build config {} for {} (attempt {}) on agent id={}",
+                            configId, repoName, attempt + 1, alternativeAgentId);
+                } else {
+                    log.info("  [TC] Retriggering build config {} for {} (attempt {}) — no alternative agent found, letting TC decide",
+                            configId, repoName, attempt + 1);
+                }
+                currentBuildId = triggerBuild(configId, branch, alternativeAgentId);
+                log.info("  [TC] Retry build queued: id={} repo={}", currentBuildId, repoName);
+            }
+        }
+    }
+
+    private Integer getAgentId(String buildId) {
+        try {
+            String url = props.getUrl() + "/app/rest/builds/id:" + buildId + "?fields=agent(id,name)";
+            HttpResponse<String> response = httpClient.send(
+                    jsonRequest("GET", url, null), HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() >= 300) return null;
+            JsonNode agentNode = objectMapper.readTree(response.body()).path("agent");
+            if (agentNode.isMissingNode()) return null;
+            log.debug("Failed build {} ran on agent id={} name={}",
+                    buildId, agentNode.path("id").asInt(), agentNode.path("name").asText());
+            return agentNode.path("id").asInt();
+        } catch (Exception e) {
+            log.debug("Could not retrieve agent id for build {}: {}", buildId, e.getMessage());
+            return null;
+        }
+    }
+
+    private Integer pickAlternativeAgent(String configId, Set<Integer> excludedAgentIds) {
+        try {
+            String url = props.getUrl() + "/app/rest/agents" +
+                    "?locator=compatible:(buildType:(id:" + configId + ")),enabled:true,connected:true,authorized:true" +
+                    "&fields=agent(id,name)";
+            HttpResponse<String> response = httpClient.send(
+                    jsonRequest("GET", url, null), HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() >= 300) {
+                log.debug("Could not fetch compatible agents for {}: HTTP {}", configId, response.statusCode());
+                return null;
+            }
+            JsonNode agents = objectMapper.readTree(response.body()).path("agent");
+            if (!agents.isArray()) return null;
+            for (JsonNode agent : agents) {
+                int id = agent.path("id").asInt();
+                if (!excludedAgentIds.contains(id)) {
+                    log.debug("Selected alternative agent id={} name={}", id, agent.path("name").asText());
+                    return id;
+                }
+            }
+            log.debug("No compatible agent available outside excluded set {} for {}", excludedAgentIds, configId);
+            return null;
+        } catch (Exception e) {
+            log.debug("Could not pick alternative agent for {}: {}", configId, e.getMessage());
+            return null;
         }
     }
 
@@ -122,6 +201,10 @@ public class TeamCityBuildService implements BuildService {
     }
 
     private String triggerBuild(String configId, String branchName) {
+        return triggerBuild(configId, branchName, null);
+    }
+
+    private String triggerBuild(String configId, String branchName, Integer pinnedAgentId) {
         if (props.getUrl().isBlank()) {
             throw new RuntimeException("TeamCity is not configured: set teamcity.url and teamcity.token");
         }
@@ -130,6 +213,9 @@ public class TeamCityBuildService implements BuildService {
             payload.put("buildType", Map.of("id", configId));
             if (!branchName.isBlank()) {
                 payload.put("branchName", branchName);
+            }
+            if (pinnedAgentId != null) {
+                payload.put("agent", Map.of("id", pinnedAgentId));
             }
             List<Map<String, String>> buildProps = new ArrayList<>();
             buildProps.add(Map.of("name", "system.skipTests", "value", "true"));
