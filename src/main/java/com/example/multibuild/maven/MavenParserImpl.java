@@ -43,7 +43,7 @@ public class MavenParserImpl implements MavenParser {
         } catch (IOException e) {
             throw new RuntimeException("Failed to scan " + repoDir, e);
         }
-        return new RepositoryProject(repoDir.getFileName().toString(), modules, aggregatorParents);
+        return new RepositoryProject(repoDir.getFileName().toString(), repoDir, modules, aggregatorParents);
     }
 
     private void parsePom(Path pomPath, Path repoRoot,

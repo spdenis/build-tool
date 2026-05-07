@@ -52,9 +52,7 @@ public class ProjectAggregator {
             for (Module module : project.getModules()) {
                 repoByKey.put(module.getArtifact().key(), module.getRepoRoot());
             }
-            if (!project.getModules().isEmpty()) {
-                projectByRepo.putIfAbsent(project.getModules().get(0).getRepoRoot(), project);
-            }
+            projectByRepo.putIfAbsent(project.getRepoRoot(), project);
         }
 
         DependencyGraph<Path> graph = new DependencyGraph<>();
@@ -64,7 +62,7 @@ public class ProjectAggregator {
 
         for (RepositoryProject project : projects) {
             if (project.getModules().isEmpty()) continue;
-            Path fromRepo = project.getModules().get(0).getRepoRoot();
+            Path fromRepo = project.getRepoRoot();
 
             for (Module module : project.getModules()) {
                 for (Dependency dep : module.getDependencies()) {
