@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -61,6 +62,10 @@ public class BranchService {
             RepoConfig config = repoConfigByPath.get(repoDir);
             if (config != null && config.isPreserveVersion()) {
                 log.info("Skipping version validation for {} (preserveVersion=true)", repoDir.getFileName());
+                continue;
+            }
+            if (!Files.exists(repoDir.resolve("pom.xml"))) {
+                log.info("Skipping version validation for {} (no pom.xml)", repoDir.getFileName());
                 continue;
             }
 
@@ -119,6 +124,9 @@ public class BranchService {
         if (created) {
             if (repoConfig != null && repoConfig.isPreserveVersion()) {
                 log.info("Created branch {} in {}, preserveVersion=true — skipping version update",
+                        integrationBranch, repoDir.getFileName());
+            } else if (!Files.exists(repoDir.resolve("pom.xml"))) {
+                log.info("Created branch {} in {}, no pom.xml — skipping version update",
                         integrationBranch, repoDir.getFileName());
             } else {
                 log.info("Created branch {} in {}, updating pom versions", integrationBranch, repoDir.getFileName());

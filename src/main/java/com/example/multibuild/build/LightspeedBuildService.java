@@ -146,7 +146,15 @@ public class LightspeedBuildService implements BuildService {
             return;
         }
 
+        boolean hasPom = Files.exists(repoRoot.resolve("pom.xml"));
+
         if (release) {
+            if (!hasPom) {
+                // Release is triggered by the tag pushed in ReleaseService; no Maven artifacts to poll
+                log.info("  [LS] No pom.xml in {} — release triggered by tag, skipping artifact polling",
+                        repoRoot.getFileName());
+                return;
+            }
             String releaseVersion = buildBranchByRepo.get(repoRoot);
             if (releaseVersion == null) {
                 throw new RuntimeException(
@@ -159,6 +167,12 @@ public class LightspeedBuildService implements BuildService {
                     releaseArtifacts.size(), repoRoot.getFileName(), releaseVersion);
             pollUntilReleasePublished(repoRoot, releaseArtifacts);
         } else {
+            if (!hasPom) {
+                // No pom.xml — trigger via Jenkinsfile commit; no Maven artifacts to poll (fire-and-forget)
+                log.info("  [LS] No pom.xml in {} — triggering via Jenkinsfile", repoRoot.getFileName());
+                injectJenkinsfileAndPush(repoRoot);
+                return;
+            }
             // POM carries bare version (e.g. 1.0.1-SNAPSHOT); the pipeline publishes
             // under the full version (e.g. 1.0.1-integration-SNAPSHOT). Poll using that.
             List<Artifact> pollArtifacts = expandVersions(artifacts);
@@ -169,6 +183,30 @@ public class LightspeedBuildService implements BuildService {
             injectTriggerAndPush(repoRoot);
             pollUntilSnapshotsUpdated(repoRoot, pollArtifacts, baselines);
         }
+    }
+
+    private void injectJenkinsfileAndPush(Path repoRoot) {
+        Path jenkinsfile = repoRoot.resolve("Jenkinsfile");
+        if (!Files.exists(jenkinsfile)) {
+            log.warn("No Jenkinsfile found in {}, cannot trigger Lightspeed build", repoRoot.getFileName());
+            return;
+        }
+        try {
+            List<String> lines = new ArrayList<>(Files.readAllLines(jenkinsfile, StandardCharsets.UTF_8));
+            String triggerLine = "// build.trigger=" + Instant.now();
+            if (!lines.isEmpty() && lines.get(0).startsWith("// build.trigger=")) {
+                lines.set(0, triggerLine);
+            } else {
+                lines.add(0, triggerLine);
+            }
+            Files.writeString(jenkinsfile, String.join("\n", lines) + "\n", StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            log.warn("Could not update Jenkinsfile in {}: {}", repoRoot.getFileName(), e.getMessage());
+            return;
+        }
+        gitService.commitAllIfDirty(repoRoot, commitFormatter.format("chore: trigger ci build"));
+        gitService.push(repoRoot);
+        log.info("Pushed Jenkinsfile trigger commit for {}", repoRoot.getFileName());
     }
 
     // --- Snapshot flow ---

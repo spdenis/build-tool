@@ -14,6 +14,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collections;
 import java.util.HashMap;
@@ -61,7 +62,15 @@ public class ReleaseService {
         for (Path repoRoot : repoRoots) {
             String current = pomVersionUpdater.getRootVersion(repoRoot);
             if (current == null) {
-                log.warn("  [{}] Could not determine version, skipping", repoRoot.getFileName());
+                RepoConfig config = repoConfigs.get(repoRoot);
+                if (config != null && config.hasVersionOverride()) {
+                    String release = config.getVersion();
+                    releaseVersionByRepo.put(repoRoot, release);
+                    log.info("  [{}] No pom.xml — using version override {} as release version",
+                            repoRoot.getFileName(), release);
+                } else {
+                    log.warn("  [{}] No pom.xml and no version override — skipping release", repoRoot.getFileName());
+                }
                 continue;
             }
             String release = baseVersion(current);
@@ -90,8 +99,12 @@ public class ReleaseService {
                 if (release == null) continue;
                 String tagName = release;
                 gitService.deleteTagIfExists(repoRoot, tagName);
-                log.info("  [{}] Committing, tagging {}", repoRoot.getFileName(), tagName);
-                gitService.commitAll(repoRoot, "chore: release " + release);
+                if (Files.exists(repoRoot.resolve("pom.xml"))) {
+                    log.info("  [{}] Committing, tagging {}", repoRoot.getFileName(), tagName);
+                    gitService.commitAll(repoRoot, "chore: release " + release);
+                } else {
+                    log.info("  [{}] No pom.xml — tagging {} directly on HEAD", repoRoot.getFileName(), tagName);
+                }
                 gitService.createTag(repoRoot, tagName, "Release " + release);
                 if (isDryRun(repoConfigs.get(repoRoot))) {
                     log.info("  [{}] Dry mode — skipping push/pushTag", repoRoot.getFileName());
@@ -110,6 +123,13 @@ public class ReleaseService {
                 if (v != null) {
                     releaseVersionByRepo.put(repoRoot, v);
                     log.info("  [{}] Resumed at version {}", repoRoot.getFileName(), v);
+                } else {
+                    RepoConfig config = repoConfigs.get(repoRoot);
+                    if (config != null && config.hasVersionOverride()) {
+                        releaseVersionByRepo.put(repoRoot, config.getVersion());
+                        log.info("  [{}] No pom.xml — using version override {} on resume",
+                                repoRoot.getFileName(), config.getVersion());
+                    }
                 }
             }
             releaseVersionByKey.clear();
@@ -165,6 +185,11 @@ public class ReleaseService {
             for (Path repoRoot : newlyBuilt) {
                 String release = releaseVersionByRepo.get(repoRoot);
                 if (release == null) continue;
+                if (!Files.exists(repoRoot.resolve("pom.xml"))) {
+                    log.info("  [{}] No pom.xml — skipping version bump", repoRoot.getFileName());
+                    resumeState.markCompleted(repoRoot);
+                    continue;
+                }
                 String nextSnapshot = incrementPatch(release) + "-SNAPSHOT";
                 log.info("  [{}] Bumping {} → {}", repoRoot.getFileName(), release, nextSnapshot);
 
