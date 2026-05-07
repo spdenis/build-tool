@@ -125,9 +125,19 @@ public class BranchService {
             if (repoConfig != null && repoConfig.isPreserveVersion()) {
                 log.info("Created branch {} in {}, preserveVersion=true — skipping version update",
                         integrationBranch, repoDir.getFileName());
+                if (isDryRun(dryMode, repoConfig)) {
+                    log.info("Dry mode — skipping push for {}", repoDir.getFileName());
+                } else {
+                    gitService.push(repoDir);
+                }
             } else if (!Files.exists(repoDir.resolve("pom.xml"))) {
                 log.info("Created branch {} in {}, no pom.xml — skipping version update",
                         integrationBranch, repoDir.getFileName());
+                if (isDryRun(dryMode, repoConfig)) {
+                    log.info("Dry mode — skipping push for {}", repoDir.getFileName());
+                } else {
+                    gitService.push(repoDir);
+                }
             } else {
                 log.info("Created branch {} in {}, updating pom versions", integrationBranch, repoDir.getFileName());
                 String newVersion = isLightspeed(repoConfig)
