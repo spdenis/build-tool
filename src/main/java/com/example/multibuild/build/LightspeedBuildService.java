@@ -149,20 +149,37 @@ public class LightspeedBuildService implements BuildService {
         boolean hasPom = Files.exists(repoRoot.resolve("pom.xml"));
 
         if (release) {
-            if (!hasPom) {
-                // Release is triggered by the tag pushed in ReleaseService; no Maven artifacts to poll
-                log.info("  [LS] No pom.xml in {} — release triggered by tag, skipping artifact polling",
-                        repoRoot.getFileName());
-                return;
-            }
             String releaseVersion = buildBranchByRepo.get(repoRoot);
             if (releaseVersion == null) {
                 throw new RuntimeException(
                         "No release version found for " + repoRoot.getFileName() + " in buildBranchByRepo");
             }
-            List<Artifact> releaseArtifacts = artifacts.stream()
-                    .map(a -> new Artifact(a.getGroupId(), a.getArtifactId(), releaseVersion))
-                    .toList();
+
+            List<Artifact> releaseArtifacts;
+            if (!hasPom) {
+                // No pom.xml — release triggered by tag push in ReleaseService.
+                // Poll for any explicitly declared artifacts in the repo config.
+                List<String> coords = repoConfig != null ? repoConfig.getReleaseArtifacts() : List.of();
+                if (coords.isEmpty()) {
+                    log.info("  [LS] No pom.xml and no releaseArtifacts declared in {} — skipping artifact polling",
+                            repoRoot.getFileName());
+                    return;
+                }
+                releaseArtifacts = coords.stream()
+                        .map(coord -> {
+                            String[] parts = coord.split(":", 2);
+                            if (parts.length != 2) throw new RuntimeException(
+                                    "Invalid releaseArtifact coord '" + coord + "' in " + repoRoot.getFileName() +
+                                    " — expected groupId:artifactId");
+                            return new Artifact(parts[0], parts[1], releaseVersion);
+                        })
+                        .toList();
+            } else {
+                releaseArtifacts = artifacts.stream()
+                        .map(a -> new Artifact(a.getGroupId(), a.getArtifactId(), releaseVersion))
+                        .toList();
+            }
+
             log.info("Polling Maven releases for {} artifact(s) in {} (version {})",
                     releaseArtifacts.size(), repoRoot.getFileName(), releaseVersion);
             pollUntilReleasePublished(repoRoot, releaseArtifacts);

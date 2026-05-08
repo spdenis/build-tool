@@ -100,8 +100,13 @@ public class ReleaseService {
                 String tagName = release;
                 gitService.deleteTagIfExists(repoRoot, tagName);
                 if (Files.exists(repoRoot.resolve("pom.xml"))) {
-                    log.info("  [{}] Committing, tagging {}", repoRoot.getFileName(), tagName);
-                    gitService.commitAll(repoRoot, "chore: release " + release);
+                    boolean committed = gitService.commitAllIfDirty(repoRoot, "chore: release " + release);
+                    if (committed) {
+                        log.info("  [{}] Committed release version, tagging {}", repoRoot.getFileName(), tagName);
+                    } else {
+                        log.info("  [{}] Nothing to commit (pom already at release version), tagging {} on HEAD",
+                                repoRoot.getFileName(), tagName);
+                    }
                 } else {
                     log.info("  [{}] No pom.xml — tagging {} directly on HEAD", repoRoot.getFileName(), tagName);
                 }

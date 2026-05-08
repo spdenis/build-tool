@@ -1,5 +1,5 @@
 package com.example.multibuild.model;
 
 public enum BuildMode {
-    SNAPSHOT, RELEASE
+    SNAPSHOT, RELEASE, RELEASE_INIT
 }

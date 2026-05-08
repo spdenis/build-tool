@@ -148,6 +148,11 @@ public class Main implements CommandLineRunner {
             repoConfigByPath.put(cloned, entry);
         }
 
+        if (buildMode == BuildMode.RELEASE_INIT) {
+            log.info("══ Release init complete — {} repo(s) branched ══════════", clonedPaths.size());
+            return;
+        }
+
         if (buildEnabled && buildMode != BuildMode.RELEASE) {
             List<Path> pathsToValidate = clonedPaths.stream()
                     .filter(p -> !repoConfigByPath.get(p).hasVersionOverride())

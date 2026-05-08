@@ -2,6 +2,8 @@ package com.example.multibuild.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 
+import java.util.List;
+
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class RepoConfig {
 
@@ -13,6 +15,9 @@ public class RepoConfig {
     private String teamcityReleaseConfigId;
     private boolean dryRun;
     private boolean preserveVersion;
+    // Artifact coordinates (groupId:artifactId) to poll in the Maven release repo after a release build.
+    // Required for repos without pom.xml; ignored for repos that have one (modules are discovered automatically).
+    private List<String> releaseArtifacts;
 
     public String getUrl() { return url; }
     public void setUrl(String url) { this.url = url; }
@@ -47,4 +52,7 @@ public class RepoConfig {
 
     public boolean isPreserveVersion() { return preserveVersion; }
     public void setPreserveVersion(boolean preserveVersion) { this.preserveVersion = preserveVersion; }
+
+    public List<String> getReleaseArtifacts() { return releaseArtifacts != null ? releaseArtifacts : List.of(); }
+    public void setReleaseArtifacts(List<String> releaseArtifacts) { this.releaseArtifacts = releaseArtifacts; }
 }
