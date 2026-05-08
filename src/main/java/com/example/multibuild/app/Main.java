@@ -37,6 +37,9 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
 
 @SpringBootApplication
@@ -130,22 +133,62 @@ public class Main implements CommandLineRunner {
         ResumeState resumeState = loadResumeState(stateFile);
 
         // ── Phase: clone & branch ──────────────────────────────────
-        log.info("── Phase 1/3: clone & branch ─────────────────────────");
-        List<Path> clonedPaths = new ArrayList<>();
-        Map<Path, RepoConfig> repoConfigByPath = new LinkedHashMap<>();
-        for (int i = 0; i < repoEntries.size(); i++) {
-            RepoConfig entry = repoEntries.get(i);
-            String url = entry.getUrl();
-            String repoName = url.substring(url.lastIndexOf('/') + 1).replace(".git", "");
-            log.info("  [{}/{}] {}", i + 1, repoEntries.size(), repoName);
-            String cloneUrl = gitAuthTokenInUrl ? withToken(url, githubToken) : url;
-            Path cloned = gitService.cloneRepo(cloneUrl, workDir.resolve(repoName));
-            branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry);
-            if (entry.hasVersionOverride()) {
-                applyVersionOverride(cloned, entry.getVersion(), entry);
+        log.info("── Phase 1/3: clone & branch ({} repo(s), parallel) ──", repoEntries.size());
+        int total = repoEntries.size();
+        // Pre-sized array keeps insertion order without synchronization (each index written by one thread)
+        Path[] clonedArray = new Path[total];
+
+        var cloneExecutor = Executors.newCachedThreadPool();
+        try {
+            List<CompletableFuture<Void>> cloneFutures = new ArrayList<>(total);
+            for (int i = 0; i < total; i++) {
+                final int idx = i;
+                RepoConfig entry = repoEntries.get(i);
+                String url = entry.getUrl();
+                String repoName = url.substring(url.lastIndexOf('/') + 1).replace(".git", "");
+                String cloneUrl = gitAuthTokenInUrl ? withToken(url, githubToken) : url;
+                cloneFutures.add(CompletableFuture.runAsync(() -> {
+                    log.info("  Cloning {}", repoName);
+                    Path cloned = gitService.cloneRepo(cloneUrl, workDir.resolve(repoName));
+                    branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry);
+                    if (entry.hasVersionOverride()) {
+                        applyVersionOverride(cloned, entry.getVersion(), entry);
+                    }
+                    clonedArray[idx] = cloned;
+                    log.info("  Done: {}", repoName);
+                }, cloneExecutor));
             }
-            clonedPaths.add(cloned);
-            repoConfigByPath.put(cloned, entry);
+
+            try {
+                CompletableFuture.allOf(cloneFutures.toArray(new CompletableFuture[0])).join();
+            } catch (CompletionException ignored) {
+                // at least one failed; collect all errors below
+            }
+            List<String> cloneErrors = cloneFutures.stream()
+                    .filter(CompletableFuture::isCompletedExceptionally)
+                    .map(f -> {
+                        try { f.join(); return null; }
+                        catch (CompletionException e) {
+                            Throwable cause = e.getCause() != null ? e.getCause() : e;
+                            return cause.getMessage() != null ? cause.getMessage() : cause.toString();
+                        }
+                    })
+                    .toList();
+            if (!cloneErrors.isEmpty()) {
+                System.err.println("\n[BUILD FAILED]\n" + String.join("\n---\n", cloneErrors));
+                System.exit(1);
+            }
+        } finally {
+            cloneExecutor.shutdown();
+        }
+
+        List<Path> clonedPaths = new ArrayList<>(total);
+        Map<Path, RepoConfig> repoConfigByPath = new LinkedHashMap<>();
+        for (int i = 0; i < total; i++) {
+            if (clonedArray[i] != null) {
+                clonedPaths.add(clonedArray[i]);
+                repoConfigByPath.put(clonedArray[i], repoEntries.get(i));
+            }
         }
 
         if (buildMode == BuildMode.RELEASE_INIT) {
