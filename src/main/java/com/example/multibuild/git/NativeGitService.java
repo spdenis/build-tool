@@ -77,7 +77,8 @@ public class NativeGitService implements GitService {
             String output = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
             int exit = proc.waitFor();
             if (exit != 0) {
-                throw new RuntimeException("git command failed (exit " + exit + "): "
+                String location = dir != null ? " [" + dir.getFileName() + "]" : "";
+                throw new RuntimeException("git command failed (exit " + exit + ")" + location + ": "
                         + String.join(" ", cmd) + "\n" + output.trim());
             }
             return output;
@@ -96,7 +97,8 @@ public class NativeGitService implements GitService {
             pb.environment().putAll(gitEnv());
             int exit = pb.start().waitFor();
             if (exit != 0) {
-                throw new RuntimeException("git command failed (exit " + exit + "): "
+                String location = dir != null ? " [" + dir.getFileName() + "]" : "";
+                throw new RuntimeException("git command failed (exit " + exit + ")" + location + ": "
                         + String.join(" ", cmd));
             }
         } catch (IOException | InterruptedException e) {

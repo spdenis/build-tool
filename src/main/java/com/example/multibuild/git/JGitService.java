@@ -193,7 +193,7 @@ public class JGitService implements GitService {
             fetch.call();
             return targetDir;
         } catch (GitAPIException | IOException e) {
-            throw new RuntimeException("Failed to update " + url, e);
+            throw new RuntimeException("Failed to update [" + targetDir.getFileName() + "] " + url, e);
         }
     }
 
@@ -217,7 +217,7 @@ public class JGitService implements GitService {
             cmd.call().close();
             return targetDir;
         } catch (GitAPIException e) {
-            throw new RuntimeException("Failed to clone " + url, e);
+            throw new RuntimeException("Failed to clone [" + targetDir.getFileName() + "] " + url, e);
         }
     }
 
