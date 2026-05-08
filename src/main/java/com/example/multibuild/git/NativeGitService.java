@@ -162,13 +162,21 @@ public class NativeGitService implements GitService {
         // with shallow clones (git clone --depth N only fetches the default branch).
         String lsRemote = exec(repoDir, "git", "ls-remote", "--heads", "origin", branchName);
         if (!lsRemote.isBlank()) {
-            // Fetch without depth: shallow fetches with an explicit refspec may not create
-            // the remote tracking ref, causing checkout --track to fail with
-            // "starting point 'origin/X' is not a branch". A targeted single-branch
-            // fetch doesn't need depth.
-            exec(repoDir, "git", "fetch", "origin",
-                    "refs/heads/" + branchName + ":refs/remotes/origin/" + branchName);
-            exec(repoDir, "git", "checkout", "-b", branchName, "--track", "origin/" + branchName);
+            // Register the branch in the remote's fetch refspecs before fetching.
+            // Without this, shallow single-branch clones silently skip writing the
+            // remote tracking ref (refs/remotes/origin/X), which causes both:
+            //   - depth=1: checkout --track fails ("starting point not a branch")
+            //   - depth=0: fetch appears to create the tracking ref but a stale local
+            //              branch may already exist, causing checkout -b to fail
+            exec(repoDir, "git", "remote", "set-branches", "--add", "origin", branchName);
+            List<String> fetchCmd = new ArrayList<>(List.of("git", "fetch", "origin", branchName));
+            if (cloneDepth > 0) {
+                fetchCmd.addAll(List.of("--depth", String.valueOf(cloneDepth)));
+            }
+            exec(repoDir, fetchCmd.toArray(String[]::new));
+            // DWIM checkout: if local branch already exists, switches to it;
+            // if only the tracking ref exists, auto-creates a local tracking branch.
+            exec(repoDir, "git", "checkout", branchName);
             return false;
         }
 

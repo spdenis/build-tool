@@ -38,6 +38,7 @@ import java.net.SocketAddress;
 import java.net.URI;
 import java.nio.file.Path;
 import java.security.PublicKey;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -247,25 +248,44 @@ public class JGitService implements GitService {
             boolean remoteExists = lsRemote.call().stream()
                     .anyMatch(ref -> ref.getName().equals("refs/heads/" + branchName));
             if (remoteExists) {
-                // Fetch the specific branch without depth: shallow fetches with an explicit
-                // refspec may not create the remote tracking ref, causing the subsequent
-                // checkout --track to fail. A targeted single-branch fetch doesn't need depth.
+                // Register the branch in the remote's fetch refspecs before fetching.
+                // Without this, shallow single-branch clones silently skip writing the
+                // remote tracking ref (refs/remotes/origin/X), which causes checkout --track
+                // to fail with "starting point is not a branch".
+                String fetchRefSpec = "+refs/heads/" + branchName + ":refs/remotes/origin/" + branchName;
+                StoredConfig config = git.getRepository().getConfig();
+                List<String> existingRefSpecs = new ArrayList<>(
+                        Arrays.asList(config.getStringList("remote", "origin", "fetch")));
+                if (!existingRefSpecs.contains(fetchRefSpec)) {
+                    existingRefSpecs.add(fetchRefSpec);
+                    config.setStringList("remote", "origin", "fetch", existingRefSpecs);
+                    config.save();
+                }
+
                 var fetch = git.fetch()
                         .setRemote("origin")
-                        .setRefSpecs(new RefSpec(
-                                "refs/heads/" + branchName + ":refs/remotes/origin/" + branchName))
+                        .setRefSpecs(new RefSpec(fetchRefSpec))
                         .setTransportConfigCallback(sshTransportCallback())
                         .setTimeout(gitTimeoutSeconds);
                 if (!isSshRemote(git) && !githubToken.isBlank() && !remoteHasEmbeddedCredentials(git)) {
                     fetch.setCredentialsProvider(httpCredentials());
                 }
                 fetch.call();
-                git.checkout()
-                        .setCreateBranch(true)
-                        .setName(branchName)
-                        .setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.TRACK)
-                        .setStartPoint("origin/" + branchName)
-                        .call();
+
+                // DWIM: if local branch already exists, just switch to it;
+                // otherwise auto-create a local tracking branch from origin/X.
+                boolean localNowExists = git.branchList().call().stream()
+                        .anyMatch(ref -> ref.getName().equals("refs/heads/" + branchName));
+                if (localNowExists) {
+                    git.checkout().setName(branchName).call();
+                } else {
+                    git.checkout()
+                            .setCreateBranch(true)
+                            .setName(branchName)
+                            .setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.TRACK)
+                            .setStartPoint("origin/" + branchName)
+                            .call();
+                }
                 return false;
             }
 
