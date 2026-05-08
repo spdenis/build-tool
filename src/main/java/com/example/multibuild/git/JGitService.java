@@ -235,12 +235,32 @@ public class JGitService implements GitService {
                 return false;
             }
 
-            List<Ref> remoteBranches = git.branchList()
-                    .setListMode(ListBranchCommand.ListMode.REMOTE)
-                    .call();
-            boolean remoteExists = remoteBranches.stream()
-                    .anyMatch(ref -> ref.getName().equals("refs/remotes/origin/" + branchName));
+            // Use ls-remote to query the actual remote: local tracking refs may be absent
+            // with shallow clones (git clone --depth N only fetches the default branch).
+            var lsRemote = git.lsRemote()
+                    .setRemote("origin")
+                    .setHeads(true)
+                    .setTransportConfigCallback(sshTransportCallback());
+            if (!isSshRemote(git) && !githubToken.isBlank() && !remoteHasEmbeddedCredentials(git)) {
+                lsRemote.setCredentialsProvider(httpCredentials());
+            }
+            boolean remoteExists = lsRemote.call().stream()
+                    .anyMatch(ref -> ref.getName().equals("refs/heads/" + branchName));
             if (remoteExists) {
+                // Fetch the specific branch so it is available as a tracking ref
+                var fetch = git.fetch()
+                        .setRemote("origin")
+                        .setRefSpecs(new RefSpec(
+                                "refs/heads/" + branchName + ":refs/remotes/origin/" + branchName))
+                        .setTransportConfigCallback(sshTransportCallback())
+                        .setTimeout(gitTimeoutSeconds);
+                if (!isSshRemote(git) && !githubToken.isBlank() && !remoteHasEmbeddedCredentials(git)) {
+                    fetch.setCredentialsProvider(httpCredentials());
+                }
+                if (cloneDepth > 0) {
+                    fetch.setDepth(cloneDepth);
+                }
+                fetch.call();
                 git.checkout()
                         .setCreateBranch(true)
                         .setName(branchName)

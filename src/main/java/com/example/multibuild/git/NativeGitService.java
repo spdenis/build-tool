@@ -158,8 +158,17 @@ public class NativeGitService implements GitService {
             return false;
         }
 
-        String remoteMatch = exec(repoDir, "git", "branch", "-r", "--list", "origin/" + branchName);
-        if (!remoteMatch.isBlank()) {
+        // Use ls-remote to query the actual remote: local tracking refs may be absent
+        // with shallow clones (git clone --depth N only fetches the default branch).
+        String lsRemote = exec(repoDir, "git", "ls-remote", "--heads", "origin", branchName);
+        if (!lsRemote.isBlank()) {
+            List<String> fetchCmd = new ArrayList<>(List.of(
+                    "git", "fetch", "origin",
+                    "refs/heads/" + branchName + ":refs/remotes/origin/" + branchName));
+            if (cloneDepth > 0) {
+                fetchCmd.addAll(List.of("--depth", String.valueOf(cloneDepth)));
+            }
+            exec(repoDir, fetchCmd.toArray(String[]::new));
             exec(repoDir, "git", "checkout", "-b", branchName, "--track", "origin/" + branchName);
             return false;
         }
