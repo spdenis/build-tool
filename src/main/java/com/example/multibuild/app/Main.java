@@ -117,6 +117,17 @@ public class Main implements CommandLineRunner {
         List<RepoConfig> repoEntries = objectMapper.readValue(
                 Paths.get(args[0]).toFile(), new TypeReference<List<RepoConfig>>() {});
 
+        Set<String> seen = new LinkedHashSet<>();
+        List<String> duplicates = new ArrayList<>();
+        for (RepoConfig entry : repoEntries) {
+            if (!seen.add(entry.getUrl())) duplicates.add(entry.getUrl());
+        }
+        if (!duplicates.isEmpty()) {
+            System.err.println("[ERROR] Duplicate repository URL(s) in " + args[0] + ":");
+            duplicates.forEach(u -> System.err.println("  " + u));
+            System.exit(1);
+        }
+
         log.info("══════════════════════════════════════════════════════");
         log.info("  MultiBuild  mode={}  repos={}  build={}  dryMode={}",
                 buildMode, repoEntries.size(),
