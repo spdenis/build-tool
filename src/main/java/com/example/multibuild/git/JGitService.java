@@ -247,7 +247,9 @@ public class JGitService implements GitService {
             boolean remoteExists = lsRemote.call().stream()
                     .anyMatch(ref -> ref.getName().equals("refs/heads/" + branchName));
             if (remoteExists) {
-                // Fetch the specific branch so it is available as a tracking ref
+                // Fetch the specific branch without depth: shallow fetches with an explicit
+                // refspec may not create the remote tracking ref, causing the subsequent
+                // checkout --track to fail. A targeted single-branch fetch doesn't need depth.
                 var fetch = git.fetch()
                         .setRemote("origin")
                         .setRefSpecs(new RefSpec(
@@ -256,9 +258,6 @@ public class JGitService implements GitService {
                         .setTimeout(gitTimeoutSeconds);
                 if (!isSshRemote(git) && !githubToken.isBlank() && !remoteHasEmbeddedCredentials(git)) {
                     fetch.setCredentialsProvider(httpCredentials());
-                }
-                if (cloneDepth > 0) {
-                    fetch.setDepth(cloneDepth);
                 }
                 fetch.call();
                 git.checkout()

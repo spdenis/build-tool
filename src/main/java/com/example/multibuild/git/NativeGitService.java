@@ -162,13 +162,12 @@ public class NativeGitService implements GitService {
         // with shallow clones (git clone --depth N only fetches the default branch).
         String lsRemote = exec(repoDir, "git", "ls-remote", "--heads", "origin", branchName);
         if (!lsRemote.isBlank()) {
-            List<String> fetchCmd = new ArrayList<>(List.of(
-                    "git", "fetch", "origin",
-                    "refs/heads/" + branchName + ":refs/remotes/origin/" + branchName));
-            if (cloneDepth > 0) {
-                fetchCmd.addAll(List.of("--depth", String.valueOf(cloneDepth)));
-            }
-            exec(repoDir, fetchCmd.toArray(String[]::new));
+            // Fetch without depth: shallow fetches with an explicit refspec may not create
+            // the remote tracking ref, causing checkout --track to fail with
+            // "starting point 'origin/X' is not a branch". A targeted single-branch
+            // fetch doesn't need depth.
+            exec(repoDir, "git", "fetch", "origin",
+                    "refs/heads/" + branchName + ":refs/remotes/origin/" + branchName);
             exec(repoDir, "git", "checkout", "-b", branchName, "--track", "origin/" + branchName);
             return false;
         }
