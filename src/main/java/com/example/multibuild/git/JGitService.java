@@ -174,7 +174,7 @@ public class JGitService implements GitService {
             String configuredUrl = git.getRepository().getConfig().getString("remote", "origin", "url");
             if (!url.equals(configuredUrl)) {
                 log.warn("  Remote URL mismatch in {} (expected '{}', found '{}') — re-cloning",
-                        targetDir.getFileName(), url, configuredUrl);
+                        targetDir.getFileName(), maskUrl(url), maskUrl(configuredUrl));
                 return doClone(url, targetDir);
             }
             // Discard any uncommitted changes left by a previous run
@@ -194,13 +194,13 @@ public class JGitService implements GitService {
             fetch.call();
             return targetDir;
         } catch (GitAPIException | IOException e) {
-            throw new RuntimeException("Failed to update [" + targetDir.getFileName() + "] " + url, e);
+            throw new RuntimeException("Failed to update [" + targetDir.getFileName() + "] " + maskUrl(url), e);
         }
     }
 
     private Path doClone(String url, Path targetDir) {
         FileSystemUtils.deleteRecursively(targetDir.toFile());
-        log.info("Cloning {} into {}", url, targetDir.toAbsolutePath());
+        log.info("Cloning {} into {}", maskUrl(url), targetDir.toAbsolutePath());
         try {
             CloneCommand cmd = Git.cloneRepository()
                     .setURI(url)
@@ -218,7 +218,7 @@ public class JGitService implements GitService {
             cmd.call().close();
             return targetDir;
         } catch (GitAPIException e) {
-            throw new RuntimeException("Failed to clone [" + targetDir.getFileName() + "] " + url, e);
+            throw new RuntimeException("Failed to clone [" + targetDir.getFileName() + "] " + maskUrl(url), e);
         }
     }
 
@@ -482,6 +482,10 @@ public class JGitService implements GitService {
 
         sshdFactory = builder.build(null);
         return sshdFactory;
+    }
+
+    private static String maskUrl(String url) {
+        return url.replaceAll("(https?://)([^@]+@)", "$1***@");
     }
 
     private static boolean isSsh(String url) {

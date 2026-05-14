@@ -2,6 +2,7 @@ package com.example.multibuild.app;
 
 import com.example.multibuild.build.BuildFailedException;
 import com.example.multibuild.build.BuildService;
+import com.example.multibuild.git.GitHubService;
 import com.example.multibuild.git.GitService;
 import com.example.multibuild.graph.DependencyGraph;
 import com.example.multibuild.maven.PomVersionUpdater;
@@ -81,12 +82,13 @@ public class Main implements CommandLineRunner {
     private final ReleaseService releaseService;
     private final ObjectMapper objectMapper;
     private final CommitMessageFormatter commitFormatter;
+    private final GitHubService gitHubService;
 
     public Main(GitService gitService, BranchService branchService,
                 PomVersionUpdater pomVersionUpdater,
                 ProjectAggregator aggregator, DependencyVersionService dependencyVersionService,
                 BuildService buildService, ReleaseService releaseService, ObjectMapper objectMapper,
-                CommitMessageFormatter commitFormatter) {
+                CommitMessageFormatter commitFormatter, GitHubService gitHubService) {
         this.gitService = gitService;
         this.branchService = branchService;
         this.pomVersionUpdater = pomVersionUpdater;
@@ -96,6 +98,7 @@ public class Main implements CommandLineRunner {
         this.releaseService = releaseService;
         this.objectMapper = objectMapper;
         this.commitFormatter = commitFormatter;
+        this.gitHubService = gitHubService;
     }
 
     public static void main(String[] args) {
@@ -104,29 +107,33 @@ public class Main implements CommandLineRunner {
 
     @Override
     public void run(String... args) throws Exception {
-        if (args.length < 1) {
-            System.err.println("Usage: java -jar multibuild.jar repos.json");
+        if (args.length < 2) {
+            System.err.println("Usage: java -jar multibuild.jar build        repos.json");
+            System.err.println("       java -jar multibuild.jar release-init repos.json");
+            System.err.println("       java -jar multibuild.jar create-prs   repos.json");
             System.exit(1);
         }
+        switch (args[0]) {
+            case "build"        -> runBuild(args[1]);
+            case "release-init" -> runReleaseInit(args[1]);
+            case "create-prs"   -> runCreatePrs(args[1]);
+            default -> {
+                System.err.println("[ERROR] Unknown command: " + args[0]);
+                System.err.println("Usage: java -jar multibuild.jar build        repos.json");
+                System.err.println("       java -jar multibuild.jar release-init repos.json");
+                System.err.println("       java -jar multibuild.jar create-prs   repos.json");
+                System.exit(1);
+            }
+        }
+    }
 
+    private void runBuild(String reposFile) throws Exception {
         if (branchService.getIntegrationBranch().isBlank()) {
             System.err.println("[ERROR] integration.branch is required but not set.");
             System.exit(1);
         }
 
-        List<RepoConfig> repoEntries = objectMapper.readValue(
-                Paths.get(args[0]).toFile(), new TypeReference<List<RepoConfig>>() {});
-
-        Set<String> seen = new LinkedHashSet<>();
-        List<String> duplicates = new ArrayList<>();
-        for (RepoConfig entry : repoEntries) {
-            if (!seen.add(entry.getUrl())) duplicates.add(entry.getUrl());
-        }
-        if (!duplicates.isEmpty()) {
-            System.err.println("[ERROR] Duplicate repository URL(s) in " + args[0] + ":");
-            duplicates.forEach(u -> System.err.println("  " + u));
-            System.exit(1);
-        }
+        List<RepoConfig> repoEntries = loadRepos(reposFile);
 
         log.info("══════════════════════════════════════════════════════");
         log.info("  MultiBuild  mode={}  repos={}  build={}  dryMode={}",
@@ -143,69 +150,10 @@ public class Main implements CommandLineRunner {
 
         ResumeState resumeState = loadResumeState(stateFile);
 
-        // ── Phase: clone & branch ──────────────────────────────────
         log.info("── Phase 1/3: clone & branch ({} repo(s), parallel) ──", repoEntries.size());
-        int total = repoEntries.size();
-        // Pre-sized array keeps insertion order without synchronization (each index written by one thread)
-        Path[] clonedArray = new Path[total];
-
-        var cloneExecutor = Executors.newCachedThreadPool();
-        try {
-            List<CompletableFuture<Void>> cloneFutures = new ArrayList<>(total);
-            for (int i = 0; i < total; i++) {
-                final int idx = i;
-                RepoConfig entry = repoEntries.get(i);
-                String url = entry.getUrl();
-                String repoName = url.substring(url.lastIndexOf('/') + 1).replace(".git", "");
-                String cloneUrl = gitAuthTokenInUrl ? withToken(url, githubToken) : url;
-                cloneFutures.add(CompletableFuture.runAsync(() -> {
-                    log.info("  Cloning {}", repoName);
-                    Path cloned = gitService.cloneRepo(cloneUrl, workDir.resolve(repoName));
-                    branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry);
-                    if (entry.hasVersionOverride()) {
-                        applyVersionOverride(cloned, entry.getVersion(), entry);
-                    }
-                    clonedArray[idx] = cloned;
-                    log.info("  Done: {}", repoName);
-                }, cloneExecutor));
-            }
-
-            try {
-                CompletableFuture.allOf(cloneFutures.toArray(new CompletableFuture[0])).join();
-            } catch (CompletionException ignored) {
-                // at least one failed; collect all errors below
-            }
-            List<String> cloneErrors = cloneFutures.stream()
-                    .filter(CompletableFuture::isCompletedExceptionally)
-                    .map(f -> {
-                        try { f.join(); return null; }
-                        catch (CompletionException e) {
-                            Throwable cause = e.getCause() != null ? e.getCause() : e;
-                            return cause.getMessage() != null ? cause.getMessage() : cause.toString();
-                        }
-                    })
-                    .toList();
-            if (!cloneErrors.isEmpty()) {
-                System.err.println("\n[BUILD FAILED]\n" + String.join("\n---\n", cloneErrors));
-                System.exit(1);
-            }
-        } finally {
-            cloneExecutor.shutdown();
-        }
-
-        List<Path> clonedPaths = new ArrayList<>(total);
-        Map<Path, RepoConfig> repoConfigByPath = new LinkedHashMap<>();
-        for (int i = 0; i < total; i++) {
-            if (clonedArray[i] != null) {
-                clonedPaths.add(clonedArray[i]);
-                repoConfigByPath.put(clonedArray[i], repoEntries.get(i));
-            }
-        }
-
-        if (buildMode == BuildMode.RELEASE_INIT) {
-            log.info("══ Release init complete — {} repo(s) branched ══════════", clonedPaths.size());
-            return;
-        }
+        CloneResult cloned = cloneAndBranch(repoEntries, workDir);
+        List<Path> clonedPaths = cloned.paths();
+        Map<Path, RepoConfig> repoConfigByPath = cloned.configByPath();
 
         if (buildEnabled && buildMode != BuildMode.RELEASE) {
             List<Path> pathsToValidate = clonedPaths.stream()
@@ -288,6 +236,138 @@ public class Main implements CommandLineRunner {
         }
 
         System.out.println(objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(result));
+    }
+
+    private void runReleaseInit(String reposFile) throws Exception {
+        if (branchService.getIntegrationBranch().isBlank()) {
+            System.err.println("[ERROR] integration.branch is required but not set.");
+            System.exit(1);
+        }
+
+        List<RepoConfig> repoEntries = loadRepos(reposFile);
+        log.info("── Release init: clone & branch ({} repo(s), parallel) ──", repoEntries.size());
+
+        Path workDir = Paths.get(cloneDir);
+        Files.createDirectories(workDir);
+
+        CloneResult result = cloneAndBranch(repoEntries, workDir);
+        log.info("══ Release init complete — {} repo(s) branched ══════════", result.paths().size());
+    }
+
+    private void runCreatePrs(String reposFile) throws Exception {
+        if (branchService.getIntegrationBranch().isBlank()) {
+            System.err.println("[ERROR] integration.branch is required but not set.");
+            System.exit(1);
+        }
+
+        List<RepoConfig> repoEntries = loadRepos(reposFile);
+
+        String integrationBranch = branchService.getIntegrationBranch();
+        log.info("── Creating pull requests: {} → source branch ({} repo(s)) ──",
+                integrationBranch, repoEntries.size());
+
+        List<String> prUrls = new ArrayList<>();
+        List<String> errors = new ArrayList<>();
+
+        for (RepoConfig entry : repoEntries) {
+            String repoUrl = entry.getUrl();
+            String repoName = repoUrl.substring(repoUrl.lastIndexOf('/') + 1).replace(".git", "");
+            String sourceBranch = entry.getEffectiveSourceBranch(defaultSourceBranch);
+            String title = "Merge " + integrationBranch + " into " + sourceBranch;
+            try {
+                String prUrl = gitHubService.createOrFindPr(repoUrl, integrationBranch, sourceBranch, title);
+                prUrls.add(prUrl);
+                log.info("  {} — PR ready", repoName);
+            } catch (Exception e) {
+                log.error("  {} — FAILED: {}", repoName, e.getMessage());
+                errors.add(repoName + ": " + e.getMessage());
+            }
+        }
+
+        log.info("── Pull request URLs ─────────────────────────────────────");
+        prUrls.forEach(url -> log.info("  {}", url));
+
+        if (!errors.isEmpty()) {
+            System.err.println("\n[ERRORS]");
+            errors.forEach(e -> System.err.println("  " + e));
+            System.exit(1);
+        }
+    }
+
+    private record CloneResult(List<Path> paths, Map<Path, RepoConfig> configByPath) {}
+
+    private List<RepoConfig> loadRepos(String reposFile) throws IOException {
+        List<RepoConfig> repos = objectMapper.readValue(
+                Paths.get(reposFile).toFile(), new TypeReference<List<RepoConfig>>() {});
+        Set<String> seen = new LinkedHashSet<>();
+        List<String> duplicates = new ArrayList<>();
+        for (RepoConfig entry : repos) {
+            if (!seen.add(entry.getUrl())) duplicates.add(entry.getUrl());
+        }
+        if (!duplicates.isEmpty()) {
+            System.err.println("[ERROR] Duplicate repository URL(s) in " + reposFile + ":");
+            duplicates.forEach(u -> System.err.println("  " + u));
+            System.exit(1);
+        }
+        return repos;
+    }
+
+    private CloneResult cloneAndBranch(List<RepoConfig> repoEntries, Path workDir) {
+        int total = repoEntries.size();
+        // Pre-sized array keeps insertion order without synchronization (each index written by one thread)
+        Path[] clonedArray = new Path[total];
+        var executor = Executors.newCachedThreadPool();
+        try {
+            List<CompletableFuture<Void>> futures = new ArrayList<>(total);
+            for (int i = 0; i < total; i++) {
+                final int idx = i;
+                RepoConfig entry = repoEntries.get(i);
+                String url = entry.getUrl();
+                String repoName = url.substring(url.lastIndexOf('/') + 1).replace(".git", "");
+                String cloneUrl = gitAuthTokenInUrl ? withToken(url, githubToken) : url;
+                futures.add(CompletableFuture.runAsync(() -> {
+                    log.info("  Cloning {}", repoName);
+                    Path cloned = gitService.cloneRepo(cloneUrl, workDir.resolve(repoName));
+                    branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry);
+                    if (entry.hasVersionOverride()) {
+                        applyVersionOverride(cloned, entry.getVersion(), entry);
+                    }
+                    clonedArray[idx] = cloned;
+                    log.info("  Done: {}", repoName);
+                }, executor));
+            }
+            try {
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            } catch (CompletionException ignored) {
+                // collect all errors below
+            }
+            List<String> errors = futures.stream()
+                    .filter(CompletableFuture::isCompletedExceptionally)
+                    .map(f -> {
+                        try { f.join(); return null; }
+                        catch (CompletionException e) {
+                            Throwable cause = e.getCause() != null ? e.getCause() : e;
+                            return cause.getMessage() != null ? cause.getMessage() : cause.toString();
+                        }
+                    })
+                    .toList();
+            if (!errors.isEmpty()) {
+                System.err.println("\n[FAILED]\n" + String.join("\n---\n", errors));
+                System.exit(1);
+            }
+        } finally {
+            executor.shutdown();
+        }
+
+        List<Path> paths = new ArrayList<>(total);
+        Map<Path, RepoConfig> configByPath = new LinkedHashMap<>();
+        for (int i = 0; i < total; i++) {
+            if (clonedArray[i] != null) {
+                paths.add(clonedArray[i]);
+                configByPath.put(clonedArray[i], repoEntries.get(i));
+            }
+        }
+        return new CloneResult(paths, configByPath);
     }
 
     private void logDependencyTree(DependencyGraph<Path> graph) {

@@ -120,7 +120,7 @@ public class NativeGitService implements GitService {
         String configuredUrl = exec(targetDir, "git", "remote", "get-url", "origin").trim();
         if (!url.equals(configuredUrl)) {
             log.warn("  Remote URL mismatch in {} (expected '{}', found '{}') — re-cloning",
-                    targetDir.getFileName(), url, configuredUrl);
+                    targetDir.getFileName(), maskUrl(url), maskUrl(configuredUrl));
             return doClone(url, targetDir);
         }
         exec(targetDir, "git", "reset", "--hard");
@@ -136,7 +136,7 @@ public class NativeGitService implements GitService {
 
     private Path doClone(String url, Path targetDir) {
         FileSystemUtils.deleteRecursively(targetDir.toFile());
-        log.info("Cloning {} into {}", url, targetDir.toAbsolutePath());
+        log.info("Cloning {} into {}", maskUrl(url), targetDir.toAbsolutePath());
         List<String> cmd = new ArrayList<>(List.of("git", "clone"));
         if (cloneDepth > 0) {
             cmd.addAll(List.of("--depth", String.valueOf(cloneDepth)));
@@ -233,5 +233,9 @@ public class NativeGitService implements GitService {
     public void pushTag(Path repoDir, String tagName) {
         log.info("Pushing tag {} in {}", tagName, repoDir.getFileName());
         execLive(repoDir, "git", "push", "origin", "refs/tags/" + tagName);
+    }
+
+    private static String maskUrl(String url) {
+        return url.replaceAll("(https?://)([^@]+@)", "$1***@");
     }
 }
