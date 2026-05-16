@@ -267,7 +267,7 @@ public class TeamCityBuildService implements BuildService {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException("Interrupted while waiting for build " + buildId, e);
             } catch (IOException e) {
-                log.warn("Error polling build {}: {}", buildId, e.getMessage());
+                log.warn("Error polling build {}", buildId, e);
             }
         }
         throw new RuntimeException("Timeout waiting for TeamCity build " + buildId + " (" + repoName + ")");

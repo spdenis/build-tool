@@ -162,6 +162,7 @@ public class Main implements CommandLineRunner {
             try {
                 branchService.validateVersions(pathsToValidate, repoConfigByPath);
             } catch (RuntimeException e) {
+                log.error("Version validation failed", e);
                 System.err.println("\n[BUILD FAILED]\n" + e.getMessage());
                 System.exit(1);
             }
@@ -207,6 +208,7 @@ public class Main implements CommandLineRunner {
                 Files.deleteIfExists(stateFile);
                 log.info("══ Build complete in {} ══════════════════════════════", elapsed(buildStart));
             } catch (RuntimeException e) {
+                log.error("Build failed", e);
                 saveResumeState(resumeState, stateFile);
                 System.err.println("\n[BUILD FAILED]\n" + e.getMessage());
                 System.err.println("\nTo resume this build, re-run with:");
@@ -279,7 +281,7 @@ public class Main implements CommandLineRunner {
                 prUrls.add(prUrl);
                 log.info("  {} — PR ready", repoName);
             } catch (Exception e) {
-                log.error("  {} — FAILED: {}", repoName, e.getMessage());
+                log.error("  {} — FAILED", repoName, e);
                 errors.add(repoName + ": " + e.getMessage());
             }
         }
@@ -327,13 +329,18 @@ public class Main implements CommandLineRunner {
                 String cloneUrl = gitAuthTokenInUrl ? withToken(url, githubToken) : url;
                 futures.add(CompletableFuture.runAsync(() -> {
                     log.info("  Cloning {}", repoName);
-                    Path cloned = gitService.cloneRepo(cloneUrl, workDir.resolve(repoName));
-                    branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry);
-                    if (entry.hasVersionOverride()) {
-                        applyVersionOverride(cloned, entry.getVersion(), entry);
+                    try {
+                        Path cloned = gitService.cloneRepo(cloneUrl, workDir.resolve(repoName));
+                        branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry);
+                        if (entry.hasVersionOverride()) {
+                            applyVersionOverride(cloned, entry.getVersion(), entry);
+                        }
+                        clonedArray[idx] = cloned;
+                        log.info("  Done: {}", repoName);
+                    } catch (RuntimeException e) {
+                        log.error("  Clone/branch failed for {}", repoName, e);
+                        throw e;
                     }
-                    clonedArray[idx] = cloned;
-                    log.info("  Done: {}", repoName);
                 }, executor));
             }
             try {
@@ -464,7 +471,7 @@ public class Main implements CommandLineRunner {
                 }
                 return state;
             } catch (IOException e) {
-                log.warn("Could not read resume state from {}: {}", stateFile, e.getMessage());
+                log.warn("Could not read resume state from {}", stateFile, e);
             }
         }
         return new ResumeState();
@@ -475,7 +482,7 @@ public class Main implements CommandLineRunner {
             objectMapper.writerWithDefaultPrettyPrinter().writeValue(stateFile.toFile(), state);
             log.info("Resume state saved to: {}", stateFile.toAbsolutePath());
         } catch (IOException e) {
-            log.warn("Could not save resume state to {}: {}", stateFile, e.getMessage());
+            log.warn("Could not save resume state to {}", stateFile, e);
         }
     }
 

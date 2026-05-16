@@ -99,6 +99,7 @@ public class DispatchingBuildService implements BuildService {
                                 layerSucceeded.addAll(ex.getSucceeded());
                                 layerFailures.add(ex.getMessage());
                             } catch (RuntimeException ex) {
+                                log.error("Build service group failed", ex);
                                 layerFailures.add(ex.getMessage());
                             }
                         }))

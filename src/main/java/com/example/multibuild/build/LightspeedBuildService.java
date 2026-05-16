@@ -121,6 +121,7 @@ public class LightspeedBuildService implements BuildService {
                             buildRepo(repoRoot, artifacts, release, buildBranchByRepo, repoConfigs.get(repoRoot));
                             layerSucceeded.add(repoRoot);
                         } catch (RuntimeException ex) {
+                            log.error("Build failed for {}", repoRoot.getFileName(), ex);
                             layerFailures.add("Build failed in repository: " + repoRoot + "\n" +
                                     "  Reason : " + ex.getMessage());
                         }
@@ -218,7 +219,7 @@ public class LightspeedBuildService implements BuildService {
             }
             Files.writeString(jenkinsfile, String.join("\n", lines) + "\n", StandardCharsets.UTF_8);
         } catch (Exception e) {
-            log.warn("Could not update Jenkinsfile in {}: {}", repoRoot.getFileName(), e.getMessage());
+            log.warn("Could not update Jenkinsfile in {}", repoRoot.getFileName(), e);
             return;
         }
         gitService.commitAllIfDirty(repoRoot, commitFormatter.format("chore: trigger ci build"));
@@ -249,7 +250,7 @@ public class LightspeedBuildService implements BuildService {
         try {
             injectTimestamp(pomPath);
         } catch (Exception e) {
-            log.warn("Could not inject build trigger into {}: {}", pomPath, e.getMessage());
+            log.warn("Could not inject build trigger into {}", pomPath, e);
         }
         gitService.commitAllIfDirty(repoRoot, commitFormatter.format("chore: trigger ci build"));
         gitService.push(repoRoot);
@@ -384,7 +385,7 @@ public class LightspeedBuildService implements BuildService {
             }
             return new SnapshotMeta(timestamp, buildNumber);
         } catch (Exception e) {
-            log.warn("Failed to parse snapshot metadata XML: {}", e.getMessage());
+            log.warn("Failed to parse snapshot metadata XML", e);
             return SnapshotMeta.EMPTY;
         }
     }
@@ -421,7 +422,7 @@ public class LightspeedBuildService implements BuildService {
             }
             return resp.body();
         } catch (Exception e) {
-            log.warn("Failed to fetch {}: {}", url, e.getMessage());
+            log.warn("Failed to fetch {}", url, e);
             return null;
         }
     }
