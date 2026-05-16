@@ -17,8 +17,8 @@ public interface GitService {
     // Returns true if a commit was made, false if the working tree was already clean.
     boolean commitAllIfDirty(Path repoDir, String message);
 
-    // Fast-forward merges origin/<currentBranch> into the current branch.
-    // No-op if already up to date. Throws if the branches have diverged.
+    // Resets the current branch to origin/<currentBranch> (hard reset).
+    // No-op if the remote tracking ref does not exist (branch not pushed yet).
     void pull(Path repoDir);
 
     void push(Path repoDir);

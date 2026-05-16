@@ -340,21 +340,17 @@ public class JGitService implements GitService {
     public void pull(Path repoDir) {
         try (Git git = Git.open(repoDir.toFile())) {
             String branch = git.getRepository().getBranch();
-            log.info("Pulling origin/{} in {}", branch, repoDir.getFileName());
-            var pull = git.pull()
-                    .setFastForward(org.eclipse.jgit.api.MergeCommand.FastForwardMode.FF_ONLY)
-                    .setTransportConfigCallback(sshTransportCallback())
-                    .setTimeout(gitTimeoutSeconds);
-            if (!isSshRemote(git) && !githubToken.isBlank() && !remoteHasEmbeddedCredentials(git)) {
-                pull.setCredentialsProvider(httpCredentials());
+            if (git.getRepository().resolve("refs/remotes/origin/" + branch) == null) {
+                log.info("  No remote tracking ref for {} in {} — skipping sync", branch, repoDir.getFileName());
+                return;
             }
-            var result = pull.call();
-            if (!result.isSuccessful()) {
-                throw new RuntimeException("Pull failed in " + repoDir.getFileName() +
-                        " (branches may have diverged): " + result.getMergeResult().getMergeStatus());
-            }
+            log.info("  Resetting {} to origin/{} in {}", branch, branch, repoDir.getFileName());
+            git.reset()
+                    .setMode(ResetCommand.ResetType.HARD)
+                    .setRef("origin/" + branch)
+                    .call();
         } catch (GitAPIException | IOException e) {
-            throw new RuntimeException("Failed to pull in " + repoDir, e);
+            throw new RuntimeException("Failed to reset to remote in " + repoDir, e);
         }
     }
 

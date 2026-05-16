@@ -209,8 +209,13 @@ public class NativeGitService implements GitService {
     @Override
     public void pull(Path repoDir) {
         String branch = exec(repoDir, "git", "rev-parse", "--abbrev-ref", "HEAD").trim();
-        log.info("Pulling origin/{} in {}", branch, repoDir.getFileName());
-        exec(repoDir, "git", "pull", "--ff-only", "origin", branch);
+        String trackingRef = exec(repoDir, "git", "branch", "-r", "--list", "origin/" + branch).trim();
+        if (trackingRef.isBlank()) {
+            log.info("  No remote tracking ref for {} in {} — skipping sync", branch, repoDir.getFileName());
+            return;
+        }
+        log.info("  Resetting {} to origin/{} in {}", branch, branch, repoDir.getFileName());
+        exec(repoDir, "git", "reset", "--hard", "origin/" + branch);
     }
 
     @Override
