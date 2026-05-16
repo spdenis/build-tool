@@ -17,6 +17,10 @@ public interface GitService {
     // Returns true if a commit was made, false if the working tree was already clean.
     boolean commitAllIfDirty(Path repoDir, String message);
 
+    // Fast-forward merges origin/<currentBranch> into the current branch.
+    // No-op if already up to date. Throws if the branches have diverged.
+    void pull(Path repoDir);
+
     void push(Path repoDir);
 
     void createTag(Path repoDir, String tagName, String message);

@@ -151,6 +151,7 @@ public class BranchService {
                 }
             }
         } else {
+            gitService.pull(repoDir);
             log.info("Branch {} already exists in {}, keeping current versions", integrationBranch, repoDir.getFileName());
         }
     }

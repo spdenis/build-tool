@@ -207,6 +207,13 @@ public class NativeGitService implements GitService {
     }
 
     @Override
+    public void pull(Path repoDir) {
+        String branch = exec(repoDir, "git", "rev-parse", "--abbrev-ref", "HEAD").trim();
+        log.info("Pulling origin/{} in {}", branch, repoDir.getFileName());
+        exec(repoDir, "git", "pull", "--ff-only", "origin", branch);
+    }
+
+    @Override
     public void push(Path repoDir) {
         String branch = exec(repoDir, "git", "rev-parse", "--abbrev-ref", "HEAD").trim();
         log.info("Pushing branch {} in {}", branch, repoDir.getFileName());

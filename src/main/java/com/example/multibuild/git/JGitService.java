@@ -337,6 +337,28 @@ public class JGitService implements GitService {
     }
 
     @Override
+    public void pull(Path repoDir) {
+        try (Git git = Git.open(repoDir.toFile())) {
+            String branch = git.getRepository().getBranch();
+            log.info("Pulling origin/{} in {}", branch, repoDir.getFileName());
+            var pull = git.pull()
+                    .setFastForward(org.eclipse.jgit.api.MergeCommand.FastForwardMode.FF_ONLY)
+                    .setTransportConfigCallback(sshTransportCallback())
+                    .setTimeout(gitTimeoutSeconds);
+            if (!isSshRemote(git) && !githubToken.isBlank() && !remoteHasEmbeddedCredentials(git)) {
+                pull.setCredentialsProvider(httpCredentials());
+            }
+            var result = pull.call();
+            if (!result.isSuccessful()) {
+                throw new RuntimeException("Pull failed in " + repoDir.getFileName() +
+                        " (branches may have diverged): " + result.getMergeResult().getMergeStatus());
+            }
+        } catch (GitAPIException | IOException e) {
+            throw new RuntimeException("Failed to pull in " + repoDir, e);
+        }
+    }
+
+    @Override
     public void push(Path repoDir) {
         try (Git git = Git.open(repoDir.toFile())) {
             String branch = git.getRepository().getBranch();
