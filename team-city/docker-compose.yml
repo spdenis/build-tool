@@ -20,6 +20,16 @@ services:
     volumes:
       - agent_conf:/data/teamcity_agent/conf
 
+  teamcity-agent-1:
+    build: ./agent
+    container_name: teamcity-agent-1
+    environment:
+      SERVER_URL: http://teamcity-server:8111
+    depends_on:
+      - teamcity-server
+    volumes:
+      - agent_conf:/data/teamcity_agent1/conf
+
 volumes:
   server_datadir:
   server_logs:

@@ -1,11 +1,12 @@
 package com.example.multibuild.build;
 
 import com.example.multibuild.git.GitService;
+import com.example.multibuild.maven.XmlUtils;
 import com.example.multibuild.model.Artifact;
-import com.example.multibuild.service.CommitMessageFormatter;
 import com.example.multibuild.model.BuildMode;
 import com.example.multibuild.model.Module;
 import com.example.multibuild.model.RepoConfig;
+import com.example.multibuild.service.CommitMessageFormatter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -16,17 +17,8 @@ import org.w3c.dom.Document;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.OutputKeys;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.transform.stream.StreamResult;
 import javax.xml.xpath.XPath;
-import javax.xml.xpath.XPathConstants;
 import javax.xml.xpath.XPathFactory;
-import java.io.OutputStream;
-import java.io.StringReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -35,18 +27,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Base64;
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
-import java.util.stream.Collectors;
 
 @Service
 @Qualifier("lightspeed")
@@ -328,15 +312,15 @@ public class LightspeedBuildService implements BuildService {
 
     private void injectTimestamp(Path pomPath) throws Exception {
         String originalXml = Files.readString(pomPath, StandardCharsets.UTF_8);
-        Document doc = parseXml(originalXml);
+        Document doc = XmlUtils.parseXml(originalXml);
         XPath xp = XPathFactory.newInstance().newXPath();
 
         String timestamp = Instant.now().toString();
 
-        Node props = (Node) xp.evaluate("/project/properties", doc, XPathConstants.NODE);
+        Node props = XmlUtils.node(xp, "/project/properties", doc);
         if (props == null) {
             // Create <properties> and append to <project>
-            Node project = (Node) xp.evaluate("/project", doc, XPathConstants.NODE);
+            Node project = XmlUtils.node(xp, "/project", doc);
             if (project == null) return;
             props = doc.createElement("properties");
             project.appendChild(doc.createTextNode("\n    "));
@@ -354,7 +338,7 @@ public class LightspeedBuildService implements BuildService {
         }
         triggerNode.setTextContent(timestamp);
 
-        writeXml(doc, pomPath, originalXml.stripLeading().startsWith("<?xml"));
+        XmlUtils.writeXml(doc, pomPath, originalXml.stripLeading().startsWith("<?xml"));
         log.debug("Injected build trigger timestamp {} into {}", timestamp, pomPath.getFileName());
     }
 
@@ -374,10 +358,10 @@ public class LightspeedBuildService implements BuildService {
 
     private SnapshotMeta parseSnapshotMeta(String xml) {
         try {
-            Document doc = parseXml(xml);
+            Document doc = XmlUtils.parseXml(xml);
             XPath xp = XPathFactory.newInstance().newXPath();
-            Node ts = (Node) xp.evaluate("/metadata/versioning/snapshot/timestamp", doc, XPathConstants.NODE);
-            Node bn = (Node) xp.evaluate("/metadata/versioning/snapshot/buildNumber", doc, XPathConstants.NODE);
+            Node ts = XmlUtils.node(xp, "/metadata/versioning/snapshot/timestamp", doc);
+            Node bn = XmlUtils.node(xp, "/metadata/versioning/snapshot/buildNumber", doc);
             String timestamp = ts != null ? ts.getTextContent().trim() : "";
             int buildNumber = 0;
             if (bn != null) {
@@ -461,26 +445,6 @@ public class LightspeedBuildService implements BuildService {
     private static String elapsed(long startMs) {
         long s = (System.currentTimeMillis() - startMs) / 1000;
         return String.format("%d:%02d", s / 60, s % 60);
-    }
-
-    // --- XML helpers ---
-
-    private static Document parseXml(String xml) throws Exception {
-        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-        dbf.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
-        dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
-        dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-        return dbf.newDocumentBuilder().parse(new org.xml.sax.InputSource(new StringReader(xml)));
-    }
-
-    private static void writeXml(Document doc, Path path, boolean includeDeclaration) throws Exception {
-        Transformer t = TransformerFactory.newInstance().newTransformer();
-        t.setOutputProperty(OutputKeys.INDENT, "no");
-        t.setOutputProperty(OutputKeys.ENCODING, "UTF-8");
-        t.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, includeDeclaration ? "no" : "yes");
-        try (OutputStream os = Files.newOutputStream(path)) {
-            t.transform(new DOMSource(doc), new StreamResult(os));
-        }
     }
 
     private record SnapshotMeta(String timestamp, int buildNumber) {
