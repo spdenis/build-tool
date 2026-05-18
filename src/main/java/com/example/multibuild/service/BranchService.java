@@ -152,6 +152,14 @@ public class BranchService {
             }
         } else {
             gitService.pull(repoDir);
+            if (!gitService.hasRemoteBranch(repoDir, integrationBranch)) {
+                log.info("Branch {} not yet on remote in {}", integrationBranch, repoDir.getFileName());
+                if (isDryRun(dryMode, repoConfig)) {
+                    log.info("Dry mode — skipping push for {}", repoDir.getFileName());
+                } else {
+                    gitService.push(repoDir);
+                }
+            }
             log.info("Branch {} already exists in {}, keeping current versions", integrationBranch, repoDir.getFileName());
         }
     }
