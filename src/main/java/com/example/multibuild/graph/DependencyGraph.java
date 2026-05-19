@@ -1,16 +1,6 @@
 package com.example.multibuild.graph;
 
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Deque;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 
 public class DependencyGraph<T> {
@@ -125,5 +115,41 @@ public class DependencyGraph<T> {
 
     public List<T> topologicalSort() {
         return topologicalLayers().stream().flatMap(Collection::stream).toList();
+    }
+
+    // Returns all nodes that the given node transitively depends on (must be built before it).
+    public Set<T> transitiveDependenciesOf(T node) {
+        Set<T> result = new LinkedHashSet<>();
+        collectTransitiveDeps(node, result);
+        return result;
+    }
+
+    private void collectTransitiveDeps(T node, Set<T> visited) {
+        for (T dep : adjacencyList.getOrDefault(node, List.of())) {
+            if (visited.add(dep)) {
+                collectTransitiveDeps(dep, visited);
+            }
+        }
+    }
+
+    // Returns all nodes that transitively depend on the given node (must be built after it).
+    public Set<T> transitiveConsumersOf(T node) {
+        Map<T, List<T>> reversed = new HashMap<>();
+        for (Map.Entry<T, List<T>> entry : adjacencyList.entrySet()) {
+            for (T dep : entry.getValue()) {
+                reversed.computeIfAbsent(dep, k -> new ArrayList<>()).add(entry.getKey());
+            }
+        }
+        Set<T> result = new LinkedHashSet<>();
+        collectConsumers(node, reversed, result);
+        return result;
+    }
+
+    private void collectConsumers(T node, Map<T, List<T>> reversed, Set<T> visited) {
+        for (T consumer : reversed.getOrDefault(node, List.of())) {
+            if (visited.add(consumer)) {
+                collectConsumers(consumer, reversed, visited);
+            }
+        }
     }
 }

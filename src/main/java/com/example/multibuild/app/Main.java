@@ -6,17 +6,9 @@ import com.example.multibuild.git.GitHubService;
 import com.example.multibuild.git.GitService;
 import com.example.multibuild.graph.DependencyGraph;
 import com.example.multibuild.maven.PomVersionUpdater;
-import com.example.multibuild.model.Artifact;
-import com.example.multibuild.model.BuildMode;
+import com.example.multibuild.model.*;
 import com.example.multibuild.model.Module;
-import com.example.multibuild.model.RepoConfig;
-import com.example.multibuild.model.RepositoryProject;
-import com.example.multibuild.model.ResumeState;
-import com.example.multibuild.service.BranchService;
-import com.example.multibuild.service.CommitMessageFormatter;
-import com.example.multibuild.service.DependencyVersionService;
-import com.example.multibuild.service.ProjectAggregator;
-import com.example.multibuild.service.ReleaseService;
+import com.example.multibuild.service.*;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -31,13 +23,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executors;
@@ -72,6 +58,15 @@ public class Main implements CommandLineRunner {
 
     @Value("${git.auth.token.in.url:false}")
     private boolean gitAuthTokenInUrl;
+
+    @Value("${skip.git:false}")
+    private boolean skipGit;
+
+    @Value("${build.target:}")
+    private String buildTarget;
+
+    @Value("${build.target.with-deps:false}")
+    private boolean buildTargetWithDeps;
 
     private final GitService gitService;
     private final BranchService branchService;
@@ -136,9 +131,12 @@ public class Main implements CommandLineRunner {
         List<RepoConfig> repoEntries = loadRepos(reposFile);
 
         log.info("══════════════════════════════════════════════════════");
-        log.info("  MultiBuild  mode={}  repos={}  build={}  dryMode={}",
+        log.info("  MultiBuild  mode={}  repos={}  build={}  dryMode={}  skipGit={}",
                 buildMode, repoEntries.size(),
-                buildEnabled ? buildMode : "disabled", dryMode);
+                buildEnabled ? buildMode : "disabled", dryMode, skipGit);
+        if (!buildTarget.isBlank()) {
+            log.info("  build.target={}  with-deps={}", buildTarget, buildTargetWithDeps);
+        }
         log.info("══════════════════════════════════════════════════════");
 
         Path workDir = Paths.get(cloneDir);
@@ -150,12 +148,16 @@ public class Main implements CommandLineRunner {
 
         ResumeState resumeState = loadResumeState(stateFile);
 
-        log.info("── Phase 1/3: clone & branch ({} repo(s), parallel) ──", repoEntries.size());
-        CloneResult cloned = cloneAndBranch(repoEntries, workDir);
+        if (skipGit) {
+            log.info("── Phase 1/3: skipped — using local repos in {} ──", workDir);
+        } else {
+            log.info("── Phase 1/3: clone & branch ({} repo(s), parallel) ──", repoEntries.size());
+        }
+        CloneResult cloned = skipGit ? useLocalRepos(repoEntries, workDir) : cloneAndBranch(repoEntries, workDir);
         List<Path> clonedPaths = cloned.paths();
         Map<Path, RepoConfig> repoConfigByPath = cloned.configByPath();
 
-        if (buildEnabled && buildMode != BuildMode.RELEASE) {
+        if (buildEnabled && buildMode != BuildMode.RELEASE && !skipGit) {
             List<Path> pathsToValidate = clonedPaths.stream()
                     .filter(p -> !repoConfigByPath.get(p).hasVersionOverride())
                     .toList();
@@ -173,6 +175,9 @@ public class Main implements CommandLineRunner {
         List<RepositoryProject> projects = aggregator.aggregate(clonedPaths);
         DependencyGraph<Path> graph = aggregator.buildGraph(projects);
         List<List<Path>> buildLayers = graph.topologicalLayers();
+        if (!buildTarget.isBlank()) {
+            buildLayers = filterToTarget(buildLayers, graph, clonedPaths);
+        }
         List<Path> buildOrder = buildLayers.stream().flatMap(List::stream).toList();
 
         log.info("  {} repo(s) in {} layer(s):", clonedPaths.size(), buildLayers.size());
@@ -247,12 +252,15 @@ public class Main implements CommandLineRunner {
         }
 
         List<RepoConfig> repoEntries = loadRepos(reposFile);
-        log.info("── Release init: clone & branch ({} repo(s), parallel) ──", repoEntries.size());
-
         Path workDir = Paths.get(cloneDir);
         Files.createDirectories(workDir);
 
-        CloneResult result = cloneAndBranch(repoEntries, workDir);
+        if (skipGit) {
+            log.info("── Release init: skipped — using local repos in {} ──", workDir);
+        } else {
+            log.info("── Release init: clone & branch ({} repo(s), parallel) ──", repoEntries.size());
+        }
+        CloneResult result = skipGit ? useLocalRepos(repoEntries, workDir) : cloneAndBranch(repoEntries, workDir);
         log.info("══ Release init complete — {} repo(s) branched ══════════", result.paths().size());
     }
 
@@ -375,6 +383,65 @@ public class Main implements CommandLineRunner {
             }
         }
         return new CloneResult(paths, configByPath);
+    }
+
+    private CloneResult useLocalRepos(List<RepoConfig> repoEntries, Path workDir) {
+        List<Path> paths = new ArrayList<>();
+        Map<Path, RepoConfig> configByPath = new LinkedHashMap<>();
+        List<String> missing = new ArrayList<>();
+
+        for (RepoConfig entry : repoEntries) {
+            String url = entry.getUrl();
+            String repoName = url.substring(url.lastIndexOf('/') + 1).replace(".git", "");
+            Path repoDir = workDir.resolve(repoName);
+            if (!repoDir.toFile().exists()) {
+                missing.add(repoName + " (expected at " + repoDir.toAbsolutePath() + ")");
+            } else {
+                log.info("  Using local repo: {}", repoName);
+                paths.add(repoDir);
+                configByPath.put(repoDir, entry);
+            }
+        }
+
+        if (!missing.isEmpty()) {
+            System.err.println("[ERROR] skip.git=true but the following repos are not present in " + workDir + ":");
+            missing.forEach(m -> System.err.println("  " + m));
+            System.exit(1);
+        }
+
+        return new CloneResult(paths, configByPath);
+    }
+
+    private List<List<Path>> filterToTarget(List<List<Path>> layers, DependencyGraph<Path> graph,
+                                            List<Path> allPaths) {
+        Path targetPath = allPaths.stream()
+                .filter(p -> p.getFileName().toString().equals(buildTarget))
+                .findFirst()
+                .orElse(null);
+        if (targetPath == null) {
+            String available = allPaths.stream()
+                    .map(p -> p.getFileName().toString())
+                    .collect(Collectors.joining(", "));
+            System.err.println("[ERROR] build.target '" + buildTarget + "' not found. Available: " + available);
+            System.exit(1);
+            return layers;
+        }
+
+        Set<Path> keep = new LinkedHashSet<>();
+        keep.add(targetPath);
+        if (buildTargetWithDeps) {
+            keep.addAll(graph.transitiveConsumersOf(targetPath));
+            log.info("  Filtering build to '{}' + {} downstream repo(s): {}", buildTarget,
+                    keep.size() - 1,
+                    keep.stream().map(p -> p.getFileName().toString()).collect(Collectors.joining(", ")));
+        } else {
+            log.info("  Filtering build to '{}' only", buildTarget);
+        }
+
+        return layers.stream()
+                .map(layer -> layer.stream().filter(keep::contains).toList())
+                .filter(layer -> !layer.isEmpty())
+                .toList();
     }
 
     private void logDependencyTree(DependencyGraph<Path> graph) {
