@@ -20,14 +20,13 @@ import java.util.List;
  * different uDeploy servers without needing separate client instances.
  *
  * Endpoints used:
- *   GET    /application                                              — list all apps (filter by name)
- *   GET    /application/{appId}/snapshots/false/0/-1                — list snapshots
- *   POST   /snapshot                                                — create snapshot
- *   GET    /component/{name}/false                                  — resolve component → id
- *   GET    /component/{compId}/versions/false/0/-1/true             — versions (newest first)
- *   GET    /snapshot/{snapshotId}/configuration/versions            — pinned component versions
- *   PUT    /snapshot/{snapshotId}/configuration/versions/{compId}   — pin version
- *   DELETE /snapshot/{snapshotId}/configuration/versions/{compId}   — unpin version
+ *   GET  /rest/deploy/application/{name}                                  — resolve app → id
+ *   GET  /rest/deploy/application/{appId}/snapshots/false/0/-1            — list snapshots
+ *   GET  /rest/deploy/component/{name}/false                              — resolve component → id
+ *   GET  /rest/deploy/component/{compId}/versions/false/0/-1/true         — versions (newest first)
+ *   GET  /rest/deploy/snapshot/{snapshotId}/configuration/versions        — pinned component versions
+ *   PUT  /rest/deploy/snapshot/{snapshotId}/configuration/versions/{compId} — pin version
+ *   DELETE /rest/deploy/snapshot/{snapshotId}/configuration/versions/{compId} — unpin version
  */
 @Component
 @EnableConfigurationProperties(UDeployProperties.class)
@@ -43,18 +42,13 @@ class UDeployClient {
     }
 
     String resolveApplicationId(String baseUrl, String applicationName) {
-        JsonNode apps = get(baseUrl, "/application");
-        for (JsonNode app : apps) {
-            if (applicationName.equals(app.path("name").asText())) {
-                return app.get("id").asText();
-            }
-        }
-        throw new RuntimeException("Application '" + applicationName + "' not found in uDeploy");
+        JsonNode node = get(baseUrl, "/rest/deploy/application/" + encode(applicationName));
+        return node.get("id").asText();
     }
 
     /** Returns the snapshot id, or {@code null} if no snapshot with that name exists. */
     String findSnapshotId(String baseUrl, String appId, String snapshotName) {
-        JsonNode snapshots = get(baseUrl, "/application/" + appId + "/snapshots/false/0/-1");
+        JsonNode snapshots = get(baseUrl, "/rest/deploy/application/" + appId + "/snapshots/false/0/-1");
         for (JsonNode s : snapshots) {
             if (snapshotName.equals(s.path("name").asText())) {
                 return s.get("id").asText();
@@ -66,18 +60,18 @@ class UDeployClient {
     /** Creates a new snapshot and returns its id. */
     String createSnapshot(String baseUrl, String appId, String snapshotName) {
         String body = "{\"name\":\"" + snapshotName + "\",\"application\":{\"id\":\"" + appId + "\"}}";
-        JsonNode node = post(baseUrl, "/snapshot", body);
+        JsonNode node = post(baseUrl, "/rest/deploy/snapshot", body);
         return node.get("id").asText();
     }
 
     ComponentInfo resolveComponent(String baseUrl, String componentName) {
-        JsonNode node = get(baseUrl, "/component/" + encode(componentName) + "/false");
+        JsonNode node = get(baseUrl, "/rest/deploy/component/" + encode(componentName) + "/false");
         return new ComponentInfo(node.get("id").asText(), node.path("name").asText());
     }
 
     /** Returns all versions of a component sorted newest-first. */
     List<VersionInfo> getComponentVersions(String baseUrl, String componentId) {
-        JsonNode array = get(baseUrl, "/component/" + componentId + "/versions/false/0/-1/true");
+        JsonNode array = get(baseUrl, "/rest/deploy/component/" + componentId + "/versions/false/0/-1/true");
         List<VersionInfo> result = new ArrayList<>();
         for (JsonNode v : array) {
             result.add(new VersionInfo(v.get("id").asText(), v.path("name").asText()));
@@ -90,7 +84,7 @@ class UDeployClient {
      * Response: [{component:{id,name}, desiredVersion:{id,name}}, ...]
      */
     List<SnapshotEntry> getSnapshotVersions(String baseUrl, String snapshotId) {
-        JsonNode array = get(baseUrl, "/snapshot/" + snapshotId + "/configuration/versions");
+        JsonNode array = get(baseUrl, "/rest/deploy/snapshot/" + snapshotId + "/configuration/versions");
         List<SnapshotEntry> result = new ArrayList<>();
         for (JsonNode entry : array) {
             JsonNode comp = entry.path("component");
@@ -107,11 +101,11 @@ class UDeployClient {
 
     void addComponentVersion(String baseUrl, String snapshotId, String componentId, String versionId) {
         String body = "{\"version\":{\"id\":\"" + versionId + "\"},\"type\":\"DESIRED\"}";
-        put(baseUrl, "/snapshot/" + snapshotId + "/configuration/versions/" + componentId, body);
+        put(baseUrl, "/rest/deploy/snapshot/" + snapshotId + "/configuration/versions/" + componentId, body);
     }
 
     void removeComponentVersion(String baseUrl, String snapshotId, String componentId) {
-        delete(baseUrl, "/snapshot/" + snapshotId + "/configuration/versions/" + componentId);
+        delete(baseUrl, "/rest/deploy/snapshot/" + snapshotId + "/configuration/versions/" + componentId);
     }
 
     // ── HTTP primitives ──────────────────────────────────────────────────────
