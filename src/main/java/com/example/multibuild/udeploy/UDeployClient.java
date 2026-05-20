@@ -26,8 +26,7 @@ import java.util.List;
  *   GET  /cli/component/info?component={name}                               — resolve component → id
  *   GET  /cli/component/versions?component={nameOrId}                       — versions (newest first)
  *   GET  /cli/snapshot/getSnapshotVersions?snapshot={snapshotId}            — pinned component versions
- *   PUT  /cli/snapshot/addVersionToSnapshot?snapshot={id}&version={id}      — pin version
- *   PUT  /cli/snapshot/removeVersionFromSnapshot?snapshot={id}&version={id} — unpin version
+ *   PUT  /cli/snapshot/addVersionToSnapshot?snapshot={id}&version={id}      — pin/update version
  */
 @Component
 @EnableConfigurationProperties(UDeployProperties.class)
@@ -102,10 +101,6 @@ class UDeployClient {
 
     void addComponentVersion(String baseUrl, String snapshotId, String versionId) {
         putNoBody(baseUrl, "/cli/snapshot/addVersionToSnapshot?snapshot=" + snapshotId + "&version=" + versionId);
-    }
-
-    void removeComponentVersion(String baseUrl, String snapshotId, String versionId) {
-        putNoBody(baseUrl, "/cli/snapshot/removeVersionFromSnapshot?snapshot=" + snapshotId + "&version=" + versionId);
     }
 
     // ── HTTP primitives ──────────────────────────────────────────────────────
