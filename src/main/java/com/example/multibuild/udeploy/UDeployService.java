@@ -102,11 +102,11 @@ public class UDeployService {
 
         if (existing != null) {
             log.info("    Removing old version '{}' …", existing.versionName());
-            client.removeComponentVersion(baseUrl, snapshotId, comp.id());
+            client.removeComponentVersion(baseUrl, snapshotId, existing.versionId());
         }
 
         log.info("    Adding version '{}' …", target.name());
-        client.addComponentVersion(baseUrl, snapshotId, comp.id(), target.id());
+        client.addComponentVersion(baseUrl, snapshotId, target.id());
         log.info("    Done: {} → {}", existing != null ? existing.versionName() : "(none)", target.name());
     }
 
