@@ -1,3 +1,3 @@
 package com.example.multibuild.udeploy;
 
-record SnapshotEntry(String componentId, String componentName, String versionId, String versionName) {}
+record SnapshotEntry(String componentName, String versionId, String versionName) {}

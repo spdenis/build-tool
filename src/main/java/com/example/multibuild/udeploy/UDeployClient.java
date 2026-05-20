@@ -26,7 +26,8 @@ import java.util.List;
  *   GET  /cli/component/info?component={name}                               — resolve component → id
  *   GET  /cli/component/versions?component={nameOrId}                       — versions (newest first)
  *   GET  /cli/snapshot/getSnapshotVersions?snapshot={snapshotId}            — pinned component versions
- *   PUT  /cli/snapshot/addVersionToSnapshot?snapshot={id}&version={id}      — pin/update version
+ *   PUT  /cli/snapshot/addVersionToSnapshot?snapshot={id}&version={id}      — pin version
+ *   PUT  /cli/snapshot/removeVersionFromSnapshot?snapshot={id}&version={id} — unpin version
  */
 @Component
 @EnableConfigurationProperties(UDeployProperties.class)
@@ -80,27 +81,32 @@ class UDeployClient {
     }
 
     /**
-     * Returns the component versions currently pinned in the snapshot.
-     * Response: [{component:{id,name}, desiredVersion:{id,name}}, ...]
+     * Returns one entry per pinned version per component.
+     * Response: [{name: componentName, desiredVersions: [{id, name}, ...]}, ...]
      */
     List<SnapshotEntry> getSnapshotVersions(String baseUrl, String snapshotId) {
         JsonNode array = get(baseUrl, "/cli/snapshot/getSnapshotVersions?snapshot=" + snapshotId);
         List<SnapshotEntry> result = new ArrayList<>();
         for (JsonNode entry : array) {
-            JsonNode comp = entry.path("component");
-            JsonNode ver = entry.path("desiredVersion");
-            if (comp.isMissingNode() || ver.isMissingNode() || ver.isNull()) continue;
-            result.add(new SnapshotEntry(
-                    comp.path("id").asText(),
-                    comp.path("name").asText(),
-                    ver.path("id").asText(),
-                    ver.path("name").asText()));
+            String componentName = entry.path("name").asText();
+            JsonNode desiredVersions = entry.path("desiredVersions");
+            if (desiredVersions.isMissingNode() || !desiredVersions.isArray()) continue;
+            for (JsonNode ver : desiredVersions) {
+                result.add(new SnapshotEntry(
+                        componentName,
+                        ver.path("id").asText(),
+                        ver.path("name").asText()));
+            }
         }
         return result;
     }
 
     void addComponentVersion(String baseUrl, String snapshotId, String versionId) {
         putNoBody(baseUrl, "/cli/snapshot/addVersionToSnapshot?snapshot=" + snapshotId + "&version=" + versionId);
+    }
+
+    void removeComponentVersion(String baseUrl, String snapshotId, String versionId) {
+        putNoBody(baseUrl, "/cli/snapshot/removeVersionFromSnapshot?snapshot=" + snapshotId + "&version=" + versionId);
     }
 
     // ── HTTP primitives ──────────────────────────────────────────────────────

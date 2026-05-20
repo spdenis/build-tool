@@ -90,19 +90,29 @@ public class UDeployService {
             return;
         }
 
-        SnapshotEntry existing = currentVersions.stream()
+        List<SnapshotEntry> existing = currentVersions.stream()
                 .filter(e -> e.componentName().equals(componentName))
-                .findFirst()
-                .orElse(null);
+                .toList();
 
-        if (existing != null && existing.versionName().equals(target.name())) {
+        boolean alreadyCorrect = existing.size() == 1 && existing.get(0).versionName().equals(target.name());
+        if (alreadyCorrect) {
             log.info("    Already at version '{}' — nothing to do", target.name());
             return;
         }
 
         log.info("    Pinning version '{}' …", target.name());
         client.addComponentVersion(baseUrl, snapshotId, target.id());
-        log.info("    Done: {} → {}", existing != null ? existing.versionName() : "(none)", target.name());
+
+        for (SnapshotEntry old : existing) {
+            if (!old.versionId().equals(target.id())) {
+                log.info("    Removing old version '{}' …", old.versionName());
+                client.removeComponentVersion(baseUrl, snapshotId, old.versionId());
+            }
+        }
+
+        String previousVersions = existing.isEmpty() ? "(none)" : existing.stream()
+                .map(SnapshotEntry::versionName).collect(java.util.stream.Collectors.joining(", "));
+        log.info("    Done: [{}] → {}", previousVersions, target.name());
     }
 
     private String resolveOrCreateSnapshot(String url, String appName) {
