@@ -19,6 +19,16 @@ public class RepoConfig {
     // Required for repos without pom.xml; ignored for repos that have one (modules are discovered automatically).
     private List<String> releaseArtifacts;
 
+    // uDeploy component name for this repository. When set, the update-snapshot command will
+    // update the snapshot to point to the latest matching version of this component.
+    private String udeployComponent;
+
+    // Overrides the global udeploy.application property for this repository.
+    private String udeployApplication;
+
+    // Overrides the global udeploy.url property for this repository.
+    private String udeployUrl;
+
     public String getUrl() { return url; }
     public void setUrl(String url) { this.url = url; }
 
@@ -55,4 +65,13 @@ public class RepoConfig {
 
     public List<String> getReleaseArtifacts() { return releaseArtifacts != null ? releaseArtifacts : List.of(); }
     public void setReleaseArtifacts(List<String> releaseArtifacts) { this.releaseArtifacts = releaseArtifacts; }
+
+    public String getUdeployComponent() { return udeployComponent; }
+    public void setUdeployComponent(String udeployComponent) { this.udeployComponent = udeployComponent; }
+
+    public String getUdeployApplication() { return udeployApplication; }
+    public void setUdeployApplication(String udeployApplication) { this.udeployApplication = udeployApplication; }
+
+    public String getUdeployUrl() { return udeployUrl; }
+    public void setUdeployUrl(String udeployUrl) { this.udeployUrl = udeployUrl; }
 }

@@ -9,6 +9,7 @@ import com.example.multibuild.maven.PomVersionUpdater;
 import com.example.multibuild.model.*;
 import com.example.multibuild.model.Module;
 import com.example.multibuild.service.*;
+import com.example.multibuild.udeploy.UDeployService;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
@@ -78,12 +79,14 @@ public class Main implements CommandLineRunner {
     private final ObjectMapper objectMapper;
     private final CommitMessageFormatter commitFormatter;
     private final GitHubService gitHubService;
+    private final UDeployService uDeployService;
 
     public Main(GitService gitService, BranchService branchService,
                 PomVersionUpdater pomVersionUpdater,
                 ProjectAggregator aggregator, DependencyVersionService dependencyVersionService,
                 BuildService buildService, ReleaseService releaseService, ObjectMapper objectMapper,
-                CommitMessageFormatter commitFormatter, GitHubService gitHubService) {
+                CommitMessageFormatter commitFormatter, GitHubService gitHubService,
+                UDeployService uDeployService) {
         this.gitService = gitService;
         this.branchService = branchService;
         this.pomVersionUpdater = pomVersionUpdater;
@@ -94,6 +97,7 @@ public class Main implements CommandLineRunner {
         this.objectMapper = objectMapper;
         this.commitFormatter = commitFormatter;
         this.gitHubService = gitHubService;
+        this.uDeployService = uDeployService;
     }
 
     public static void main(String[] args) {
@@ -103,20 +107,17 @@ public class Main implements CommandLineRunner {
     @Override
     public void run(String... args) throws Exception {
         if (args.length < 2) {
-            System.err.println("Usage: java -jar multibuild.jar build        repos.json");
-            System.err.println("       java -jar multibuild.jar release-init repos.json");
-            System.err.println("       java -jar multibuild.jar create-prs   repos.json");
+            printUsage();
             System.exit(1);
         }
         switch (args[0]) {
-            case "build"        -> runBuild(args[1]);
-            case "release-init" -> runReleaseInit(args[1]);
-            case "create-prs"   -> runCreatePrs(args[1]);
+            case "build"           -> runBuild(args[1]);
+            case "release-init"    -> runReleaseInit(args[1]);
+            case "create-prs"      -> runCreatePrs(args[1]);
+            case "update-snapshot" -> runUpdateSnapshot(args[1]);
             default -> {
                 System.err.println("[ERROR] Unknown command: " + args[0]);
-                System.err.println("Usage: java -jar multibuild.jar build        repos.json");
-                System.err.println("       java -jar multibuild.jar release-init repos.json");
-                System.err.println("       java -jar multibuild.jar create-prs   repos.json");
+                printUsage();
                 System.exit(1);
             }
         }
@@ -302,6 +303,27 @@ public class Main implements CommandLineRunner {
             errors.forEach(e -> System.err.println("  " + e));
             System.exit(1);
         }
+    }
+
+    private void runUpdateSnapshot(String reposFile) throws Exception {
+        List<RepoConfig> repoEntries = loadRepos(reposFile);
+        log.info("── Update uDeploy snapshot: {}/{}  mode={}  repos={} ──",
+                buildMode, repoEntries.size(), buildMode, repoEntries.size());
+        try {
+            uDeployService.updateSnapshot(repoEntries, buildMode);
+            log.info("══ uDeploy snapshot update complete ══════════════════");
+        } catch (RuntimeException e) {
+            log.error("uDeploy snapshot update failed", e);
+            System.err.println("\n[FAILED]\n" + e.getMessage());
+            System.exit(1);
+        }
+    }
+
+    private static void printUsage() {
+        System.err.println("Usage: java -jar multibuild.jar build           repos.json");
+        System.err.println("       java -jar multibuild.jar release-init    repos.json");
+        System.err.println("       java -jar multibuild.jar create-prs      repos.json");
+        System.err.println("       java -jar multibuild.jar update-snapshot repos.json");
     }
 
     private record CloneResult(List<Path> paths, Map<Path, RepoConfig> configByPath) {}
