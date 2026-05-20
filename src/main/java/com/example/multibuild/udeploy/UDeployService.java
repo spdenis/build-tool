@@ -114,7 +114,7 @@ public class UDeployService {
         String snapshotName = props.getSnapshot();
         log.info("Resolving uDeploy snapshot '{}/{}' …", appName, snapshotName);
         String appId = client.resolveApplicationId(url, appName);
-        String sid = client.findSnapshotId(url, appId, snapshotName);
+        String sid = client.findSnapshotId(url, appName, snapshotName);
         if (sid != null) {
             log.info("  Snapshot id: {}", sid);
             return sid;

@@ -21,7 +21,7 @@ import java.util.List;
  *
  * Endpoints used:
  *   GET  /rest/deploy/application/{name}                                  — resolve app → id
- *   GET  /rest/deploy/application/{appId}/snapshots/false/0/-1            — list snapshots
+ *   GET  /rest/deploy/application/{name}/snapshots/false/0/-1             — list snapshots
  *   GET  /rest/deploy/component/{name}/false                              — resolve component → id
  *   GET  /rest/deploy/component/{compId}/versions/false/0/-1/true         — versions (newest first)
  *   GET  /rest/deploy/snapshot/{snapshotId}/configuration/versions        — pinned component versions
@@ -47,8 +47,8 @@ class UDeployClient {
     }
 
     /** Returns the snapshot id, or {@code null} if no snapshot with that name exists. */
-    String findSnapshotId(String baseUrl, String appId, String snapshotName) {
-        JsonNode snapshots = get(baseUrl, "/rest/deploy/application/" + appId + "/snapshots/false/0/-1");
+    String findSnapshotId(String baseUrl, String appName, String snapshotName) {
+        JsonNode snapshots = get(baseUrl, "/rest/deploy/application/" + encode(appName) + "/snapshots/false/0/-1");
         for (JsonNode s : snapshots) {
             if (snapshotName.equals(s.path("name").asText())) {
                 return s.get("id").asText();
