@@ -1,0 +1,458 @@
+package com.example.multibuild.build;
+
+import com.example.multibuild.git.GitService;
+import com.example.multibuild.maven.XmlUtils;
+import com.example.multibuild.model.Artifact;
+import com.example.multibuild.model.BuildMode;
+import com.example.multibuild.model.Module;
+import com.example.multibuild.model.RepoConfig;
+import com.example.multibuild.service.CommitMessageFormatter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.stereotype.Service;
+import org.w3c.dom.Document;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+
+import javax.xml.xpath.XPath;
+import javax.xml.xpath.XPathFactory;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+
+@Service
+@Qualifier("lightspeed")
+@EnableConfigurationProperties(LightspeedProperties.class)
+public class LightspeedBuildService implements BuildService {
+
+    private static final Logger log = LoggerFactory.getLogger(LightspeedBuildService.class);
+    private static final String TRIGGER_PROP = "build.trigger.timestamp";
+
+    @Value("${build.mode:SNAPSHOT}")
+    private BuildMode buildMode;
+
+    @Value("${dry.mode:false}")
+    private boolean dryMode;
+
+    @Value("${integration.branch:}")
+    private String integrationBranch;
+
+    private final LightspeedProperties props;
+    private final GitService gitService;
+    private final CommitMessageFormatter commitFormatter;
+    private final HttpClient httpClient = HttpClient.newHttpClient();
+    // Cached thread pool because poll loops are long-running blocking IO tasks
+    private final java.util.concurrent.ExecutorService executor =
+            Executors.newCachedThreadPool();
+
+    public LightspeedBuildService(LightspeedProperties props, GitService gitService,
+                                  CommitMessageFormatter commitFormatter) {
+        this.props = props;
+        this.gitService = gitService;
+        this.commitFormatter = commitFormatter;
+    }
+
+    @Override
+    public void buildAll(List<List<Path>> layers, Map<Artifact, Module> moduleMap,
+                         Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
+                         Map<Path, String> buildBranchByRepo) {
+        boolean release = buildMode == BuildMode.RELEASE;
+        if (release) {
+            if (props.getMavenRepo().getReleasesUrl().isBlank()) {
+                throw new RuntimeException(
+                        "Lightspeed is not configured for release builds: set lightspeed.maven-repo.releases-url");
+            }
+        } else {
+            if (props.getMavenRepo().getSnapshotsUrl().isBlank()) {
+                throw new RuntimeException(
+                        "Lightspeed is not configured for snapshot builds: set lightspeed.maven-repo.snapshots-url");
+            }
+        }
+
+        // Build repo → artifacts lookup for Maven polling
+        Map<Path, List<Artifact>> artifactsByRepo = new LinkedHashMap<>();
+        for (Map.Entry<Artifact, Module> e : moduleMap.entrySet()) {
+            artifactsByRepo.computeIfAbsent(e.getValue().getRepoRoot(), k -> new ArrayList<>()).add(e.getKey());
+        }
+
+        Set<Path> overallSucceeded = new LinkedHashSet<>();
+
+        for (List<Path> layer : layers) {
+            List<Path> repos = layer.stream()
+                    .filter(p -> !completedRepoNames.contains(p.getFileName().toString()))
+                    .toList();
+            if (repos.isEmpty()) continue;
+
+            Set<Path> layerSucceeded = ConcurrentHashMap.newKeySet();
+            List<String> layerFailures = Collections.synchronizedList(new ArrayList<>());
+
+            List<CompletableFuture<Void>> futures = repos.stream()
+                    .map(repoRoot -> CompletableFuture.runAsync(() -> {
+                        List<Artifact> artifacts = artifactsByRepo.getOrDefault(repoRoot, List.of());
+                        try {
+                            buildRepo(repoRoot, artifacts, release, buildBranchByRepo, repoConfigs.get(repoRoot));
+                            layerSucceeded.add(repoRoot);
+                        } catch (RuntimeException ex) {
+                            log.error("Build failed for {}", repoRoot.getFileName(), ex);
+                            layerFailures.add("Build failed in repository: " + repoRoot + "\n" +
+                                    "  Reason : " + ex.getMessage());
+                        }
+                    }, executor))
+                    .toList();
+
+            futures.forEach(CompletableFuture::join);
+            overallSucceeded.addAll(layerSucceeded);
+
+            if (!layerFailures.isEmpty()) {
+                throw new BuildFailedException(
+                        layerFailures.size() + " repo(s) failed:\n" +
+                        String.join("\n---\n", layerFailures),
+                        overallSucceeded);
+            }
+        }
+    }
+
+    private void buildRepo(Path repoRoot, List<Artifact> artifacts, boolean release,
+                           Map<Path, String> buildBranchByRepo, RepoConfig repoConfig) {
+        if (dryMode || (repoConfig != null && repoConfig.isDryRun())) {
+            log.info("Dry mode — skipping Lightspeed build/poll for {}", repoRoot.getFileName());
+            return;
+        }
+
+        boolean hasPom = Files.exists(repoRoot.resolve("pom.xml"));
+
+        if (release) {
+            String releaseVersion = buildBranchByRepo.get(repoRoot);
+            if (releaseVersion == null) {
+                throw new RuntimeException(
+                        "No release version found for " + repoRoot.getFileName() + " in buildBranchByRepo");
+            }
+
+            List<Artifact> releaseArtifacts;
+            if (!hasPom) {
+                // No pom.xml — release triggered by tag push in ReleaseService.
+                // Poll for any explicitly declared artifacts in the repo config.
+                List<String> coords = repoConfig != null ? repoConfig.getReleaseArtifacts() : List.of();
+                if (coords.isEmpty()) {
+                    log.info("  [LS] No pom.xml and no releaseArtifacts declared in {} — skipping artifact polling",
+                            repoRoot.getFileName());
+                    return;
+                }
+                releaseArtifacts = coords.stream()
+                        .map(coord -> {
+                            String[] parts = coord.split(":", 2);
+                            if (parts.length != 2) throw new RuntimeException(
+                                    "Invalid releaseArtifact coord '" + coord + "' in " + repoRoot.getFileName() +
+                                    " — expected groupId:artifactId");
+                            return new Artifact(parts[0], parts[1], releaseVersion);
+                        })
+                        .toList();
+            } else {
+                releaseArtifacts = artifacts.stream()
+                        .map(a -> new Artifact(a.getGroupId(), a.getArtifactId(), releaseVersion))
+                        .toList();
+            }
+
+            log.info("Polling Maven releases for {} artifact(s) in {} (version {})",
+                    releaseArtifacts.size(), repoRoot.getFileName(), releaseVersion);
+            pollUntilReleasePublished(repoRoot, releaseArtifacts);
+        } else {
+            if (!hasPom) {
+                // No pom.xml — trigger via Jenkinsfile commit; no Maven artifacts to poll (fire-and-forget)
+                log.info("  [LS] No pom.xml in {} — triggering via Jenkinsfile", repoRoot.getFileName());
+                injectJenkinsfileAndPush(repoRoot);
+                return;
+            }
+            // POM carries bare version (e.g. 1.0.1-SNAPSHOT); the pipeline publishes
+            // under the full version (e.g. 1.0.1-integration-SNAPSHOT). Poll using that.
+            List<Artifact> pollArtifacts = expandVersions(artifacts);
+            log.info("Triggering and polling Maven snapshots for {} artifact(s) in {} (version {})",
+                    pollArtifacts.size(), repoRoot.getFileName(),
+                    pollArtifacts.isEmpty() ? "?" : pollArtifacts.get(0).getVersion());
+            List<SnapshotMeta> baselines = captureSnapshotBaselines(pollArtifacts);
+            injectTriggerAndPush(repoRoot);
+            pollUntilSnapshotsUpdated(repoRoot, pollArtifacts, baselines);
+        }
+    }
+
+    private void injectJenkinsfileAndPush(Path repoRoot) {
+        Path jenkinsfile = repoRoot.resolve("Jenkinsfile");
+        if (!Files.exists(jenkinsfile)) {
+            log.warn("No Jenkinsfile found in {}, cannot trigger Lightspeed build", repoRoot.getFileName());
+            return;
+        }
+        try {
+            List<String> lines = new ArrayList<>(Files.readAllLines(jenkinsfile, StandardCharsets.UTF_8));
+            String triggerLine = "// build.trigger=" + Instant.now();
+            if (!lines.isEmpty() && lines.get(0).startsWith("// build.trigger=")) {
+                lines.set(0, triggerLine);
+            } else {
+                lines.add(0, triggerLine);
+            }
+            Files.writeString(jenkinsfile, String.join("\n", lines) + "\n", StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            log.warn("Could not update Jenkinsfile in {}", repoRoot.getFileName(), e);
+            return;
+        }
+        gitService.commitAllIfDirty(repoRoot, commitFormatter.format("chore: trigger ci build"));
+        gitService.push(repoRoot);
+        log.info("Pushed Jenkinsfile trigger commit for {}", repoRoot.getFileName());
+    }
+
+    // --- Snapshot flow ---
+
+    private List<SnapshotMeta> captureSnapshotBaselines(List<Artifact> artifacts) {
+        return artifacts.stream()
+                .map(a -> {
+                    String url = snapshotMetadataUrl(a);
+                    String xml = fetchXml(url);
+                    SnapshotMeta meta = xml != null ? parseSnapshotMeta(xml) : SnapshotMeta.EMPTY;
+                    log.info("  [LS] Baseline {}:{} build#{}", a.getArtifactId(), meta.timestamp(), meta.buildNumber());
+                    return meta;
+                })
+                .toList();
+    }
+
+    private void injectTriggerAndPush(Path repoRoot) {
+        Path pomPath = repoRoot.resolve("pom.xml");
+        if (!Files.exists(pomPath)) {
+            log.warn("No root pom.xml in {}, skipping trigger injection", repoRoot.getFileName());
+            return;
+        }
+        try {
+            injectTimestamp(pomPath);
+        } catch (Exception e) {
+            log.warn("Could not inject build trigger into {}", pomPath, e);
+        }
+        gitService.commitAllIfDirty(repoRoot, commitFormatter.format("chore: trigger ci build"));
+        gitService.push(repoRoot);
+        log.info("Pushed trigger commit for {}", repoRoot.getFileName());
+    }
+
+    private void pollUntilSnapshotsUpdated(Path repoRoot, List<Artifact> artifacts,
+                                           List<SnapshotMeta> baselines) {
+        long startMs = System.currentTimeMillis();
+        long deadline = startMs + props.getTimeoutMs();
+        while (System.currentTimeMillis() < deadline) {
+            sleep(props.getPollIntervalMs());
+            int pending = 0;
+            for (int i = 0; i < artifacts.size(); i++) {
+                Artifact a = artifacts.get(i);
+                SnapshotMeta baseline = baselines.get(i);
+                String xml = fetchXml(snapshotMetadataUrl(a));
+                if (xml == null) { pending++; continue; }
+                SnapshotMeta current = parseSnapshotMeta(xml);
+                if (!current.isNewerThan(baseline)) {
+                    pending++;
+                } else {
+                    log.info("  [LS] Snapshot updated: {} build#{}", a.getArtifactId(), current.buildNumber());
+                }
+            }
+            if (pending == 0) {
+                log.info("  [LS] All {} snapshot artifact(s) published for {} in {}",
+                        artifacts.size(), repoRoot.getFileName(), elapsed(startMs));
+                return;
+            }
+            log.info("  [LS] Waiting for {} artifact(s) in {} (elapsed={})",
+                    pending, repoRoot.getFileName(), elapsed(startMs));
+        }
+        throw new RuntimeException("Timeout waiting for Maven snapshot artifacts in " + repoRoot.getFileName());
+    }
+
+    // --- Release flow ---
+
+    private void pollUntilReleasePublished(Path repoRoot, List<Artifact> artifacts) {
+        long startMs = System.currentTimeMillis();
+        long deadline = startMs + props.getTimeoutMs();
+        while (System.currentTimeMillis() < deadline) {
+            sleep(props.getPollIntervalMs());
+            List<Artifact> pending = artifacts.stream().filter(a -> !isReleasePublished(a)).toList();
+            if (pending.isEmpty()) {
+                log.info("  [LS] All {} release artifact(s) published for {} in {}",
+                        artifacts.size(), repoRoot.getFileName(), elapsed(startMs));
+                return;
+            }
+            log.info("  [LS] Waiting for {}/{} artifact(s) in {} (elapsed={})",
+                    pending.size(), artifacts.size(), repoRoot.getFileName(), elapsed(startMs));
+        }
+        List<String> missing = artifacts.stream()
+                .filter(a -> !isReleasePublished(a))
+                .map(a -> a.getGroupId() + ":" + a.getArtifactId() + ":" + a.getVersion())
+                .toList();
+        throw new RuntimeException("Timeout waiting for release artifacts in " + repoRoot.getFileName() +
+                ". Missing: " + missing);
+    }
+
+    private boolean isReleasePublished(Artifact a) {
+        String url = releasePomUrl(a);
+        try {
+            HttpResponse<Void> resp = httpClient.send(
+                    requestBuilder(url).method("HEAD", HttpRequest.BodyPublishers.noBody()).build(),
+                    HttpResponse.BodyHandlers.discarding());
+            return resp.statusCode() == 200;
+        } catch (Exception e) {
+            log.debug("HEAD {} failed: {}", url, e.getMessage());
+            return false;
+        }
+    }
+
+    // --- Timestamp injection ---
+
+    private void injectTimestamp(Path pomPath) throws Exception {
+        String originalXml = Files.readString(pomPath, StandardCharsets.UTF_8);
+        Document doc = XmlUtils.parseXml(originalXml);
+        XPath xp = XPathFactory.newInstance().newXPath();
+
+        String timestamp = Instant.now().toString();
+
+        Node props = XmlUtils.node(xp, "/project/properties", doc);
+        if (props == null) {
+            // Create <properties> and append to <project>
+            Node project = XmlUtils.node(xp, "/project", doc);
+            if (project == null) return;
+            props = doc.createElement("properties");
+            project.appendChild(doc.createTextNode("\n    "));
+            project.appendChild(props);
+            project.appendChild(doc.createTextNode("\n"));
+        }
+
+        // Find or create the trigger property child element
+        Node triggerNode = findChildElement(props, TRIGGER_PROP);
+        if (triggerNode == null) {
+            triggerNode = doc.createElement(TRIGGER_PROP);
+            props.appendChild(doc.createTextNode("\n        "));
+            props.appendChild(triggerNode);
+            props.appendChild(doc.createTextNode("\n    "));
+        }
+        triggerNode.setTextContent(timestamp);
+
+        XmlUtils.writeXml(doc, pomPath, originalXml.stripLeading().startsWith("<?xml"));
+        log.debug("Injected build trigger timestamp {} into {}", timestamp, pomPath.getFileName());
+    }
+
+    private static Node findChildElement(Node parent, String localName) {
+        NodeList children = parent.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node child = children.item(i);
+            if (child.getNodeType() == Node.ELEMENT_NODE) {
+                String name = child.getLocalName() != null ? child.getLocalName() : child.getNodeName();
+                if (localName.equals(name)) return child;
+            }
+        }
+        return null;
+    }
+
+    // --- Maven metadata parsing ---
+
+    private SnapshotMeta parseSnapshotMeta(String xml) {
+        try {
+            Document doc = XmlUtils.parseXml(xml);
+            XPath xp = XPathFactory.newInstance().newXPath();
+            Node ts = XmlUtils.node(xp, "/metadata/versioning/snapshot/timestamp", doc);
+            Node bn = XmlUtils.node(xp, "/metadata/versioning/snapshot/buildNumber", doc);
+            String timestamp = ts != null ? ts.getTextContent().trim() : "";
+            int buildNumber = 0;
+            if (bn != null) {
+                try { buildNumber = Integer.parseInt(bn.getTextContent().trim()); } catch (NumberFormatException ignored) {}
+            }
+            return new SnapshotMeta(timestamp, buildNumber);
+        } catch (Exception e) {
+            log.warn("Failed to parse snapshot metadata XML", e);
+            return SnapshotMeta.EMPTY;
+        }
+    }
+
+    // --- URL helpers ---
+
+    private String snapshotMetadataUrl(Artifact a) {
+        return props.getMavenRepo().getSnapshotsUrl().stripTrailing() + "/" +
+                groupPath(a.getGroupId()) + "/" + a.getArtifactId() + "/" +
+                a.getVersion() + "/maven-metadata.xml";
+    }
+
+    private String releasePomUrl(Artifact a) {
+        return props.getMavenRepo().getReleasesUrl().stripTrailing() + "/" +
+                groupPath(a.getGroupId()) + "/" + a.getArtifactId() + "/" +
+                a.getVersion() + "/" + a.getArtifactId() + "-" + a.getVersion() + ".pom";
+    }
+
+    private static String groupPath(String groupId) {
+        return groupId.replace('.', '/');
+    }
+
+    // --- HTTP helpers ---
+
+    private String fetchXml(String url) {
+        try {
+            HttpResponse<String> resp = httpClient.send(
+                    requestBuilder(url).GET().build(),
+                    HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 404) return null;
+            if (resp.statusCode() >= 300) {
+                log.warn("Unexpected status {} from {}", resp.statusCode(), url);
+                return null;
+            }
+            return resp.body();
+        } catch (Exception e) {
+            log.warn("Failed to fetch {}", url, e);
+            return null;
+        }
+    }
+
+    private HttpRequest.Builder requestBuilder(String url) {
+        var builder = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Accept", "application/xml");
+        String user = props.getMavenRepo().getUsername();
+        if (!user.isBlank()) {
+            String creds = Base64.getEncoder().encodeToString(
+                    (user + ":" + props.getMavenRepo().getPassword()).getBytes(StandardCharsets.UTF_8));
+            builder.header("Authorization", "Basic " + creds);
+        }
+        return builder;
+    }
+
+    private static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+
+    private List<Artifact> expandVersions(List<Artifact> artifacts) {
+        if (integrationBranch.isBlank()) return artifacts;
+        return artifacts.stream()
+                .map(a -> {
+                    String v = a.getVersion();
+                    if (v.endsWith("-SNAPSHOT")) {
+                        v = v.substring(0, v.length() - "-SNAPSHOT".length())
+                                + "-" + integrationBranch + "-SNAPSHOT";
+                    }
+                    return new Artifact(a.getGroupId(), a.getArtifactId(), v);
+                })
+                .toList();
+    }
+
+    private static String elapsed(long startMs) {
+        long s = (System.currentTimeMillis() - startMs) / 1000;
+        return String.format("%d:%02d", s / 60, s % 60);
+    }
+
+    private record SnapshotMeta(String timestamp, int buildNumber) {
+        static final SnapshotMeta EMPTY = new SnapshotMeta("", 0);
+
+        boolean isNewerThan(SnapshotMeta other) {
+            if (this.buildNumber != other.buildNumber) return this.buildNumber > other.buildNumber;
+            return this.timestamp.compareTo(other.timestamp) > 0;
+        }
+    }
+}

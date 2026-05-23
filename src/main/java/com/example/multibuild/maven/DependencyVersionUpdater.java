@@ -7,26 +7,14 @@ import org.w3c.dom.Document;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.OutputKeys;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.transform.stream.StreamResult;
 import javax.xml.xpath.XPath;
 import javax.xml.xpath.XPathConstants;
 import javax.xml.xpath.XPathFactory;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.HashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Stream;
 
 @Component
@@ -34,9 +22,10 @@ public class DependencyVersionUpdater {
 
     private static final Logger log = LoggerFactory.getLogger(DependencyVersionUpdater.class);
 
-    // Updates <dependency> and <dependencyManagement> versions across all pom.xml files
-    // for every in-scope artifact. Returns the repo roots that had at least one change.
-    // Versions specified via property placeholders (${prop}) are resolved through <properties>.
+    // Updates <parent>, <dependency>, and <dependencyManagement> versions across all pom.xml
+    // files for every in-scope artifact. Returns the repo roots that had at least one change.
+    // Dependency versions specified via property placeholders (${prop}) are resolved through
+    // <properties>. Parent versions are always inline — placeholders are not supported there.
     public Set<Path> update(List<Path> repoRoots, Map<String, String> versionByKey) {
         Set<Path> modifiedRepos = new LinkedHashSet<>();
         for (Path repoRoot : repoRoots) {
@@ -58,13 +47,14 @@ public class DependencyVersionUpdater {
     private boolean updatePom(Path pomPath, Map<String, String> versionByKey) {
         try {
             String originalXml = Files.readString(pomPath, StandardCharsets.UTF_8);
-            Document doc = parseXml(originalXml);
+            Document doc = XmlUtils.parseXml(originalXml);
             XPath xp = XPathFactory.newInstance().newXPath();
             // Track properties already updated in this pom to avoid double-writes when
             // the same property is referenced by more than one dependency.
             Map<String, String> updatedProps = new HashMap<>();
 
-            boolean changed = updateDepNodes(
+            boolean changed = updateParent(doc, xp, versionByKey);
+            changed |= updateDepNodes(
                     (NodeList) xp.evaluate("/project/dependencies/dependency", doc, XPathConstants.NODESET),
                     xp, versionByKey, doc, updatedProps);
             changed |= updateDepNodes(
@@ -72,7 +62,7 @@ public class DependencyVersionUpdater {
                     xp, versionByKey, doc, updatedProps);
 
             if (changed) {
-                writeXml(doc, pomPath, originalXml.stripLeading().startsWith("<?xml"));
+                XmlUtils.writeXml(doc, pomPath, originalXml.stripLeading().startsWith("<?xml"));
                 log.debug("Updated dependency versions in {}", pomPath);
             }
             return changed;
@@ -82,14 +72,32 @@ public class DependencyVersionUpdater {
         }
     }
 
+    private boolean updateParent(Document doc, XPath xp, Map<String, String> versionByKey) throws Exception {
+        Node gId = XmlUtils.node(xp, "/project/parent/groupId", doc);
+        Node aId = XmlUtils.node(xp, "/project/parent/artifactId", doc);
+        Node ver = XmlUtils.node(xp, "/project/parent/version", doc);
+        if (gId == null || aId == null || ver == null) return false;
+
+        String key = gId.getTextContent().trim() + ":" + aId.getTextContent().trim();
+        String newVersion = versionByKey.get(key);
+        if (newVersion == null) return false;
+
+        String current = ver.getTextContent().trim();
+        if (newVersion.equals(current)) return false;
+
+        log.info("  {}:{} (parent) {} -> {}", gId.getTextContent().trim(), aId.getTextContent().trim(), current, newVersion);
+        ver.setTextContent(newVersion);
+        return true;
+    }
+
     private boolean updateDepNodes(NodeList nodes, XPath xp, Map<String, String> versionByKey,
                                    Document doc, Map<String, String> updatedProps) throws Exception {
         boolean changed = false;
         for (int i = 0; i < nodes.getLength(); i++) {
             Node dep = nodes.item(i);
-            Node gId = (Node) xp.evaluate("groupId", dep, XPathConstants.NODE);
-            Node aId = (Node) xp.evaluate("artifactId", dep, XPathConstants.NODE);
-            Node ver = (Node) xp.evaluate("version", dep, XPathConstants.NODE);
+            Node gId = XmlUtils.node(xp, "groupId", dep);
+            Node aId = XmlUtils.node(xp, "artifactId", dep);
+            Node ver = XmlUtils.node(xp, "version", dep);
             if (gId == null || aId == null || ver == null) continue;
 
             String current = ver.getTextContent().trim();
@@ -135,7 +143,7 @@ public class DependencyVersionUpdater {
     // Finds a child element of /project/properties whose local name matches propName.
     // Using DOM traversal instead of XPath to handle any valid Maven property name.
     private static Node findProperty(Document doc, XPath xp, String propName) throws Exception {
-        Node props = (Node) xp.evaluate("/project/properties", doc, XPathConstants.NODE);
+        Node props = XmlUtils.node(xp, "/project/properties", doc);
         if (props == null) return null;
         NodeList children = props.getChildNodes();
         for (int i = 0; i < children.getLength(); i++) {
@@ -161,23 +169,4 @@ public class DependencyVersionUpdater {
         }
     }
 
-    // --- XML helpers ---
-
-    private static Document parseXml(String xml) throws Exception {
-        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-        dbf.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
-        dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
-        dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-        return dbf.newDocumentBuilder().parse(new org.xml.sax.InputSource(new StringReader(xml)));
-    }
-
-    private static void writeXml(Document doc, Path path, boolean includeDeclaration) throws Exception {
-        Transformer t = TransformerFactory.newInstance().newTransformer();
-        t.setOutputProperty(OutputKeys.INDENT, "no");
-        t.setOutputProperty(OutputKeys.ENCODING, "UTF-8");
-        t.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, includeDeclaration ? "no" : "yes");
-        try (OutputStream os = Files.newOutputStream(path)) {
-            t.transform(new DOMSource(doc), new StreamResult(os));
-        }
-    }
 }

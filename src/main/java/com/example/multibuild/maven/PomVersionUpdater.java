@@ -1,7 +1,6 @@
 package com.example.multibuild.maven;
 
 import org.apache.maven.model.Model;
-import org.apache.maven.model.Parent;
 import org.apache.maven.model.io.xpp3.MavenXpp3Reader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -9,19 +8,10 @@ import org.springframework.stereotype.Component;
 import org.w3c.dom.Document;
 import org.w3c.dom.Node;
 
-import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.transform.OutputKeys;
-import javax.xml.transform.Transformer;
-import javax.xml.transform.TransformerFactory;
-import javax.xml.transform.dom.DOMSource;
-import javax.xml.transform.stream.StreamResult;
 import javax.xml.xpath.XPath;
-import javax.xml.xpath.XPathConstants;
 import javax.xml.xpath.XPathFactory;
 import java.io.FileReader;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -32,6 +22,26 @@ import java.util.stream.Stream;
 public class PomVersionUpdater {
 
     private static final Logger log = LoggerFactory.getLogger(PomVersionUpdater.class);
+
+    // Updates all pom.xml versions to <baseVersion>-SNAPSHOT (no branch qualifier).
+    // Used for Lightspeed repos where the CI pipeline appends the branch name itself.
+    // Returns the new version string.
+    public String updateVersionsBare(Path repoDir) {
+        List<Path> pomFiles = findPomFiles(repoDir);
+        if (pomFiles.isEmpty()) {
+            throw new RuntimeException("No pom.xml files found in " + repoDir);
+        }
+        RootInfo root = findRootInfo(pomFiles);
+        if (root == null) {
+            throw new RuntimeException("Could not determine root artifact in " + repoDir);
+        }
+        String newVersion = baseVersion(root.oldVersion()) + "-SNAPSHOT";
+        log.info("Updating versions in {} from {} to {}", repoDir.getFileName(), root.oldVersion(), newVersion);
+        for (Path pomFile : pomFiles) {
+            updatePom(pomFile, root, newVersion);
+        }
+        return newVersion;
+    }
 
     // Updates all pom.xml versions to <baseVersion>-<branchName>-SNAPSHOT,
     // preserving the numeric part of the existing version.
@@ -87,21 +97,21 @@ public class PomVersionUpdater {
     private void updatePom(Path pomPath, RootInfo root, String newVersion) {
         try {
             String originalXml = Files.readString(pomPath, StandardCharsets.UTF_8);
-            Document doc = parseXml(originalXml);
+            Document doc = XmlUtils.parseXml(originalXml);
             XPath xp = XPathFactory.newInstance().newXPath();
             boolean changed = false;
 
             // Update own <version> if it matches the root's old version
-            Node ownVersion = node(xp, "/project/version", doc);
+            Node ownVersion = XmlUtils.node(xp, "/project/version", doc);
             if (ownVersion != null && root.oldVersion().equals(ownVersion.getTextContent().trim())) {
                 ownVersion.setTextContent(newVersion);
                 changed = true;
             }
 
             // Update <parent><version> if parent is the root of this project
-            Node pg = node(xp, "/project/parent/groupId", doc);
-            Node pa = node(xp, "/project/parent/artifactId", doc);
-            Node pv = node(xp, "/project/parent/version", doc);
+            Node pg = XmlUtils.node(xp, "/project/parent/groupId", doc);
+            Node pa = XmlUtils.node(xp, "/project/parent/artifactId", doc);
+            Node pv = XmlUtils.node(xp, "/project/parent/version", doc);
             if (pg != null && pa != null && pv != null
                     && root.groupId().equals(pg.getTextContent().trim())
                     && root.artifactId().equals(pa.getTextContent().trim())
@@ -111,7 +121,7 @@ public class PomVersionUpdater {
             }
 
             if (changed) {
-                writeXml(doc, pomPath, originalXml.stripLeading().startsWith("<?xml"));
+                XmlUtils.writeXml(doc, pomPath, originalXml.stripLeading().startsWith("<?xml"));
                 log.debug("Updated {}", pomPath.getFileName());
             }
         } catch (Exception e) {
@@ -167,30 +177,6 @@ public class PomVersionUpdater {
                     .toList();
         } catch (IOException e) {
             throw new RuntimeException("Failed to scan " + repoDir, e);
-        }
-    }
-
-    // --- XML helpers ---
-
-    private static Node node(XPath xp, String expr, Object ctx) throws Exception {
-        return (Node) xp.evaluate(expr, ctx, XPathConstants.NODE);
-    }
-
-    private static Document parseXml(String xml) throws Exception {
-        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-        dbf.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
-        dbf.setFeature("http://xml.org/sax/features/external-general-entities", false);
-        dbf.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
-        return dbf.newDocumentBuilder().parse(new org.xml.sax.InputSource(new StringReader(xml)));
-    }
-
-    private static void writeXml(Document doc, Path path, boolean includeDeclaration) throws Exception {
-        Transformer t = TransformerFactory.newInstance().newTransformer();
-        t.setOutputProperty(OutputKeys.INDENT, "no");
-        t.setOutputProperty(OutputKeys.ENCODING, "UTF-8");
-        t.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, includeDeclaration ? "no" : "yes");
-        try (OutputStream os = Files.newOutputStream(path)) {
-            t.transform(new DOMSource(doc), new StreamResult(os));
         }
     }
 

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+
+    <!-- Base name (no extension). Override with: - -logging.file.name=/path/to/multibuild -->
+    <springProperty scope="context" name="LOG_BASE" source="logging.file.name" defaultValue="multibuild"/>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>${CONSOLE_LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+    </appender>
+
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_BASE}.log</file>
+        <encoder>
+            <pattern>${FILE_LOG_PATTERN}</pattern>
+            <charset>UTF-8</charset>
+        </encoder>
+        <!--
+            SizeAndTimeBasedRollingPolicy handles archive naming and old-file cleanup.
+            StartupTriggeringPolicy (below) overrides the built-in trigger so a roll
+            happens exactly once per JVM startup (if the active file is non-empty).
+            maxHistory counts second-level periods; 999999 s ≈ 11 days of time-based
+            expiry, but totalSizeCap is the practical limit in normal use.
+        -->
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_BASE}.%d{yyyy-MM-dd_HH-mm-ss}.%i.gz</fileNamePattern>
+            <maxFileSize>50MB</maxFileSize>
+            <maxHistory>999999</maxHistory>
+            <totalSizeCap>500MB</totalSizeCap>
+        </rollingPolicy>
+        <triggeringPolicy class="com.example.multibuild.logging.StartupTriggeringPolicy"/>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+        <appender-ref ref="FILE"/>
+    </root>
+</configuration>
