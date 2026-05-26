@@ -49,7 +49,7 @@ public class DependencyVersionService {
     // because the CI pipeline appends the branch name. Dependencies in other repos must
     // therefore reference the expanded version, not the bare one.
     public void apply(Map<Artifact, Module> moduleMap, List<Path> repoRoots,
-                      Map<Path, RepoConfig> repoConfigByPath) {
+                      Map<Path, RepoConfig> repoConfigByPath, String integrationBranch, boolean dryMode) {
         Map<String, String> versionByKey = moduleMap.entrySet().stream()
                 .collect(Collectors.toMap(
                         e -> e.getKey().key(),

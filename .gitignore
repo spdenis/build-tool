@@ -22,4 +22,29 @@
 # virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
 hs_err_pid*
 replay_pid*
+
+# Local config — do not commit
 user.properties
+mcp-config.json
+repo.json
+
+# Build output
+target/
+src/main/resources/static/
+
+# IDE
+.idea/
+.DS_Store
+
+# Claude local state
+.claude/
+
+# Planning artifacts
+multi_git_build_tool_plan.pdf
+build-completion-detector-plan.md
+
+# Frontend
+frontend/node_modules/
+
+# Local infrastructure
+udeploy-local/

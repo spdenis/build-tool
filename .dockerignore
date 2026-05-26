@@ -1,0 +1,10 @@
+target/
+.git/
+.idea/
+.claude/
+*.log
+*.pdf
+*.gz
+.DS_Store
+# Never bake secrets into the image
+user.properties

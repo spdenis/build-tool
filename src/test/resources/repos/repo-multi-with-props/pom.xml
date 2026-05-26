@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>multi-with-props-parent</artifactId>
+  <version>5.0.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+  <properties>
+    <lib-a.version>1.0.0-SNAPSHOT</lib-a.version>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.example</groupId>
+        <artifactId>lib-c</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <modules>
+    <module>module-x</module>
+  </modules>
+</project>

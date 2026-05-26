@@ -124,7 +124,7 @@ class MultiBuildFunctionalTest {
         Path work = workPath("repo-a");
         gitService.cloneRepo(remote.toUri().toString(), work);
 
-        branchService.apply(work, "main", new RepoConfig());
+        branchService.apply(work, "main", new RepoConfig(), INTEGRATION_BRANCH, false);
 
         try (Git git = Git.open(work.toFile())) {
             assertThat(git.getRepository().getBranch()).isEqualTo(INTEGRATION_BRANCH);
@@ -139,11 +139,11 @@ class MultiBuildFunctionalTest {
         Path work = workPath("repo-a");
         gitService.cloneRepo(remote.toUri().toString(), work);
 
-        branchService.apply(work, "main", new RepoConfig());
+        branchService.apply(work, "main", new RepoConfig(), INTEGRATION_BRANCH, false);
         String versionAfterFirst = pomVersionUpdater.getRootVersion(work);
 
         // Applying a second time must not modify the version again
-        branchService.apply(work, "main", new RepoConfig());
+        branchService.apply(work, "main", new RepoConfig(), INTEGRATION_BRANCH, false);
 
         assertThat(pomVersionUpdater.getRootVersion(work)).isEqualTo(versionAfterFirst);
     }
@@ -190,7 +190,7 @@ class MultiBuildFunctionalTest {
 
         RepoConfig config = new RepoConfig();
         config.setPreserveVersion(true);
-        branchService.apply(work, "main", config);
+        branchService.apply(work, "main", config, INTEGRATION_BRANCH, false);
 
         assertThat(pomVersionUpdater.getRootVersion(work)).isEqualTo("1.0.0-SNAPSHOT");
     }

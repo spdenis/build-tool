@@ -5,7 +5,6 @@ import com.example.multibuild.build.BuildService;
 import com.example.multibuild.git.GitHubService;
 import com.example.multibuild.git.GitService;
 import com.example.multibuild.graph.DependencyGraph;
-import com.example.multibuild.maven.PomVersionUpdater;
 import com.example.multibuild.model.*;
 import com.example.multibuild.model.Module;
 import com.example.multibuild.service.*;
@@ -71,7 +70,6 @@ public class Main implements CommandLineRunner {
 
     private final GitService gitService;
     private final BranchService branchService;
-    private final PomVersionUpdater pomVersionUpdater;
     private final ProjectAggregator aggregator;
     private final DependencyVersionService dependencyVersionService;
     private final BuildService buildService;
@@ -82,14 +80,12 @@ public class Main implements CommandLineRunner {
     private final UDeployService uDeployService;
 
     public Main(GitService gitService, BranchService branchService,
-                PomVersionUpdater pomVersionUpdater,
                 ProjectAggregator aggregator, DependencyVersionService dependencyVersionService,
                 BuildService buildService, ReleaseService releaseService, ObjectMapper objectMapper,
                 CommitMessageFormatter commitFormatter, GitHubService gitHubService,
                 UDeployService uDeployService) {
         this.gitService = gitService;
         this.branchService = branchService;
-        this.pomVersionUpdater = pomVersionUpdater;
         this.aggregator = aggregator;
         this.dependencyVersionService = dependencyVersionService;
         this.buildService = buildService;
@@ -106,6 +102,10 @@ public class Main implements CommandLineRunner {
 
     @Override
     public void run(String... args) throws Exception {
+        if (args.length == 0) {
+            log.info("No CLI command provided — running in web server mode");
+            return;
+        }
         if (args.length < 2) {
             printUsage();
             System.exit(1);
@@ -163,7 +163,7 @@ public class Main implements CommandLineRunner {
                     .filter(p -> !repoConfigByPath.get(p).hasVersionOverride())
                     .toList();
             try {
-                branchService.validateVersions(pathsToValidate, repoConfigByPath);
+                branchService.validateVersions(pathsToValidate, repoConfigByPath, branchService.getIntegrationBranch(), dryMode);
             } catch (RuntimeException e) {
                 log.error("Version validation failed", e);
                 System.err.println("\n[BUILD FAILED]\n" + e.getMessage());
@@ -202,7 +202,7 @@ public class Main implements CommandLineRunner {
                 if (buildMode == BuildMode.RELEASE) {
                     releaseService.execute(buildLayers, moduleMap, clonedPaths, repoConfigByPath, resumeState);
                 } else {
-                    dependencyVersionService.apply(moduleMap, clonedPaths, repoConfigByPath);
+                    dependencyVersionService.apply(moduleMap, clonedPaths, repoConfigByPath, branchService.getIntegrationBranch(), dryMode);
                     try {
                         buildService.buildAll(buildLayers, moduleMap, repoConfigByPath,
                                 resumeState.getCompletedRepoNames(), Collections.emptyMap());
@@ -361,9 +361,9 @@ public class Main implements CommandLineRunner {
                     log.info("  Cloning {}", repoName);
                     try {
                         Path cloned = gitService.cloneRepo(cloneUrl, workDir.resolve(repoName));
-                        branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry);
+                        branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry, branchService.getIntegrationBranch(), dryMode);
                         if (entry.hasVersionOverride()) {
-                            applyVersionOverride(cloned, entry.getVersion(), entry);
+                            branchService.applyVersionOverride(cloned, entry.getVersion(), entry, dryMode);
                         }
                         clonedArray[idx] = cloned;
                         log.info("  Done: {}", repoName);
@@ -534,19 +534,6 @@ public class Main implements CommandLineRunner {
         if (gitService.hasRemoteBranch(repoDir, "main")) return "main";
         log.info("    Branch 'main' not found in {}, falling back to 'master'", repoDir.getFileName());
         return "master";
-    }
-
-    private void applyVersionOverride(Path repoDir, String version, RepoConfig repoConfig) {
-        log.info("    Applying version override {} in {}", version, repoDir.getFileName());
-        pomVersionUpdater.setVersions(repoDir, version);
-        boolean committed = gitService.commitAllIfDirty(repoDir, commitFormatter.format("chore: set version to " + version));
-        if (committed) {
-            if (dryMode || repoConfig.isDryRun()) {
-                log.info("    Dry mode — skipping push for {}", repoDir.getFileName());
-            } else {
-                gitService.push(repoDir);
-            }
-        }
     }
 
     private ResumeState loadResumeState(Path stateFile) {

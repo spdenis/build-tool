@@ -53,7 +53,8 @@ public class BranchService {
     // Lightspeed repos must have bare -SNAPSHOT (e.g. 1.0.1-SNAPSHOT) because the
     // CI pipeline appends the branch name itself; all others must end with -<branch>-SNAPSHOT.
     // Behaviour on mismatch controlled by snapshot.version.mismatch ("fail" or "fix").
-    public void validateVersions(List<Path> repoDirs, Map<Path, RepoConfig> repoConfigByPath) {
+    public void validateVersions(List<Path> repoDirs, Map<Path, RepoConfig> repoConfigByPath,
+                                 String integrationBranch, boolean dryMode) {
         boolean fixMode = "fix".equalsIgnoreCase(versionMismatchMode);
         String requiredSuffix = "-" + integrationBranch + "-SNAPSHOT";
         List<String> violations = new ArrayList<>();
@@ -119,7 +120,8 @@ public class BranchService {
     // Checks out the integration branch in the cloned repo.
     // If newly created: Lightspeed repos get a bare -SNAPSHOT version; others get -<branch>-SNAPSHOT.
     // sourceBranch is the start point when the integration branch doesn't exist yet.
-    public void apply(Path repoDir, String sourceBranch, RepoConfig repoConfig) {
+    public void apply(Path repoDir, String sourceBranch, RepoConfig repoConfig,
+                      String integrationBranch, boolean dryMode) {
         boolean created = gitService.checkoutOrCreateBranch(repoDir, integrationBranch, sourceBranch);
         if (created) {
             if (repoConfig != null && repoConfig.isPreserveVersion()) {
@@ -161,6 +163,19 @@ public class BranchService {
                 }
             }
             log.info("Branch {} already exists in {}, keeping current versions", integrationBranch, repoDir.getFileName());
+        }
+    }
+
+    public void applyVersionOverride(Path repoDir, String version, RepoConfig repoConfig, boolean dryMode) {
+        log.info("    Applying version override {} in {}", version, repoDir.getFileName());
+        versionUpdater.setVersions(repoDir, version);
+        boolean committed = gitService.commitAllIfDirty(repoDir, commitFormatter.format("chore: set version to " + version));
+        if (committed) {
+            if (isDryRun(dryMode, repoConfig)) {
+                log.info("    Dry mode — skipping push for {}", repoDir.getFileName());
+            } else {
+                gitService.push(repoDir);
+            }
         }
     }
 
