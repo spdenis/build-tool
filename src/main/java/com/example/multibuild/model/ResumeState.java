@@ -53,25 +53,41 @@ public class ResumeState {
         }
     }
 
-    // Phase 2 (after graph computation): adds missing entries and updates the layer index
-    // for all entries — including those added by initReposFromConfigs which had layer=-1.
+    // Phase 2 (after graph computation): rebuilds the repos list in topological order and
+    // refreshes every layer index. New repos (not yet in state) are added as PENDING.
+    // Repos that exist in the old state but are no longer in allLayers (removed from
+    // repos.json) are appended after the ordered entries so they stay visible for audit.
     public void initRepos(List<List<Path>> allLayers, Map<Path, RepoConfig> configByPath) {
-        Map<String, RepoEntry> byName = repos.stream()
-                .collect(Collectors.toMap(RepoEntry::getName, e -> e, (a, b) -> a, LinkedHashMap::new));
+        Map<String, RepoEntry> existing = repos.stream()
+                .collect(Collectors.toMap(RepoEntry::getName, e -> e, (a, b) -> a));
+
+        List<RepoEntry> ordered = new ArrayList<>();
+        Set<String> inCurrentBuild = new LinkedHashSet<>();
+
         for (int layer = 0; layer < allLayers.size(); layer++) {
             for (Path p : allLayers.get(layer)) {
                 String name = p.getFileName().toString();
-                RepoEntry entry = byName.get(name);
+                RepoEntry entry = existing.get(name);
                 if (entry == null) {
                     entry = new RepoEntry();
                     entry.setName(name);
                     entry.setConfig(configByPath.get(p));
-                    repos.add(entry);
-                    byName.put(name, entry);
                 }
                 entry.setLayer(layer);
+                ordered.add(entry);
+                inCurrentBuild.add(name);
             }
         }
+
+        // Preserve entries that are no longer in the current build (e.g. removed from
+        // repos.json). They keep their status so history is not lost.
+        for (RepoEntry old : existing.values()) {
+            if (!inCurrentBuild.contains(old.getName())) {
+                ordered.add(old);
+            }
+        }
+
+        this.repos = ordered;
     }
 
     // Derived view used by BuildService implementations to skip already-completed repos.
