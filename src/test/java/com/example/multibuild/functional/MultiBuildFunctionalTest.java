@@ -336,6 +336,24 @@ class MultiBuildFunctionalTest {
         assertThat(layers.get(1)).containsExactly(workMulti);
     }
 
+    @Test
+    void graph_parentPomDependency_inheritedBySubModules() throws Exception {
+        // repo-multi-parent-dep root pom declares lib-a in <dependencies>.
+        // module-y does NOT re-declare it — it inherits the dep from the parent pom.
+        // The graph must still recognise the cross-repo edge and place repo-multi-parent-dep
+        // after repo-a.
+        Path workA = cloneFixture("repo-a");
+        Path workMultiParentDep = cloneFixture("repo-multi-parent-dep");
+
+        List<RepositoryProject> projects = projectAggregator.aggregate(List.of(workA, workMultiParentDep));
+        DependencyGraph<Path> graph = projectAggregator.buildGraph(projects);
+        List<List<Path>> layers = graph.topologicalLayers();
+
+        assertThat(layers).hasSize(2);
+        assertThat(layers.get(0)).containsExactly(workA);
+        assertThat(layers.get(1)).containsExactly(workMultiParentDep);
+    }
+
     // ── Dependency version update phase ───────────────────────────────────────
 
     @Test

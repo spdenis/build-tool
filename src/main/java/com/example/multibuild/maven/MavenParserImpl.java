@@ -43,14 +43,16 @@ public class MavenParserImpl implements MavenParser {
         }
 
         if (declaredModulesOnly) {
-            scanDeclared(rootPom, repoDir, modules, aggregatorParents);
+            scanDeclared(rootPom, repoDir, modules, aggregatorParents, List.of());
         } else {
             try (Stream<Path> paths = Files.walk(repoDir)) {
                 paths.filter(p -> p.getFileName().toString().equals("pom.xml"))
                      .sorted()
                      .forEach(pomPath -> {
                          try {
-                             parsePom(pomPath, repoDir, modules, aggregatorParents);
+                             // inheritedFromParent is empty; parsePom will resolve the parent chain
+                             // itself via resolveParentDeps when needed.
+                             parsePom(pomPath, repoDir, modules, aggregatorParents, List.of());
                          } catch (Exception e) {
                              log.warn("Skipping {}: {}", pomPath, e.getMessage());
                          }
@@ -63,8 +65,11 @@ public class MavenParserImpl implements MavenParser {
     }
 
     // Recursively follows <modules> declarations instead of walking the filesystem.
+    // inheritedFromParent accumulates <dependencies> declared on ancestor aggregator poms
+    // in the same repo — Maven sub-modules inherit them automatically without re-declaring.
     private void scanDeclared(Path pomPath, Path repoRoot,
-                              List<Module> modules, List<Artifact> aggregatorParents) {
+                              List<Module> modules, List<Artifact> aggregatorParents,
+                              List<Dependency> inheritedFromParent) {
         Model model;
         try (FileReader fr = new FileReader(pomPath.toFile())) {
             model = reader.read(fr);
@@ -80,18 +85,30 @@ public class MavenParserImpl implements MavenParser {
                     aggregatorParents.add(new Artifact(p.getGroupId(), p.getArtifactId(), p.getVersion()));
                 }
             }
+
+            // Sub-modules inherit this aggregator's <dependencies> on top of whatever
+            // was already inherited from higher-level ancestors.
+            List<Dependency> childInherited = new ArrayList<>(inheritedFromParent);
+            for (org.apache.maven.model.Dependency dep : model.getDependencies()) {
+                if (dep.getGroupId() != null && dep.getArtifactId() != null) {
+                    childInherited.add(new Dependency(new Artifact(
+                            dep.getGroupId(), dep.getArtifactId(),
+                            dep.getVersion() != null ? dep.getVersion() : "unknown")));
+                }
+            }
+
             Path pomDir = pomPath.getParent();
             for (String moduleName : model.getModules()) {
                 Path subPom = pomDir.resolve(moduleName).resolve("pom.xml");
                 if (Files.exists(subPom)) {
-                    scanDeclared(subPom, repoRoot, modules, aggregatorParents);
+                    scanDeclared(subPom, repoRoot, modules, aggregatorParents, childInherited);
                 } else {
                     log.warn("Declared module '{}' in {} has no pom.xml — skipping", moduleName, pomPath);
                 }
             }
         } else {
             try {
-                parsePom(pomPath, repoRoot, modules, aggregatorParents);
+                parsePom(pomPath, repoRoot, modules, aggregatorParents, inheritedFromParent);
             } catch (Exception e) {
                 log.warn("Skipping {}: {}", pomPath, e.getMessage());
             }
@@ -99,7 +116,8 @@ public class MavenParserImpl implements MavenParser {
     }
 
     private void parsePom(Path pomPath, Path repoRoot,
-                          List<Module> modules, List<Artifact> aggregatorParents)
+                          List<Module> modules, List<Artifact> aggregatorParents,
+                          List<Dependency> inheritedFromParent)
             throws IOException, XmlPullParserException {
         Model model;
         try (FileReader fr = new FileReader(pomPath.toFile())) {
@@ -128,6 +146,15 @@ public class MavenParserImpl implements MavenParser {
 
         List<Dependency> dependencies = new ArrayList<>();
 
+        // Dependencies inherited from ancestor aggregator poms in the same repo.
+        // In the declared-modules path these are passed in via inheritedFromParent.
+        // In the file-walk path inheritedFromParent is empty, so we resolve the parent
+        // chain directly by following <relativePath> within the repo.
+        dependencies.addAll(inheritedFromParent);
+        if (inheritedFromParent.isEmpty()) {
+            dependencies.addAll(resolveParentDeps(model, pomPath.getParent(), repoRoot));
+        }
+
         // Include <parent> as a dependency so that an external parent from another repo
         // is reflected as a graph edge. Internal parents (aggregator roots skipped above)
         // won't match any internal artifact and are harmlessly ignored in buildGraph.
@@ -147,6 +174,48 @@ public class MavenParserImpl implements MavenParser {
         }
 
         modules.add(new Module(artifact, dependencies, pomPath.getParent(), repoRoot));
+    }
+
+    // Traverses the <parent> chain within repoRoot, collecting <dependencies> that are
+    // automatically inherited by a module without being re-declared in its own pom.
+    // Used by the file-walk path; the declared-modules path uses inheritedFromParent instead.
+    private List<Dependency> resolveParentDeps(Model model, Path pomDir, Path repoRoot) {
+        org.apache.maven.model.Parent parentRef = model.getParent();
+        if (parentRef == null) return List.of();
+
+        String relativePath = parentRef.getRelativePath();
+        // Explicit empty relativePath means "no local parent" in Maven — honour that.
+        if (relativePath != null && relativePath.isEmpty()) return List.of();
+        if (relativePath == null || relativePath.isBlank()) relativePath = "../pom.xml";
+
+        Path parentPomPath;
+        try {
+            parentPomPath = pomDir.resolve(relativePath).normalize();
+        } catch (Exception e) {
+            return List.of();
+        }
+
+        // Only follow parents within the same repo.
+        if (!parentPomPath.startsWith(repoRoot) || !Files.exists(parentPomPath)) return List.of();
+
+        Model parentModel;
+        try (FileReader fr = new FileReader(parentPomPath.toFile())) {
+            parentModel = reader.read(fr);
+        } catch (Exception e) {
+            return List.of();
+        }
+
+        List<Dependency> result = new ArrayList<>();
+        // Recurse so that grandparent <dependencies> are also collected.
+        result.addAll(resolveParentDeps(parentModel, parentPomPath.getParent(), repoRoot));
+        for (org.apache.maven.model.Dependency dep : parentModel.getDependencies()) {
+            if (dep.getGroupId() != null && dep.getArtifactId() != null) {
+                result.add(new Dependency(new Artifact(
+                        dep.getGroupId(), dep.getArtifactId(),
+                        dep.getVersion() != null ? dep.getVersion() : "unknown")));
+            }
+        }
+        return result;
     }
 
     private String resolve(String value, String fallback) {
