@@ -241,7 +241,7 @@ public class Main implements CommandLineRunner {
                         return;
                     }
                 } else {
-                    dependencyVersionService.apply(moduleMap, clonedPaths, repoConfigByPath);
+                    dependencyVersionService.apply(moduleMap, buildOrder, repoConfigByPath);
                     try {
                         buildService.buildAll(buildLayers, moduleMap, repoConfigByPath,
                                 resumeState.getCompletedRepoNames(), Collections.emptyMap());
