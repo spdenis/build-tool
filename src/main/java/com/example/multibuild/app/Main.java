@@ -69,6 +69,9 @@ public class Main implements CommandLineRunner {
     @Value("${build.target.with-deps:false}")
     private boolean buildTargetWithDeps;
 
+    @Value("${build.pause-after:}")
+    private String pauseAfterRepo;
+
     private final GitService gitService;
     private final BranchService branchService;
     private final PomVersionUpdater pomVersionUpdater;
@@ -138,6 +141,9 @@ public class Main implements CommandLineRunner {
         if (!buildTarget.isBlank()) {
             log.info("  build.target={}  with-deps={}", buildTarget, buildTargetWithDeps);
         }
+        if (!pauseAfterRepo.isBlank()) {
+            log.info("  build.pause-after={}", pauseAfterRepo);
+        }
         log.info("══════════════════════════════════════════════════════");
 
         Path workDir = Paths.get(cloneDir);
@@ -179,6 +185,30 @@ public class Main implements CommandLineRunner {
         if (!buildTarget.isBlank()) {
             buildLayers = filterToTarget(buildLayers, graph, clonedPaths);
         }
+        boolean willPause = false;
+        if (!pauseAfterRepo.isBlank()) {
+            int pauseIdx = findPauseLayerIndex(buildLayers, pauseAfterRepo);
+            if (pauseIdx < 0) {
+                String available = buildLayers.stream().flatMap(List::stream)
+                        .map(p -> p.getFileName().toString())
+                        .collect(Collectors.joining(", "));
+                System.err.println("[ERROR] build.pause-after '" + pauseAfterRepo + "' not found. Available: " + available);
+                System.exit(1);
+            }
+            boolean alreadyDone = buildLayers.get(pauseIdx).stream()
+                    .map(p -> p.getFileName().toString())
+                    .allMatch(resumeState.getCompletedRepoNames()::contains);
+            if (alreadyDone) {
+                log.info("  '{}' already completed — build.pause-after ignored, continuing full build", pauseAfterRepo);
+            } else {
+                long deferred = buildLayers.subList(pauseIdx + 1, buildLayers.size()).stream()
+                        .flatMap(List::stream).count();
+                log.info("  Will pause after layer {}/{} ('{}'); {} downstream repo(s) deferred",
+                        pauseIdx + 1, buildLayers.size(), pauseAfterRepo, deferred);
+                buildLayers = buildLayers.subList(0, pauseIdx + 1);
+                willPause = true;
+            }
+        }
         List<Path> buildOrder = buildLayers.stream().flatMap(List::stream).toList();
 
         log.info("  {} repo(s) in {} layer(s):", clonedPaths.size(), buildLayers.size());
@@ -201,6 +231,15 @@ public class Main implements CommandLineRunner {
             try {
                 if (buildMode == BuildMode.RELEASE) {
                     releaseService.execute(buildLayers, moduleMap, clonedPaths, repoConfigByPath, resumeState);
+                    if (willPause) {
+                        // resumeState already updated by execute() — Phase 1 flag + completed repo names
+                        saveResumeState(resumeState, stateFile);
+                        log.info("══ Release PAUSED after '{}' (Phase 1 complete, {}/{} repo(s) built) ══",
+                                pauseAfterRepo, resumeState.getCompletedRepoNames().size(), clonedPaths.size());
+                        log.info("  Resume when ready: re-run with --build.resume.state.file={}",
+                                stateFile.toAbsolutePath());
+                        return;
+                    }
                 } else {
                     dependencyVersionService.apply(moduleMap, clonedPaths, repoConfigByPath);
                     try {
@@ -209,6 +248,15 @@ public class Main implements CommandLineRunner {
                     } catch (BuildFailedException e) {
                         e.getSucceeded().forEach(resumeState::markCompleted);
                         throw e;
+                    }
+                    if (willPause) {
+                        buildLayers.stream().flatMap(List::stream).forEach(resumeState::markCompleted);
+                        saveResumeState(resumeState, stateFile);
+                        log.info("══ Build PAUSED after '{}' ({} repo(s) complete) ════════════",
+                                pauseAfterRepo, resumeState.getCompletedRepoNames().size());
+                        log.info("  Resume when ready: re-run with --build.resume.state.file={}",
+                                stateFile.toAbsolutePath());
+                        return;
                     }
                 }
                 Files.deleteIfExists(stateFile);
@@ -464,6 +512,15 @@ public class Main implements CommandLineRunner {
                 .map(layer -> layer.stream().filter(keep::contains).toList())
                 .filter(layer -> !layer.isEmpty())
                 .toList();
+    }
+
+    private int findPauseLayerIndex(List<List<Path>> layers, String repoName) {
+        for (int i = 0; i < layers.size(); i++) {
+            for (Path p : layers.get(i)) {
+                if (p.getFileName().toString().equals(repoName)) return i;
+            }
+        }
+        return -1;
     }
 
     private void logDependencyTree(DependencyGraph<Path> graph) {
