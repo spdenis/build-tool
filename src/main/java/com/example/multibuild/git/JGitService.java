@@ -1,19 +1,10 @@
 package com.example.multibuild.git;
 
-import org.eclipse.jgit.api.CloneCommand;
-import org.eclipse.jgit.api.CreateBranchCommand;
-import org.eclipse.jgit.api.Git;
-import org.eclipse.jgit.api.ListBranchCommand;
-import org.eclipse.jgit.api.ResetCommand;
-import org.eclipse.jgit.api.TransportConfigCallback;
+import jakarta.annotation.PostConstruct;
+import org.eclipse.jgit.api.*;
 import org.eclipse.jgit.api.errors.GitAPIException;
-import org.eclipse.jgit.lib.Ref;
 import org.eclipse.jgit.lib.StoredConfig;
-import org.eclipse.jgit.transport.CredentialsProvider;
-import org.eclipse.jgit.transport.RefSpec;
-import org.eclipse.jgit.transport.SshTransport;
-import org.eclipse.jgit.transport.URIish;
-import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
+import org.eclipse.jgit.transport.*;
 import org.eclipse.jgit.transport.sshd.KeyPasswordProvider;
 import org.eclipse.jgit.transport.sshd.ServerKeyDatabase;
 import org.eclipse.jgit.transport.sshd.SshdSessionFactory;
@@ -21,7 +12,6 @@ import org.eclipse.jgit.transport.sshd.SshdSessionFactoryBuilder;
 import org.eclipse.jgit.util.FS;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import jakarta.annotation.PostConstruct;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
@@ -29,20 +19,10 @@ import org.springframework.util.FileSystemUtils;
 
 import java.io.File;
 import java.io.IOException;
-import java.net.Authenticator;
-import java.net.InetSocketAddress;
-import java.net.PasswordAuthentication;
-import java.net.Proxy;
-import java.net.ProxySelector;
-import java.net.SocketAddress;
-import java.net.URI;
+import java.net.*;
 import java.nio.file.Path;
 import java.security.PublicKey;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
@@ -419,11 +399,21 @@ public class JGitService implements GitService {
 
     @Override
     public void pushTag(Path repoDir, String tagName) {
+        doPushTag(repoDir, tagName, false);
+    }
+
+    @Override
+    public void pushTagForce(Path repoDir, String tagName) {
+        doPushTag(repoDir, tagName, true);
+    }
+
+    private void doPushTag(Path repoDir, String tagName, boolean force) {
         try (Git git = Git.open(repoDir.toFile())) {
-            log.info("Pushing tag {} in {}", tagName, repoDir.getFileName());
+            log.info("{}Pushing tag {} in {}", force ? "Force-" : "", tagName, repoDir.getFileName());
+            String refSpec = (force ? "+" : "") + "refs/tags/" + tagName + ":refs/tags/" + tagName;
             var push = git.push()
                     .setRemote("origin")
-                    .setRefSpecs(new RefSpec("refs/tags/" + tagName + ":refs/tags/" + tagName))
+                    .setRefSpecs(new RefSpec(refSpec))
                     .setTransportConfigCallback(sshTransportCallback())
                     .setTimeout(gitTimeoutSeconds);
             if (!isSshRemote(git) && !githubToken.isBlank() && !remoteHasEmbeddedCredentials(git)) {

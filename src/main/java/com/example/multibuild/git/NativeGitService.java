@@ -247,6 +247,12 @@ public class NativeGitService implements GitService {
         execLive(repoDir, "git", "push", "origin", "refs/tags/" + tagName);
     }
 
+    @Override
+    public void pushTagForce(Path repoDir, String tagName) {
+        log.info("Force-pushing tag {} in {}", tagName, repoDir.getFileName());
+        execLive(repoDir, "git", "push", "--force", "origin", "refs/tags/" + tagName);
+    }
+
     private static String maskUrl(String url) {
         return url.replaceAll("(https?://)([^@]+@)", "$1***@");
     }

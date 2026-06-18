@@ -105,13 +105,15 @@ public class ReleaseService {
                 } else {
                     log.info("  [{}] No pom.xml — tagging {} directly on HEAD", repoRoot.getFileName(), tagName);
                 }
+                // Tag is created locally here but pushed in Phase 2, just before each layer's
+                // build is triggered. Pushing all tags upfront would cause Jenkins to start
+                // building downstream repos before their upstream dependencies are available.
                 gitService.createTag(repoRoot, tagName, "Release " + release);
                 if (isDryRun(repoConfigs.get(repoRoot))) {
-                    log.info("  [{}] Dry mode — skipping push/pushTag", repoRoot.getFileName());
+                    log.info("  [{}] Dry mode — skipping push", repoRoot.getFileName());
                 } else {
                     gitService.push(repoRoot);
-                    gitService.pushTag(repoRoot, tagName);
-                    log.info("  [{}] Pushed branch and tag {}", repoRoot.getFileName(), tagName);
+                    log.info("  [{}] Pushed release branch at {}", repoRoot.getFileName(), tagName);
                 }
             }
             resumeState.setReleasePhase1Complete(true);
@@ -178,6 +180,23 @@ public class ReleaseService {
                     .collect(Collectors.joining(", "));
             log.info("  Layer {}/{}: building {} repo(s): {}",
                     layerNum, buildLayers.size(), layerRepos.size(), repoNames);
+
+            // Push release tags for this layer's repos just before triggering their builds.
+            // Doing this per-layer (not all upfront in Phase 1) ensures Jenkins never starts
+            // building a repo before its upstream dependencies' artifacts are published.
+            // Force-push handles resume runs where a tag was already pushed before a crash.
+            for (Path repoRoot : layerRepos) {
+                if (resumeState.isCompleted(repoRoot) || isDryRun(repoConfigs.get(repoRoot))) continue;
+                String tagName = tagByRepo.get(repoRoot);
+                if (tagName == null) continue;
+                // Recreate local tag in case the repo was freshly cloned for this resume run
+                // (Phase 1 only created tags locally, never pushed them to remote).
+                gitService.deleteTagIfExists(repoRoot, tagName);
+                gitService.createTag(repoRoot, tagName, "Release " + tagName);
+                gitService.pushTagForce(repoRoot, tagName);
+                log.info("  [{}] Pushed release tag {} — Jenkins build will start shortly",
+                        repoRoot.getFileName(), tagName);
+            }
 
             // For release builds, failure is tracked immediately via callback; success is tracked
             // below after the version bump (markCompleted triggers auto-save via onUpdate).

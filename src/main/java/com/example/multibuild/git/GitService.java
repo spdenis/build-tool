@@ -29,4 +29,9 @@ public interface GitService {
     void deleteTagIfExists(Path repoDir, String tagName);
 
     void pushTag(Path repoDir, String tagName);
+
+    // Force-pushes the tag, overwriting the remote if it already exists.
+    // Use in Phase 2 of a release to avoid "rejected: already exists" when retrying
+    // after a crash that pushed the tag but did not finish the build.
+    void pushTagForce(Path repoDir, String tagName);
 }
