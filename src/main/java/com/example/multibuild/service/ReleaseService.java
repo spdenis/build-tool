@@ -16,13 +16,8 @@ import org.springframework.stereotype.Service;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 @Service
@@ -169,12 +164,18 @@ public class ReleaseService {
             log.info("  Layer {}/{}: building {} repo(s): {}",
                     layerNum, buildLayers.size(), layerRepos.size(), repoNames);
 
+            // For release builds, failure is tracked immediately via callback; success is tracked
+            // below after the version bump (markCompleted triggers auto-save via onUpdate).
+            BiConsumer<Path, String> buildCallback = (repoRoot, error) -> {
+                if (error != null) resumeState.markFailed(repoRoot, error);
+            };
+
             Set<Path> newlyBuilt;
             BuildFailedException buildError = null;
             long layerStart = System.currentTimeMillis();
             try {
                 buildService.buildAll(List.of(layer), moduleMap, repoConfigs,
-                        resumeState.getCompletedRepoNames(), tagByRepo);
+                        resumeState.getCompletedRepoNames(), tagByRepo, buildCallback);
                 newlyBuilt = layerRepos.stream()
                         .filter(r -> !resumeState.isCompleted(r))
                         .collect(Collectors.toCollection(LinkedHashSet::new));
@@ -192,7 +193,7 @@ public class ReleaseService {
                 if (release == null) continue;
                 if (!Files.exists(repoRoot.resolve("pom.xml"))) {
                     log.info("  [{}] No pom.xml — skipping version bump", repoRoot.getFileName());
-                    resumeState.markCompleted(repoRoot);
+                    resumeState.markCompleted(repoRoot, release);
                     continue;
                 }
                 String nextSnapshot = incrementPatch(release) + "-SNAPSHOT";
@@ -213,7 +214,7 @@ public class ReleaseService {
                     gitService.push(repoRoot);
                     log.info("  [{}] Pushed next dev version {}", repoRoot.getFileName(), nextSnapshot);
                 }
-                resumeState.markCompleted(repoRoot);
+                resumeState.markCompleted(repoRoot, release);
             }
 
             if (buildError != null) throw buildError;

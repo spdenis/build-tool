@@ -79,7 +79,8 @@ class TeamCityBuildServiceManualTest {
                 Map.of(),
                 Map.of(repoPath, repoConfig),
                 Set.of(),
-                Map.of()
+                Map.of(),
+                (path, error) -> {}
         )).doesNotThrowAnyException();
     }
 

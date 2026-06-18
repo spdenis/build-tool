@@ -19,13 +19,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.stream.Collectors;
+import java.util.*;
+import java.util.function.BiConsumer;
 
 @Service
 @Qualifier("teamcity")
@@ -52,7 +47,8 @@ public class TeamCityBuildService implements BuildService {
     @Override
     public void buildAll(List<List<Path>> layers, Map<Artifact, Module> moduleMap,
                          Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
-                         Map<Path, String> buildBranchByRepo) {
+                         Map<Path, String> buildBranchByRepo,
+                         BiConsumer<Path, String> onRepoComplete) {
         // Build reverse lookup: repo root → first artifact (for build-config-pattern fallback)
         Map<Path, Artifact> representativeByRepo = new LinkedHashMap<>();
         for (Map.Entry<Artifact, Module> e : moduleMap.entrySet()) {
@@ -85,11 +81,14 @@ public class TeamCityBuildService implements BuildService {
             for (QueuedBuild b : queued) {
                 try {
                     waitForCompletionWithRetry(b.buildId(), b.configId(), b.repoRoot(), b.branch());
+                    onRepoComplete.accept(b.repoRoot(), null);
                     overallSucceeded.add(b.repoRoot());
                 } catch (RuntimeException e) {
-                    failures.add("Build failed in repository: " + b.repoRoot() + "\n" +
+                    String msg = "Build failed in repository: " + b.repoRoot() + "\n" +
                             "  Config ID : " + b.configId() + "\n" +
-                            "  Reason    : " + e.getMessage());
+                            "  Reason    : " + e.getMessage();
+                    onRepoComplete.accept(b.repoRoot(), msg);
+                    failures.add(msg);
                 }
             }
 

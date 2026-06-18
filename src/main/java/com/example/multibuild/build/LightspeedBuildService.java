@@ -31,6 +31,7 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.function.BiConsumer;
 
 @Service
 @Qualifier("lightspeed")
@@ -67,7 +68,8 @@ public class LightspeedBuildService implements BuildService {
     @Override
     public void buildAll(List<List<Path>> layers, Map<Artifact, Module> moduleMap,
                          Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
-                         Map<Path, String> buildBranchByRepo) {
+                         Map<Path, String> buildBranchByRepo,
+                         BiConsumer<Path, String> onRepoComplete) {
         boolean release = buildMode == BuildMode.RELEASE;
         if (release) {
             if (props.getMavenRepo().getReleasesUrl().isBlank()) {
@@ -103,11 +105,14 @@ public class LightspeedBuildService implements BuildService {
                         List<Artifact> artifacts = artifactsByRepo.getOrDefault(repoRoot, List.of());
                         try {
                             buildRepo(repoRoot, artifacts, release, buildBranchByRepo, repoConfigs.get(repoRoot));
+                            onRepoComplete.accept(repoRoot, null);
                             layerSucceeded.add(repoRoot);
                         } catch (RuntimeException ex) {
+                            String msg = "Build failed in repository: " + repoRoot + "\n" +
+                                    "  Reason : " + ex.getMessage();
+                            onRepoComplete.accept(repoRoot, msg);
                             log.error("Build failed for {}", repoRoot.getFileName(), ex);
-                            layerFailures.add("Build failed in repository: " + repoRoot + "\n" +
-                                    "  Reason : " + ex.getMessage());
+                            layerFailures.add(msg);
                         }
                     }, executor))
                     .toList();

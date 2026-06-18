@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BiConsumer;
 
 @Service
 @Qualifier("dummy")
@@ -22,11 +23,13 @@ public class DummyBuildService implements BuildService {
     @Override
     public void buildAll(List<List<Path>> layers, Map<Artifact, Module> moduleMap,
                          Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
-                         Map<Path, String> buildBranchByRepo) {
+                         Map<Path, String> buildBranchByRepo,
+                         BiConsumer<Path, String> onRepoComplete) {
         for (List<Path> layer : layers) {
             for (Path repoRoot : layer) {
                 if (completedRepoNames.contains(repoRoot.getFileName().toString())) continue;
                 log.info("  [DUMMY] Skipping build for {} (dummy build service)", repoRoot.getFileName());
+                onRepoComplete.accept(repoRoot, null);
             }
         }
     }

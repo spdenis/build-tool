@@ -1,6 +1,5 @@
 package com.example.multibuild.app;
 
-import com.example.multibuild.build.BuildFailedException;
 import com.example.multibuild.build.BuildService;
 import com.example.multibuild.git.GitHubService;
 import com.example.multibuild.git.GitService;
@@ -28,6 +27,7 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.Executors;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 @SpringBootApplication
@@ -154,6 +154,10 @@ public class Main implements CommandLineRunner {
                 : Paths.get(resumeStateFile);
 
         ResumeState resumeState = loadResumeState(stateFile);
+        resumeState.setOnUpdate(() -> saveResumeState(resumeState, stateFile));
+        // Create the state file immediately from repos.json so it exists even if cloning fails.
+        resumeState.initReposFromConfigs(repoEntries);
+        saveResumeState(resumeState, stateFile);
 
         if (skipGit) {
             log.info("── Phase 1/3: skipped — using local repos in {} ──", workDir);
@@ -185,6 +189,8 @@ public class Main implements CommandLineRunner {
         if (!buildTarget.isBlank()) {
             buildLayers = filterToTarget(buildLayers, graph, clonedPaths);
         }
+        // Capture full layer list before any pause truncation so the state file always shows all repos.
+        List<List<Path>> allLayers = buildLayers;
         boolean willPause = false;
         if (!pauseAfterRepo.isBlank()) {
             int pauseIdx = findPauseLayerIndex(buildLayers, pauseAfterRepo);
@@ -211,6 +217,11 @@ public class Main implements CommandLineRunner {
         }
         List<Path> buildOrder = buildLayers.stream().flatMap(List::stream).toList();
 
+        // Initialise state with every repo as PENDING (preserves existing status on resume).
+        // Saved to disk immediately so the file exists even if the process crashes before the first build.
+        resumeState.initRepos(allLayers, repoConfigByPath);
+        saveResumeState(resumeState, stateFile);
+
         log.info("  {} repo(s) in {} layer(s):", clonedPaths.size(), buildLayers.size());
         for (int i = 0; i < buildLayers.size(); i++) {
             List<Path> layer = buildLayers.get(i);
@@ -224,6 +235,12 @@ public class Main implements CommandLineRunner {
                 .flatMap(p -> p.getModules().stream())
                 .collect(Collectors.toMap(Module::getArtifact, m -> m));
 
+        // Pre-compute version for each repo so the callback can record what was actually built.
+        Map<Path, String> versionByRepo = new LinkedHashMap<>();
+        for (Map.Entry<Artifact, Module> e : moduleMap.entrySet()) {
+            versionByRepo.putIfAbsent(e.getValue().getRepoRoot(), e.getKey().getVersion());
+        }
+
         // ── Phase: build ───────────────────────────────────────────
         if (buildEnabled) {
             log.info("── Phase 3/3: build ({}) ─────────────────────────────", buildMode);
@@ -232,35 +249,37 @@ public class Main implements CommandLineRunner {
                 if (buildMode == BuildMode.RELEASE) {
                     releaseService.execute(buildLayers, moduleMap, clonedPaths, repoConfigByPath, resumeState);
                     if (willPause) {
-                        // resumeState already updated by execute() — Phase 1 flag + completed repo names
-                        saveResumeState(resumeState, stateFile);
+                        long total = allLayers.stream().flatMap(List::stream).count();
                         log.info("══ Release PAUSED after '{}' (Phase 1 complete, {}/{} repo(s) built) ══",
-                                pauseAfterRepo, resumeState.getCompletedRepoNames().size(), clonedPaths.size());
+                                pauseAfterRepo, resumeState.getCompletedRepoNames().size(), total);
                         log.info("  Resume when ready: re-run with --build.resume.state.file={}",
                                 stateFile.toAbsolutePath());
                         return;
                     }
                 } else {
                     dependencyVersionService.apply(moduleMap, buildOrder, repoConfigByPath);
-                    try {
-                        buildService.buildAll(buildLayers, moduleMap, repoConfigByPath,
-                                resumeState.getCompletedRepoNames(), Collections.emptyMap());
-                    } catch (BuildFailedException e) {
-                        e.getSucceeded().forEach(resumeState::markCompleted);
-                        throw e;
-                    }
+                    BiConsumer<Path, String> onRepoComplete = (repoRoot, error) -> {
+                        if (error == null) resumeState.markCompleted(repoRoot, versionByRepo.get(repoRoot));
+                        else resumeState.markFailed(repoRoot, error);
+                    };
+                    buildService.buildAll(buildLayers, moduleMap, repoConfigByPath,
+                            resumeState.getCompletedRepoNames(), Collections.emptyMap(), onRepoComplete);
                     if (willPause) {
-                        buildLayers.stream().flatMap(List::stream).forEach(resumeState::markCompleted);
-                        saveResumeState(resumeState, stateFile);
-                        log.info("══ Build PAUSED after '{}' ({} repo(s) complete) ════════════",
-                                pauseAfterRepo, resumeState.getCompletedRepoNames().size());
+                        long total = allLayers.stream().flatMap(List::stream).count();
+                        log.info("══ Build PAUSED after '{}' ({}/{} repo(s) complete) ══════════",
+                                pauseAfterRepo, resumeState.getCompletedRepoNames().size(), total);
                         log.info("  Resume when ready: re-run with --build.resume.state.file={}",
                                 stateFile.toAbsolutePath());
                         return;
                     }
                 }
+                // Keep the completed build as a permanent record at a stable path.
+                // The resume file is removed so the next fresh run starts clean.
+                Path buildRecord = workDir.resolve(".multibuild-last-build.json");
+                saveResumeState(resumeState, buildRecord);
                 Files.deleteIfExists(stateFile);
-                log.info("══ Build complete in {} ══════════════════════════════", elapsed(buildStart));
+                log.info("══ Build complete in {} — record saved to {} ══",
+                        elapsed(buildStart), buildRecord.getFileName());
             } catch (RuntimeException e) {
                 log.error("Build failed", e);
                 saveResumeState(resumeState, stateFile);

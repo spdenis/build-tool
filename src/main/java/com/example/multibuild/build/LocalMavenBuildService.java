@@ -11,15 +11,10 @@ import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 @Service
@@ -34,7 +29,8 @@ public class LocalMavenBuildService implements BuildService {
     @Override
     public void buildAll(List<List<Path>> layers, Map<Artifact, Module> moduleMap,
                          Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
-                         Map<Path, String> buildBranchByRepo) {
+                         Map<Path, String> buildBranchByRepo,
+                         BiConsumer<Path, String> onRepoComplete) {
         Set<Path> overallSucceeded = new LinkedHashSet<>();
         int layerNum = 0;
 
@@ -56,33 +52,34 @@ public class LocalMavenBuildService implements BuildService {
             if (repos.size() == 1) {
                 layerSucceeded = new LinkedHashSet<>();
                 layerFailures = new ArrayList<>();
+                Path repo = repos.get(0);
                 try {
-                    buildRepo(repos.get(0));
-                    layerSucceeded.add(repos.get(0));
+                    buildRepo(repo);
+                    onRepoComplete.accept(repo, null);
+                    layerSucceeded.add(repo);
                 } catch (RuntimeException e) {
+                    onRepoComplete.accept(repo, e.getMessage());
                     layerFailures.add(e.getMessage());
                 }
             } else {
                 log.info("  [LOCAL] Running {} repo(s) in parallel", repos.size());
                 Set<Path> concurrentSucceeded = ConcurrentHashMap.newKeySet();
-                List<String> concurrentFailures = new ArrayList<>();
+                List<String> concurrentFailures = Collections.synchronizedList(new ArrayList<>());
 
                 List<CompletableFuture<Void>> futures = repos.stream()
                         .map(repo -> CompletableFuture.runAsync(() -> {
-                            buildRepo(repo);
-                            concurrentSucceeded.add(repo);
+                            try {
+                                buildRepo(repo);
+                                onRepoComplete.accept(repo, null);
+                                concurrentSucceeded.add(repo);
+                            } catch (RuntimeException e) {
+                                onRepoComplete.accept(repo, e.getMessage());
+                                concurrentFailures.add(e.getMessage());
+                            }
                         }))
                         .toList();
 
-                for (CompletableFuture<Void> f : futures) {
-                    try {
-                        f.join();
-                    } catch (CompletionException e) {
-                        synchronized (concurrentFailures) {
-                            concurrentFailures.add(e.getCause().getMessage());
-                        }
-                    }
-                }
+                futures.forEach(CompletableFuture::join);
                 layerSucceeded = new LinkedHashSet<>(concurrentSucceeded);
                 layerFailures = concurrentFailures;
             }

@@ -12,15 +12,10 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Service;
 
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 /**
@@ -55,7 +50,8 @@ public class DispatchingBuildService implements BuildService {
     @Override
     public void buildAll(List<List<Path>> layers, Map<Artifact, Module> moduleMap,
                          Map<Path, RepoConfig> repoConfigs, Set<String> completedRepoNames,
-                         Map<Path, String> buildBranchByRepo) {
+                         Map<Path, String> buildBranchByRepo,
+                         BiConsumer<Path, String> onRepoComplete) {
         Set<Path> overallSucceeded = new LinkedHashSet<>();
 
         for (List<Path> layer : layers) {
@@ -78,7 +74,7 @@ public class DispatchingBuildService implements BuildService {
                 Map.Entry<BuildServiceType, List<Path>> entry = byType.entrySet().iterator().next();
                 try {
                     resolve(entry.getKey()).buildAll(List.of(entry.getValue()), moduleMap, repoConfigs,
-                            completedRepoNames, buildBranchByRepo);
+                            completedRepoNames, buildBranchByRepo, onRepoComplete);
                     overallSucceeded.addAll(entry.getValue());
                 } catch (BuildFailedException e) {
                     overallSucceeded.addAll(e.getSucceeded());
@@ -93,7 +89,7 @@ public class DispatchingBuildService implements BuildService {
                         .map(e -> CompletableFuture.runAsync(() -> {
                             try {
                                 resolve(e.getKey()).buildAll(List.of(e.getValue()), moduleMap, repoConfigs,
-                                        completedRepoNames, buildBranchByRepo);
+                                        completedRepoNames, buildBranchByRepo, onRepoComplete);
                                 layerSucceeded.addAll(e.getValue());
                             } catch (BuildFailedException ex) {
                                 layerSucceeded.addAll(ex.getSucceeded());
