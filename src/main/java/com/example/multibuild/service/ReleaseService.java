@@ -121,8 +121,11 @@ public class ReleaseService {
             for (Path repoRoot : repoRoots) {
                 String v = pomVersionUpdater.getRootVersion(repoRoot);
                 if (v != null) {
-                    releaseVersionByRepo.put(repoRoot, v);
-                    log.info("  [{}] Resumed at version {}", repoRoot.getFileName(), v);
+                    // baseVersion strips any -SNAPSHOT/-branch-SNAPSHOT suffix that may remain if the repo
+                    // was not yet processed by Phase 1 when the previous run crashed.
+                    String release = baseVersion(v);
+                    releaseVersionByRepo.put(repoRoot, release);
+                    log.info("  [{}] Resumed at version {}", repoRoot.getFileName(), release);
                 } else {
                     RepoConfig config = repoConfigs.get(repoRoot);
                     if (config != null && config.hasVersionOverride()) {
@@ -149,7 +152,19 @@ public class ReleaseService {
 
         for (List<Path> layer : buildLayers) {
             layerNum++;
-            List<Path> layerRepos = layer;
+
+            // Exclude repos that have no release tag determined by Phase 1. This happens for repos
+            // without pom.xml that also have no 'version' set in repos.json. Building them with
+            // the integration branch instead of a release tag would produce a SNAPSHOT artifact.
+            List<Path> layerRepos = new ArrayList<>();
+            for (Path r : layer) {
+                if (resumeState.isCompleted(r) || tagByRepo.containsKey(r)) {
+                    layerRepos.add(r);
+                } else {
+                    log.warn("  [{}] Skipping in release build — no pom.xml and no 'version' in repos.json",
+                            r.getFileName());
+                }
+            }
 
             boolean allSkipped = layerRepos.stream().allMatch(resumeState::isCompleted);
             if (allSkipped) {
@@ -174,7 +189,7 @@ public class ReleaseService {
             BuildFailedException buildError = null;
             long layerStart = System.currentTimeMillis();
             try {
-                buildService.buildAll(List.of(layer), moduleMap, repoConfigs,
+                buildService.buildAll(List.of(layerRepos), moduleMap, repoConfigs,
                         resumeState.getCompletedRepoNames(), tagByRepo, buildCallback);
                 newlyBuilt = layerRepos.stream()
                         .filter(r -> !resumeState.isCompleted(r))
