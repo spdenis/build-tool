@@ -271,20 +271,29 @@ public class Main implements CommandLineRunner {
                         return;
                     }
                 } else {
-                    // On resume, completed repos' built versions override their current pom versions
-                    // (which may have been bumped). Completed repos are excluded from the update
-                    // target — their poms are already correct from the first run.
-                    Map<Path, String> builtVersionsByRepo = resumeState.getCompletedVersionsByRepo(buildOrder);
-                    List<Path> reposToUpdate = buildOrder.stream()
-                            .filter(r -> !builtVersionsByRepo.containsKey(r))
-                            .toList();
-                    dependencyVersionService.apply(moduleMap, reposToUpdate, repoConfigByPath, builtVersionsByRepo);
+                    // Dep version update and build happen layer by layer so each layer's repos
+                    // reference the actually-built artifact versions from the previous layer.
+                    // This is important for partial rebuilds (build.target.with-deps) and resume:
+                    // after b is built, c and d's dep on b is updated to b's built version before
+                    // c and d are triggered, and so on through the dependency chain.
                     BiConsumer<Path, String> onRepoComplete = (repoRoot, error) -> {
                         if (error == null) resumeState.markCompleted(repoRoot, versionByRepo.get(repoRoot));
                         else resumeState.markFailed(repoRoot, error);
                     };
-                    buildService.buildAll(buildLayers, moduleMap, repoConfigByPath,
-                            resumeState.getCompletedRepoNames(), Collections.emptyMap(), onRepoComplete);
+                    for (List<Path> layer : buildLayers) {
+                        List<Path> layerToBuild = layer.stream()
+                                .filter(r -> !resumeState.isCompleted(r))
+                                .toList();
+                        if (!layerToBuild.isEmpty()) {
+                            Map<Path, String> builtVersionsByRepo =
+                                    resumeState.getCompletedVersionsByRepo(buildOrder);
+                            dependencyVersionService.apply(moduleMap, layerToBuild, repoConfigByPath,
+                                    builtVersionsByRepo);
+                            buildService.buildAll(List.of(layerToBuild), moduleMap, repoConfigByPath,
+                                    resumeState.getCompletedRepoNames(), Collections.emptyMap(),
+                                    onRepoComplete);
+                        }
+                    }
                     if (willPause) {
                         long total = allLayers.stream().flatMap(List::stream).count();
                         log.info("══ Build PAUSED after '{}' ({}/{} repo(s) complete) ══════════",
