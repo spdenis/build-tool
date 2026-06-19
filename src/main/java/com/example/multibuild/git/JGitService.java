@@ -3,7 +3,10 @@ package com.example.multibuild.git;
 import jakarta.annotation.PostConstruct;
 import org.eclipse.jgit.api.*;
 import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.lib.ObjectId;
 import org.eclipse.jgit.lib.StoredConfig;
+import org.eclipse.jgit.revwalk.RevCommit;
+import org.eclipse.jgit.revwalk.RevWalk;
 import org.eclipse.jgit.transport.*;
 import org.eclipse.jgit.transport.sshd.KeyPasswordProvider;
 import org.eclipse.jgit.transport.sshd.ServerKeyDatabase;
@@ -359,6 +362,33 @@ public class JGitService implements GitService {
             config.save();
         } catch (GitAPIException | IOException e) {
             throw new RuntimeException("Failed to push in " + repoDir, e);
+        }
+    }
+
+    @Override
+    public void pushIfAhead(Path repoDir) {
+        try (Git git = Git.open(repoDir.toFile())) {
+            String branch = git.getRepository().getBranch();
+            ObjectId localHead = git.getRepository().resolve("HEAD");
+            if (localHead == null) return;
+            ObjectId remoteHead = git.getRepository().resolve("refs/remotes/origin/" + branch);
+            if (remoteHead == null) {
+                log.info("  [{}] Branch '{}' not on remote — pushing", repoDir.getFileName(), branch);
+                push(repoDir);
+                return;
+            }
+            if (localHead.equals(remoteHead)) return;
+            try (RevWalk walk = new RevWalk(git.getRepository())) {
+                RevCommit local = walk.parseCommit(localHead);
+                RevCommit remote = walk.parseCommit(remoteHead);
+                if (walk.isMergedInto(remote, local)) {
+                    log.info("  [{}] Local '{}' is ahead of remote — pushing unpushed commits",
+                            repoDir.getFileName(), branch);
+                    push(repoDir);
+                }
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to check ahead status in " + repoDir, e);
         }
     }
 

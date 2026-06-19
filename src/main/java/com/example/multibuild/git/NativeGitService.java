@@ -226,6 +226,23 @@ public class NativeGitService implements GitService {
     }
 
     @Override
+    public void pushIfAhead(Path repoDir) {
+        String branch = exec(repoDir, "git", "rev-parse", "--abbrev-ref", "HEAD").trim();
+        String tracking = exec(repoDir, "git", "branch", "-r", "--list", "origin/" + branch).trim();
+        if (tracking.isBlank()) {
+            log.info("  [{}] Branch '{}' not on remote — pushing", repoDir.getFileName(), branch);
+            push(repoDir);
+            return;
+        }
+        String aheadCount = exec(repoDir, "git", "rev-list", "--count", "origin/" + branch + "..HEAD").trim();
+        if (!"0".equals(aheadCount)) {
+            log.info("  [{}] Local '{}' is {} commit(s) ahead of remote — pushing",
+                    repoDir.getFileName(), branch, aheadCount);
+            push(repoDir);
+        }
+    }
+
+    @Override
     public void createTag(Path repoDir, String tagName, String message) {
         exec(repoDir, "git", "tag", "-a", tagName, "-m", message);
         log.info("Created tag {} in {}", tagName, repoDir.getFileName());

@@ -168,6 +168,17 @@ public class Main implements CommandLineRunner {
         List<Path> clonedPaths = cloned.paths();
         Map<Path, RepoConfig> repoConfigByPath = cloned.configByPath();
 
+        // Push any commits left unpushed by a prior dry-mode run before starting the build.
+        // This is a no-op when local is already in sync with remote.
+        if (!dryMode) {
+            for (Path repoRoot : clonedPaths) {
+                RepoConfig config = repoConfigByPath.get(repoRoot);
+                if (config == null || !config.isDryRun()) {
+                    gitService.pushIfAhead(repoRoot);
+                }
+            }
+        }
+
         if (buildEnabled && buildMode != BuildMode.RELEASE && !skipGit) {
             List<Path> pathsToValidate = clonedPaths.stream()
                     .filter(p -> !repoConfigByPath.get(p).hasVersionOverride())

@@ -23,6 +23,11 @@ public interface GitService {
 
     void push(Path repoDir);
 
+    // Pushes the current branch only if local is ahead of the remote tracking branch.
+    // No-op when already up to date. Pushes unconditionally when no remote tracking ref exists.
+    // Used to flush commits left behind by a previous dry-mode run.
+    void pushIfAhead(Path repoDir);
+
     void createTag(Path repoDir, String tagName, String message);
 
     // Deletes the tag locally and from the remote if it exists. No-op if it doesn't exist.
