@@ -247,7 +247,10 @@ public class Main implements CommandLineRunner {
             long buildStart = System.currentTimeMillis();
             try {
                 if (buildMode == BuildMode.RELEASE) {
-                    releaseService.execute(buildLayers, moduleMap, clonedPaths, repoConfigByPath, resumeState);
+                    List<Path> releaseRepoRoots = buildTarget.isBlank()
+                            ? clonedPaths
+                            : allLayers.stream().flatMap(List::stream).toList();
+                    releaseService.execute(buildLayers, moduleMap, releaseRepoRoots, repoConfigByPath, resumeState);
                     if (willPause) {
                         long total = allLayers.stream().flatMap(List::stream).count();
                         log.info("══ Release PAUSED after '{}' (Phase 1 complete, {}/{} repo(s) built) ══",
