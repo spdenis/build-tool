@@ -19,10 +19,6 @@ import org.w3c.dom.NodeList;
 
 import javax.xml.xpath.XPath;
 import javax.xml.xpath.XPathFactory;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -53,16 +49,18 @@ public class LightspeedBuildService implements BuildService {
     private final LightspeedProperties props;
     private final GitService gitService;
     private final CommitMessageFormatter commitFormatter;
-    private final HttpClient httpClient = HttpClient.newHttpClient();
+    private final MavenRepositoryClient mavenClient;
     // Cached thread pool because poll loops are long-running blocking IO tasks
     private final java.util.concurrent.ExecutorService executor =
             Executors.newCachedThreadPool();
 
     public LightspeedBuildService(LightspeedProperties props, GitService gitService,
-                                  CommitMessageFormatter commitFormatter) {
+                                  CommitMessageFormatter commitFormatter,
+                                  MavenRepositoryClient mavenClient) {
         this.props = props;
         this.gitService = gitService;
         this.commitFormatter = commitFormatter;
+        this.mavenClient = mavenClient;
     }
 
     @Override
@@ -222,7 +220,7 @@ public class LightspeedBuildService implements BuildService {
         return artifacts.stream()
                 .map(a -> {
                     String url = snapshotMetadataUrl(a);
-                    String xml = fetchXml(url);
+                    String xml = mavenClient.fetchXml(url);
                     SnapshotMeta meta = xml != null ? parseSnapshotMeta(xml) : SnapshotMeta.EMPTY;
                     log.info("  [LS] Baseline {}:{} build#{}", a.getArtifactId(), meta.timestamp(), meta.buildNumber());
                     return meta;
@@ -256,7 +254,7 @@ public class LightspeedBuildService implements BuildService {
             for (int i = 0; i < artifacts.size(); i++) {
                 Artifact a = artifacts.get(i);
                 SnapshotMeta baseline = baselines.get(i);
-                String xml = fetchXml(snapshotMetadataUrl(a));
+                String xml = mavenClient.fetchXml(snapshotMetadataUrl(a));
                 if (xml == null) { pending++; continue; }
                 SnapshotMeta current = parseSnapshotMeta(xml);
                 if (!current.isNewerThan(baseline)) {
@@ -283,7 +281,7 @@ public class LightspeedBuildService implements BuildService {
         long deadline = startMs + props.getTimeoutMs();
         while (System.currentTimeMillis() < deadline) {
             sleep(props.getPollIntervalMs());
-            List<Artifact> pending = artifacts.stream().filter(a -> !isReleasePublished(a)).toList();
+            List<Artifact> pending = artifacts.stream().filter(a -> !mavenClient.isReleasePublished(a)).toList();
             if (pending.isEmpty()) {
                 log.info("  [LS] All {} release artifact(s) published for {} in {}",
                         artifacts.size(), repoRoot.getFileName(), elapsed(startMs));
@@ -293,24 +291,11 @@ public class LightspeedBuildService implements BuildService {
                     pending.size(), artifacts.size(), repoRoot.getFileName(), elapsed(startMs));
         }
         List<String> missing = artifacts.stream()
-                .filter(a -> !isReleasePublished(a))
-                .map(a -> a.getGroupId() + ":" + a.getArtifactId() + ":" + a.getVersion())
+                .filter(a -> !mavenClient.isReleasePublished(a))
+                .map(Artifact::toString)
                 .toList();
         throw new RuntimeException("Timeout waiting for release artifacts in " + repoRoot.getFileName() +
                 ". Missing: " + missing);
-    }
-
-    private boolean isReleasePublished(Artifact a) {
-        String url = releasePomUrl(a);
-        try {
-            HttpResponse<Void> resp = httpClient.send(
-                    requestBuilder(url).method("HEAD", HttpRequest.BodyPublishers.noBody()).build(),
-                    HttpResponse.BodyHandlers.discarding());
-            return resp.statusCode() == 200;
-        } catch (Exception e) {
-            log.debug("HEAD {} failed: {}", url, e.getMessage());
-            return false;
-        }
     }
 
     // --- Timestamp injection ---
@@ -379,54 +364,10 @@ public class LightspeedBuildService implements BuildService {
         }
     }
 
-    // --- URL helpers ---
-
     private String snapshotMetadataUrl(Artifact a) {
         return props.getMavenRepo().getSnapshotsUrl().stripTrailing() + "/" +
-                groupPath(a.getGroupId()) + "/" + a.getArtifactId() + "/" +
+                MavenRepositoryClient.groupPath(a.getGroupId()) + "/" + a.getArtifactId() + "/" +
                 a.getVersion() + "/maven-metadata.xml";
-    }
-
-    private String releasePomUrl(Artifact a) {
-        return props.getMavenRepo().getReleasesUrl().stripTrailing() + "/" +
-                groupPath(a.getGroupId()) + "/" + a.getArtifactId() + "/" +
-                a.getVersion() + "/" + a.getArtifactId() + "-" + a.getVersion() + ".pom";
-    }
-
-    private static String groupPath(String groupId) {
-        return groupId.replace('.', '/');
-    }
-
-    // --- HTTP helpers ---
-
-    private String fetchXml(String url) {
-        try {
-            HttpResponse<String> resp = httpClient.send(
-                    requestBuilder(url).GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() == 404) return null;
-            if (resp.statusCode() >= 300) {
-                log.warn("Unexpected status {} from {}", resp.statusCode(), url);
-                return null;
-            }
-            return resp.body();
-        } catch (Exception e) {
-            log.warn("Failed to fetch {}", url, e);
-            return null;
-        }
-    }
-
-    private HttpRequest.Builder requestBuilder(String url) {
-        var builder = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .header("Accept", "application/xml");
-        String user = props.getMavenRepo().getUsername();
-        if (!user.isBlank()) {
-            String creds = Base64.getEncoder().encodeToString(
-                    (user + ":" + props.getMavenRepo().getPassword()).getBytes(StandardCharsets.UTF_8));
-            builder.header("Authorization", "Basic " + creds);
-        }
-        return builder;
     }
 
     private static void sleep(long ms) {

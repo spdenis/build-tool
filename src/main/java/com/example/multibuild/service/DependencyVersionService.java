@@ -48,14 +48,23 @@ public class DependencyVersionService {
     // the artifact that actually lands in the Maven repository is 1.0.1-<branch>-SNAPSHOT
     // because the CI pipeline appends the branch name. Dependencies in other repos must
     // therefore reference the expanded version, not the bare one.
+    //
+    // builtVersionsByRepo: on resume, maps already-built repo paths to their actual built
+    // version (from the state file). These override the current pom version, which may have
+    // been bumped to the next snapshot after the build completed.
     public void apply(Map<Artifact, Module> moduleMap, List<Path> repoRoots,
-                      Map<Path, RepoConfig> repoConfigByPath) {
+                      Map<Path, RepoConfig> repoConfigByPath,
+                      Map<Path, String> builtVersionsByRepo) {
         Map<String, String> versionByKey = moduleMap.entrySet().stream()
                 .collect(Collectors.toMap(
                         e -> e.getKey().key(),
                         e -> {
                             Artifact a = e.getKey();
                             Module m = e.getValue();
+                            // On resume, prefer the version that was actually built over the
+                            // current pom version (which may have been bumped to next snapshot).
+                            String builtVersion = builtVersionsByRepo.get(m.getRepoRoot());
+                            if (builtVersion != null) return builtVersion;
                             RepoConfig config = repoConfigByPath.get(m.getRepoRoot());
                             if (config != null && config.isPreserveVersion()) {
                                 return a.getVersion();

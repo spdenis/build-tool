@@ -90,6 +90,21 @@ public class ResumeState {
         this.repos = ordered;
     }
 
+    // Returns the version that was actually built for each completed repo in the given list.
+    // Used on resume so that version maps reference the real built version rather than the
+    // current pom version (which may have been bumped to next snapshot after the build).
+    public Map<Path, String> getCompletedVersionsByRepo(Collection<Path> repoRoots) {
+        Map<String, String> byName = repos.stream()
+                .filter(e -> e.getStatus() == RepoStatus.SUCCESS && e.getVersion() != null)
+                .collect(Collectors.toMap(RepoEntry::getName, RepoEntry::getVersion, (a, b) -> a));
+        Map<Path, String> result = new LinkedHashMap<>();
+        for (Path repo : repoRoots) {
+            String v = byName.get(repo.getFileName().toString());
+            if (v != null) result.put(repo, v);
+        }
+        return result;
+    }
+
     // Derived view used by BuildService implementations to skip already-completed repos.
     public Set<String> getCompletedRepoNames() {
         return repos.stream()

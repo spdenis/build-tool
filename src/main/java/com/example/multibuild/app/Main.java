@@ -260,7 +260,14 @@ public class Main implements CommandLineRunner {
                         return;
                     }
                 } else {
-                    dependencyVersionService.apply(moduleMap, buildOrder, repoConfigByPath);
+                    // On resume, completed repos' built versions override their current pom versions
+                    // (which may have been bumped). Completed repos are excluded from the update
+                    // target — their poms are already correct from the first run.
+                    Map<Path, String> builtVersionsByRepo = resumeState.getCompletedVersionsByRepo(buildOrder);
+                    List<Path> reposToUpdate = buildOrder.stream()
+                            .filter(r -> !builtVersionsByRepo.containsKey(r))
+                            .toList();
+                    dependencyVersionService.apply(moduleMap, reposToUpdate, repoConfigByPath, builtVersionsByRepo);
                     BiConsumer<Path, String> onRepoComplete = (repoRoot, error) -> {
                         if (error == null) resumeState.markCompleted(repoRoot, versionByRepo.get(repoRoot));
                         else resumeState.markFailed(repoRoot, error);

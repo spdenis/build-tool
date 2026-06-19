@@ -2,6 +2,7 @@ package com.example.multibuild.service;
 
 import com.example.multibuild.build.BuildFailedException;
 import com.example.multibuild.build.BuildService;
+import com.example.multibuild.build.MavenRepositoryClient;
 import com.example.multibuild.git.GitService;
 import com.example.multibuild.maven.DependencyVersionUpdater;
 import com.example.multibuild.maven.PomVersionUpdater;
@@ -32,15 +33,18 @@ public class ReleaseService {
     private final DependencyVersionUpdater dependencyVersionUpdater;
     private final GitService gitService;
     private final BuildService buildService;
+    private final MavenRepositoryClient mavenClient;
 
     public ReleaseService(PomVersionUpdater pomVersionUpdater,
                           DependencyVersionUpdater dependencyVersionUpdater,
                           GitService gitService,
-                          BuildService buildService) {
+                          BuildService buildService,
+                          MavenRepositoryClient mavenClient) {
         this.pomVersionUpdater = pomVersionUpdater;
         this.dependencyVersionUpdater = dependencyVersionUpdater;
         this.gitService = gitService;
         this.buildService = buildService;
+        this.mavenClient = mavenClient;
     }
 
     public void execute(List<List<Path>> buildLayers, Map<Artifact, Module> moduleMap,
@@ -76,6 +80,10 @@ public class ReleaseService {
         for (Map.Entry<Artifact, Module> entry : moduleMap.entrySet()) {
             String rv = releaseVersionByRepo.get(entry.getValue().getRepoRoot());
             if (rv != null) releaseVersionByKey.put(entry.getKey().key(), rv);
+        }
+
+        if (mavenClient.isReleasesConfigured() && !resumeState.isReleasePhase1Complete()) {
+            checkVersionsNotAlreadyReleased(repoRoots, releaseVersionByRepo, moduleMap, repoConfigs);
         }
 
         if (!resumeState.isReleasePhase1Complete()) {
@@ -120,7 +128,17 @@ public class ReleaseService {
             log.info("── Release Phase 1 complete in {} ──────────────────────", elapsed(phase1Start));
         } else {
             log.info("  Skipping — already completed in a previous run, re-deriving versions from pom files");
+            // For repos already built in Phase 2, use the exact version recorded in the state
+            // file. Reading from the pom would give the next-snapshot version (e.g. 1.0.1-SNAPSHOT
+            // after a 1.0.0 release build), and baseVersion() would yield 1.0.1 instead of 1.0.0.
+            Map<Path, String> completedVersions = resumeState.getCompletedVersionsByRepo(repoRoots);
             for (Path repoRoot : repoRoots) {
+                String stateVersion = completedVersions.get(repoRoot);
+                if (stateVersion != null) {
+                    releaseVersionByRepo.put(repoRoot, stateVersion);
+                    log.info("  [{}] Resumed — using built version {}", repoRoot.getFileName(), stateVersion);
+                    continue;
+                }
                 String v = pomVersionUpdater.getRootVersion(repoRoot);
                 if (v != null) {
                     // baseVersion strips any -SNAPSHOT/-branch-SNAPSHOT suffix that may remain if the repo
@@ -247,6 +265,59 @@ public class ReleaseService {
         }
 
         log.info("── Release Phase 2 complete in {} ──────────────────────", elapsed(phase2Start));
+    }
+
+    private void checkVersionsNotAlreadyReleased(List<Path> repoRoots,
+                                                  Map<Path, String> releaseVersionByRepo,
+                                                  Map<Artifact, Module> moduleMap,
+                                                  Map<Path, RepoConfig> repoConfigs) {
+        log.info("  Pre-flight: checking release versions are not already published in Maven...");
+
+        Map<Path, List<Artifact>> artifactsByRepo = new LinkedHashMap<>();
+        for (Map.Entry<Artifact, Module> e : moduleMap.entrySet()) {
+            artifactsByRepo.computeIfAbsent(e.getValue().getRepoRoot(), k -> new ArrayList<>())
+                           .add(e.getKey());
+        }
+
+        List<String> conflicts = new ArrayList<>();
+
+        for (Path repoRoot : repoRoots) {
+            String releaseVersion = releaseVersionByRepo.get(repoRoot);
+            if (releaseVersion == null) continue;
+
+            List<Artifact> toCheck;
+            if (Files.exists(repoRoot.resolve("pom.xml"))) {
+                toCheck = artifactsByRepo.getOrDefault(repoRoot, List.of()).stream()
+                        .map(a -> new Artifact(a.getGroupId(), a.getArtifactId(), releaseVersion))
+                        .toList();
+            } else {
+                RepoConfig config = repoConfigs.get(repoRoot);
+                List<String> coords = config != null ? config.getReleaseArtifacts() : List.of();
+                toCheck = coords.stream()
+                        .map(coord -> {
+                            String[] parts = coord.split(":", 2);
+                            if (parts.length != 2) return null;
+                            return new Artifact(parts[0], parts[1], releaseVersion);
+                        })
+                        .filter(Objects::nonNull)
+                        .toList();
+            }
+
+            for (Artifact a : toCheck) {
+                if (mavenClient.isReleasePublished(a)) {
+                    conflicts.add("  " + a + "  →  " + mavenClient.releasePomUrl(a));
+                }
+            }
+        }
+
+        if (!conflicts.isEmpty()) {
+            throw new RuntimeException(
+                    "Release build aborted — the following versions already exist in the Maven repository:\n" +
+                    String.join("\n", conflicts) + "\n" +
+                    "Update the pom.xml versions before starting a release build.");
+        }
+
+        log.info("  Pre-flight: all planned versions are available — proceeding");
     }
 
     private String baseVersion(String version) {
