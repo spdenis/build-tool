@@ -149,7 +149,6 @@ public class ReleaseService {
         long phase2Start = System.currentTimeMillis();
 
         Map<Path, String> tagByRepo = new LinkedHashMap<>(releaseVersionByRepo);
-        Map<String, String> currentVersionByKey = new HashMap<>(releaseVersionByKey);
         int layerNum = 0;
 
         for (List<Path> layer : buildLayers) {
@@ -234,13 +233,6 @@ public class ReleaseService {
                 log.info("  [{}] Bumping {} → {}", repoRoot.getFileName(), release, nextSnapshot);
 
                 pomVersionUpdater.setVersions(repoRoot, nextSnapshot);
-
-                // Update version map for all artifacts that belong to this repo
-                moduleMap.entrySet().stream()
-                        .filter(e -> repoRoot.equals(e.getValue().getRepoRoot()))
-                        .forEach(e -> currentVersionByKey.put(e.getKey().key(), nextSnapshot));
-                dependencyVersionUpdater.update(List.of(repoRoot), currentVersionByKey);
-
                 gitService.commitAll(repoRoot, "chore: prepare next development version " + nextSnapshot);
                 if (isDryRun(repoConfigs.get(repoRoot))) {
                     log.info("  [{}] Dry mode — skipping push", repoRoot.getFileName());

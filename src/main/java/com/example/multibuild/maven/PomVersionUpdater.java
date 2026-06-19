@@ -135,7 +135,7 @@ public class PomVersionUpdater {
         MavenXpp3Reader reader = new MavenXpp3Reader();
 
         for (Path pomPath : pomFiles) {
-            try (FileReader fr = new FileReader(pomPath.toFile())) {
+            try (FileReader fr = new FileReader(pomPath.toFile(), StandardCharsets.UTF_8)) {
                 Model model = reader.read(fr);
                 if (!model.getModules().isEmpty()) {
                     String groupId = model.getGroupId();
@@ -151,7 +151,7 @@ public class PomVersionUpdater {
         }
 
         // Single-module project: treat the first (shallowest) pom as root
-        try (FileReader fr = new FileReader(pomFiles.get(0).toFile())) {
+        try (FileReader fr = new FileReader(pomFiles.get(0).toFile(), StandardCharsets.UTF_8)) {
             Model model = reader.read(fr);
             String version = model.getVersion();
             if (version != null) {

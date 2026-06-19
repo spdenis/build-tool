@@ -14,6 +14,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.FileReader;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -71,7 +72,7 @@ public class MavenParserImpl implements MavenParser {
                               List<Module> modules, List<Artifact> aggregatorParents,
                               List<Dependency> inheritedFromParent) {
         Model model;
-        try (FileReader fr = new FileReader(pomPath.toFile())) {
+        try (FileReader fr = new FileReader(pomPath.toFile(), StandardCharsets.UTF_8)) {
             model = reader.read(fr);
         } catch (Exception e) {
             log.warn("Skipping {}: {}", pomPath, e.getMessage());
@@ -120,7 +121,7 @@ public class MavenParserImpl implements MavenParser {
                           List<Dependency> inheritedFromParent)
             throws IOException, XmlPullParserException {
         Model model;
-        try (FileReader fr = new FileReader(pomPath.toFile())) {
+        try (FileReader fr = new FileReader(pomPath.toFile(), StandardCharsets.UTF_8)) {
             model = reader.read(fr);
         }
 
@@ -199,7 +200,7 @@ public class MavenParserImpl implements MavenParser {
         if (!parentPomPath.startsWith(repoRoot) || !Files.exists(parentPomPath)) return List.of();
 
         Model parentModel;
-        try (FileReader fr = new FileReader(parentPomPath.toFile())) {
+        try (FileReader fr = new FileReader(parentPomPath.toFile(), StandardCharsets.UTF_8)) {
             parentModel = reader.read(fr);
         } catch (Exception e) {
             return List.of();
