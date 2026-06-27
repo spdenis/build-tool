@@ -47,11 +47,14 @@ public class GitHubService {
         body.put("body", "");
 
         try {
+            log.info("POST {} (repo: {}/{})", pullsEndpoint, coords.owner(), coords.repo());
+            log.debug("  auth={}", token.isBlank() ? "none" : "Bearer ***");
             HttpRequest request = requestBuilder(pullsEndpoint)
                     .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
                     .header("Content-Type", "application/json")
                     .build();
             HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+            log.info("  -> HTTP {}", response.statusCode());
 
             if (response.statusCode() == 201) {
                 return objectMapper.readTree(response.body()).get("html_url").asText();
@@ -60,6 +63,7 @@ public class GitHubService {
                 // A PR for this head→base pair already exists.
                 return findExistingPr(pullsEndpoint, coords.owner(), head, base);
             }
+            logErrorResponse(response);
             throw new RuntimeException("GitHub API error " + response.statusCode() + " creating PR for "
                     + coords.owner() + "/" + coords.repo() + ": " + response.body());
         } catch (InterruptedException e) {
@@ -89,6 +93,21 @@ public class GitHubService {
         } catch (IOException | InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Failed to list PRs for " + owner, e);
+        }
+    }
+
+    private void logErrorResponse(HttpResponse<String> response) {
+        log.warn("  GitHub API error response (status={}):", response.statusCode());
+        response.headers().map().forEach((name, values) ->
+                log.warn("    {}: {}", name, String.join(", ", values)));
+        if (response.statusCode() == 407) {
+            String proxyAuth = response.headers().firstValue("proxy-authenticate").orElse("(header absent)");
+            log.warn("  407 Proxy Authentication Required — proxy-authenticate: {}", proxyAuth);
+            log.warn("  Check git.proxy.username / git.proxy.password in user.properties");
+        }
+        String body = response.body();
+        if (body != null && !body.isBlank()) {
+            log.warn("  Body: {}", body);
         }
     }
 
