@@ -48,42 +48,66 @@ public class HttpClientConfig {
         if (!proxyHost.isBlank()) {
             Set<String> include = parseDomains(proxyDomains);
             Set<String> bypass  = parseDomains(proxyBypass);
-            Proxy proxy = new Proxy(Proxy.Type.HTTP, new InetSocketAddress(proxyHost, proxyPort));
 
-            log.info("HTTP proxy configured: {}:{}", proxyHost, proxyPort);
-            if (!proxyUsername.isBlank()) log.info("  Proxy auth: username={}", proxyUsername);
-            if (!include.isEmpty())       log.info("  Proxy domains (include): {}", include);
-            if (!bypass.isEmpty())        log.info("  Proxy bypass: {}", bypass);
+            // Mirror the proxy config into Java system properties so ProxySelector.getDefault()
+            // picks them up. This is the path that enables NTLM transparent authentication:
+            // the JVM uses SSPI (Windows) to authenticate with the proxy automatically,
+            // which our custom Proxy object above cannot do.
+            System.setProperty("http.proxyHost",  proxyHost);
+            System.setProperty("http.proxyPort",  String.valueOf(proxyPort));
+            System.setProperty("https.proxyHost", proxyHost);
+            System.setProperty("https.proxyPort", String.valueOf(proxyPort));
 
+            // Activate NTLM transparent auth. Only effective on Windows (no-op elsewhere).
+            // Allows the JVM to complete the NTLM handshake using the logged-in user's
+            // credentials without requiring an Authenticator.
+            if (System.getProperty("jdk.http.ntlm.transparentAuth") == null) {
+                System.setProperty("jdk.http.ntlm.transparentAuth", "all");
+            }
+
+            log.info("HTTP proxy configured: {}:{} (auth: {}, ntlm-transparent: {})",
+                    proxyHost, proxyPort,
+                    proxyUsername.isBlank() ? "none" : "user=" + proxyUsername,
+                    System.getProperty("jdk.http.ntlm.transparentAuth"));
+            if (!include.isEmpty()) log.info("  Proxy domains (include): {}", include);
+            if (!bypass.isEmpty())  log.info("  Proxy bypass: {}", bypass);
+
+            // Wrap the default system ProxySelector (which reads the system properties set above
+            // and carries NTLM support) with our domain include/bypass filtering.
+            ProxySelector systemSelector = ProxySelector.getDefault();
             builder.proxy(new ProxySelector() {
                 @Override
                 public List<Proxy> select(URI uri) {
                     String host = uri.getHost();
-                    if (host == null) return List.of(Proxy.NO_PROXY);
-                    if (!bypass.isEmpty() && bypass.stream().anyMatch(host::contains)) {
-                        log.debug("  Proxy bypass match for {}", host);
-                        return List.of(Proxy.NO_PROXY);
+                    if (host != null) {
+                        if (!bypass.isEmpty() && bypass.stream().anyMatch(host::contains)) {
+                            log.debug("  Proxy bypass match for {}", host);
+                            return List.of(Proxy.NO_PROXY);
+                        }
+                        if (!include.isEmpty() && include.stream().noneMatch(host::contains)) {
+                            log.debug("  No proxy include match for {} — direct", host);
+                            return List.of(Proxy.NO_PROXY);
+                        }
                     }
-                    if (!include.isEmpty() && include.stream().noneMatch(host::contains)) {
-                        log.debug("  No proxy include match for {} — direct", host);
-                        return List.of(Proxy.NO_PROXY);
-                    }
-                    log.debug("  Routing {} through proxy {}:{}", host, proxyHost, proxyPort);
-                    return List.of(proxy);
+                    List<Proxy> proxies = systemSelector.select(uri);
+                    log.debug("  Routing {} via {}", host, proxies);
+                    return proxies;
                 }
 
                 @Override
                 public void connectFailed(URI uri, SocketAddress sa, IOException e) {
                     log.warn("Proxy CONNECT failed for {} via {}: {}", uri, sa, e.getMessage());
+                    systemSelector.connectFailed(uri, sa, e);
                 }
             });
 
+            // Authenticator for Basic-auth proxies. NTLM uses transparent auth above.
             if (!proxyUsername.isBlank()) {
                 builder.authenticator(new Authenticator() {
                     @Override
                     protected PasswordAuthentication getPasswordAuthentication() {
                         if (getRequestorType() == RequestorType.PROXY) {
-                            log.debug("Providing proxy credentials for {}", getRequestingHost());
+                            log.debug("Providing proxy credentials (Basic) for {}", getRequestingHost());
                             return new PasswordAuthentication(proxyUsername, proxyPassword.toCharArray());
                         }
                         return null;
