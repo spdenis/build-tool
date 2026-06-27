@@ -35,11 +35,12 @@ class UDeployClient {
 
     private final UDeployProperties props;
     private final ObjectMapper objectMapper;
-    private final HttpClient httpClient = HttpClient.newHttpClient();
+    private final HttpClient httpClient;
 
-    UDeployClient(UDeployProperties props, ObjectMapper objectMapper) {
+    UDeployClient(UDeployProperties props, ObjectMapper objectMapper, HttpClient httpClient) {
         this.props = props;
         this.objectMapper = objectMapper;
+        this.httpClient = httpClient;
     }
 
     String resolveApplicationId(String baseUrl, String applicationName) {

@@ -20,10 +20,11 @@ public class MavenRepositoryClient {
     private static final Logger log = LoggerFactory.getLogger(MavenRepositoryClient.class);
 
     private final LightspeedProperties.MavenRepo mavenRepo;
-    private final HttpClient httpClient = HttpClient.newHttpClient();
+    private final HttpClient httpClient;
 
-    public MavenRepositoryClient(LightspeedProperties props) {
+    public MavenRepositoryClient(LightspeedProperties props, HttpClient httpClient) {
         this.mavenRepo = props.getMavenRepo();
+        this.httpClient = httpClient;
     }
 
     public boolean isReleasesConfigured() {

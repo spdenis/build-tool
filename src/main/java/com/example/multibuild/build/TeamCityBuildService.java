@@ -37,11 +37,12 @@ public class TeamCityBuildService implements BuildService {
 
     private final TeamCityProperties props;
     private final ObjectMapper objectMapper;
-    private final HttpClient httpClient = HttpClient.newHttpClient();
+    private final HttpClient httpClient;
 
-    public TeamCityBuildService(TeamCityProperties props, ObjectMapper objectMapper) {
+    public TeamCityBuildService(TeamCityProperties props, ObjectMapper objectMapper, HttpClient httpClient) {
         this.props = props;
         this.objectMapper = objectMapper;
+        this.httpClient = httpClient;
     }
 
     @Override

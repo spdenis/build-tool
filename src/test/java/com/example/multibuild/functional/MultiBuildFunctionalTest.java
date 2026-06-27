@@ -5,12 +5,11 @@ import com.example.multibuild.graph.DependencyGraph;
 import com.example.multibuild.maven.DependencyVersionUpdater;
 import com.example.multibuild.maven.MavenParserImpl;
 import com.example.multibuild.maven.PomVersionUpdater;
-import com.example.multibuild.model.BuildServiceType;
+import com.example.multibuild.model.*;
 import com.example.multibuild.model.Module;
-import com.example.multibuild.model.RepoConfig;
-import com.example.multibuild.model.RepositoryProject;
 import com.example.multibuild.service.BranchService;
 import com.example.multibuild.service.CommitMessageFormatter;
+import com.example.multibuild.service.DependencyVersionService;
 import com.example.multibuild.service.ProjectAggregator;
 import org.eclipse.jgit.api.Git;
 import org.junit.jupiter.api.BeforeEach;
@@ -25,6 +24,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -393,6 +393,47 @@ class MultiBuildFunctionalTest {
                 .contains("<version>1.0.0</version>");
         // Version in the direct <dependency> (no <version> element) must stay absent
         assertThat(pom).doesNotContain("<dependencies>\n    <dependency>\n      <groupId>com.example</groupId>\n      <artifactId>lib-a</artifactId>\n      <version>");
+    }
+
+    @Test
+    void resume_builtVersionByRepo_propagatesToConsumerDepViaApply() throws Exception {
+        // Reproduces the resume scenario:
+        //   1. First run: build.target=repo-a, pause-after=repo-a → state: {repo-a: SUCCESS("1.5.0-custom")}
+        //   2. User manually sets a custom version in the resume state file
+        //   3. Second run: build.target=repo-a, with-deps=true → repo-b's dep on lib-a must be "1.5.0-custom"
+        Path workA = cloneFixture("repo-a");
+        Path workB = cloneFixture("repo-b");
+
+        branchService.apply(workA, "main", new RepoConfig());
+        branchService.apply(workB, "main", new RepoConfig());
+
+        // After branch, repo-b's dep on lib-a is still at the original "1.0.0-SNAPSHOT"
+        assertThat(Files.readString(workB.resolve("pom.xml"))).contains("<version>1.0.0-SNAPSHOT</version>");
+
+        List<RepositoryProject> projects = projectAggregator.aggregate(List.of(workA, workB));
+        Map<Artifact, Module> moduleMap = projects.stream()
+                .flatMap(p -> p.getModules().stream())
+                .collect(Collectors.toMap(Module::getArtifact, m -> m));
+
+        // Simulate what Main.java does inside the build loop for the consumer layer:
+        //   builtVersionsByRepo = resumeState.getCompletedVersionsByRepo(clonedPaths)
+        //   = {workA → "1.5.0-custom"} (the manually-set version in the state file)
+        Map<Path, String> builtVersionsByRepo = Map.of(workA, "1.5.0-custom");
+
+        CommitMessageFormatter formatter = new CommitMessageFormatter();
+        ReflectionTestUtils.setField(formatter, "prefix", "");
+        DependencyVersionService depVersionService =
+                new DependencyVersionService(dependencyVersionUpdater, gitService, formatter);
+        ReflectionTestUtils.setField(depVersionService, "integrationBranch", INTEGRATION_BRANCH);
+        ReflectionTestUtils.setField(depVersionService, "dryMode", true);
+        ReflectionTestUtils.setField(depVersionService, "defaultBuildService", BuildServiceType.LOCAL);
+
+        Map<Path, RepoConfig> repoConfigByPath = Map.of(workA, new RepoConfig(), workB, new RepoConfig());
+        depVersionService.apply(moduleMap, List.of(workB), repoConfigByPath, builtVersionsByRepo);
+
+        assertThat(Files.readString(workB.resolve("pom.xml")))
+                .contains("<artifactId>lib-a</artifactId>")
+                .contains("<version>1.5.0-custom</version>");
     }
 
     @Test

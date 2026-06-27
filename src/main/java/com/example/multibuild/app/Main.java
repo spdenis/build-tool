@@ -285,8 +285,17 @@ public class Main implements CommandLineRunner {
                                 .filter(r -> !resumeState.isCompleted(r))
                                 .toList();
                         if (!layerToBuild.isEmpty()) {
+                            // Use clonedPaths (all repos), not buildOrder (target repos only), so that
+                            // resume-state versions for repos outside the target scope are also used.
+                            // This matters when build.target is set and some upstream repos are already
+                            // marked SUCCESS in the resume file (manually or from a previous full build).
                             Map<Path, String> builtVersionsByRepo =
-                                    resumeState.getCompletedVersionsByRepo(buildOrder);
+                                    resumeState.getCompletedVersionsByRepo(clonedPaths);
+                            if (!builtVersionsByRepo.isEmpty()) {
+                                log.info("  Resume version overrides: {}", builtVersionsByRepo.entrySet().stream()
+                                        .map(e -> e.getKey().getFileName() + "=" + e.getValue())
+                                        .collect(Collectors.joining(", ")));
+                            }
                             dependencyVersionService.apply(moduleMap, layerToBuild, repoConfigByPath,
                                     builtVersionsByRepo);
                             buildService.buildAll(List.of(layerToBuild), moduleMap, repoConfigByPath,

@@ -24,12 +24,11 @@ public class GitHubService {
     private String token;
 
     private final ObjectMapper objectMapper;
-    private final HttpClient http = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(30))
-            .build();
+    private final HttpClient http;
 
-    public GitHubService(ObjectMapper objectMapper) {
+    public GitHubService(ObjectMapper objectMapper, HttpClient httpClient) {
         this.objectMapper = objectMapper;
+        this.http = httpClient;
     }
 
     /**

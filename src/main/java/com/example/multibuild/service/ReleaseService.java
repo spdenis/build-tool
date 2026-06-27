@@ -198,6 +198,21 @@ public class ReleaseService {
             log.info("  Layer {}/{}: building {} repo(s): {}",
                     layerNum, buildLayers.size(), layerRepos.size(), repoNames);
 
+            // Sync cross-repo dep versions for not-yet-built repos before tagging and building.
+            // On a fresh run this is a no-op — Phase 1 just set them. On resume it picks up
+            // any version overrides added manually to the resume state file (e.g., a repo marked
+            // SUCCESS with a version that differs from what Phase 1 originally computed).
+            List<Path> layerNotYetBuilt = layerRepos.stream()
+                    .filter(r -> !resumeState.isCompleted(r))
+                    .toList();
+            Set<Path> depsModified = dependencyVersionUpdater.update(layerNotYetBuilt, releaseVersionByKey);
+            for (Path repoRoot : depsModified) {
+                boolean committed = gitService.commitAllIfDirty(repoRoot, "chore: sync release dep versions");
+                if (committed) {
+                    log.info("  [{}] Committed dep version sync", repoRoot.getFileName());
+                }
+            }
+
             // Push release tags for this layer's repos just before triggering their builds.
             // Doing this per-layer (not all upfront in Phase 1) ensures Jenkins never starts
             // building a repo before its upstream dependencies' artifacts are published.
