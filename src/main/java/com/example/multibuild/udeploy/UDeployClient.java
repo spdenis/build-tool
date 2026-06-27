@@ -3,12 +3,11 @@ package com.example.multibuild.udeploy;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.http.*;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestTemplate;
 
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -35,12 +34,12 @@ class UDeployClient {
 
     private final UDeployProperties props;
     private final ObjectMapper objectMapper;
-    private final HttpClient httpClient;
+    private final RestTemplate restTemplate;
 
-    UDeployClient(UDeployProperties props, ObjectMapper objectMapper, HttpClient httpClient) {
+    UDeployClient(UDeployProperties props, ObjectMapper objectMapper, RestTemplate restTemplate) {
         this.props = props;
         this.objectMapper = objectMapper;
-        this.httpClient = httpClient;
+        this.restTemplate = restTemplate;
     }
 
     String resolveApplicationId(String baseUrl, String applicationName) {
@@ -113,44 +112,47 @@ class UDeployClient {
     // ── HTTP primitives ──────────────────────────────────────────────────────
 
     private JsonNode get(String baseUrl, String path) {
-        return execute(baseRequest(baseUrl, path).GET().build(), "GET " + path);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                URI.create(baseUrl.stripTrailing() + path),
+                HttpMethod.GET, new HttpEntity<>(udeployHeaders(null)), String.class);
+        return parseResponse(resp, "GET " + path);
     }
 
     private JsonNode put(String baseUrl, String path, String body) {
-        return execute(baseRequest(baseUrl, path)
-                .header("Content-Type", "application/json")
-                .PUT(HttpRequest.BodyPublishers.ofString(body))
-                .build(), "PUT " + path);
+        HttpHeaders headers = udeployHeaders(MediaType.APPLICATION_JSON);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                URI.create(baseUrl.stripTrailing() + path),
+                HttpMethod.PUT, new HttpEntity<>(body, headers), String.class);
+        return parseResponse(resp, "PUT " + path);
     }
 
     private void putNoBody(String baseUrl, String path) {
-        execute(baseRequest(baseUrl, path)
-                .PUT(HttpRequest.BodyPublishers.noBody())
-                .build(), "PUT " + path);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                URI.create(baseUrl.stripTrailing() + path),
+                HttpMethod.PUT, new HttpEntity<>(udeployHeaders(null)), String.class);
+        parseResponse(resp, "PUT " + path);
     }
 
-    private HttpRequest.Builder baseRequest(String baseUrl, String path) {
-        return HttpRequest.newBuilder()
-                .uri(URI.create(baseUrl.stripTrailing() + path))
-                .header("Authorization", "Basic " + basicAuth())
-                .header("Accept", "application/json");
-    }
-
-    private JsonNode execute(HttpRequest req, String operation) {
+    private JsonNode parseResponse(ResponseEntity<String> resp, String operation) {
+        if (resp.getStatusCode().value() >= 300) {
+            throw new RuntimeException("uDeploy " + operation + " failed (" +
+                    resp.getStatusCode().value() + "): " + resp.getBody());
+        }
+        String body = resp.getBody();
         try {
-            HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() >= 300) {
-                throw new RuntimeException("uDeploy " + operation + " failed (" +
-                        resp.statusCode() + "): " + resp.body());
-            }
-            String body = resp.body();
             if (body == null || body.isBlank()) return objectMapper.createArrayNode();
             return objectMapper.readTree(body);
-        } catch (RuntimeException e) {
-            throw e;
         } catch (Exception e) {
-            throw new RuntimeException("uDeploy request failed: " + operation, e);
+            throw new RuntimeException("uDeploy response parse failed: " + operation, e);
         }
+    }
+
+    private HttpHeaders udeployHeaders(MediaType contentType) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Authorization", "Basic " + basicAuth());
+        headers.set("Accept", "application/json");
+        if (contentType != null) headers.setContentType(contentType);
+        return headers;
     }
 
     private String basicAuth() {

@@ -6,14 +6,12 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.*;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.RestTemplate;
 
-import java.io.IOException;
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
 
 @Service
 public class GitHubService {
@@ -24,11 +22,11 @@ public class GitHubService {
     private String token;
 
     private final ObjectMapper objectMapper;
-    private final HttpClient http;
+    private final RestTemplate restTemplate;
 
-    public GitHubService(ObjectMapper objectMapper, HttpClient httpClient) {
+    public GitHubService(ObjectMapper objectMapper, RestTemplate restTemplate) {
         this.objectMapper = objectMapper;
-        this.http = httpClient;
+        this.restTemplate = restTemplate;
     }
 
     /**
@@ -40,36 +38,40 @@ public class GitHubService {
         RepoCoords coords = parseCoords(repoUrl);
         String pullsEndpoint = apiBaseUrl(coords.host()) + "/repos/" + coords.owner() + "/" + coords.repo() + "/pulls";
 
-        ObjectNode body = objectMapper.createObjectNode();
-        body.put("title", title);
-        body.put("head", head);
-        body.put("base", base);
-        body.put("body", "");
-
         try {
+            ObjectNode body = objectMapper.createObjectNode();
+            body.put("title", title);
+            body.put("head", head);
+            body.put("base", base);
+            body.put("body", "");
+
             log.info("POST {} (repo: {}/{})", pullsEndpoint, coords.owner(), coords.repo());
             log.debug("  auth={}", token.isBlank() ? "none" : "Bearer ***");
-            HttpRequest request = requestBuilder(pullsEndpoint)
-                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(body)))
-                    .header("Content-Type", "application/json")
-                    .build();
-            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-            log.info("  -> HTTP {}", response.statusCode());
 
-            if (response.statusCode() == 201) {
-                return objectMapper.readTree(response.body()).get("html_url").asText();
+            HttpHeaders headers = githubHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            HttpEntity<String> entity = new HttpEntity<>(objectMapper.writeValueAsString(body), headers);
+
+            ResponseEntity<String> response = restTemplate.exchange(
+                    URI.create(pullsEndpoint), HttpMethod.POST, entity, String.class);
+            log.info("  -> HTTP {}", response.getStatusCode().value());
+
+            if (response.getStatusCode().value() == 201) {
+                return objectMapper.readTree(response.getBody()).get("html_url").asText();
             }
-            if (response.statusCode() == 422) {
+            if (response.getStatusCode().value() == 422) {
                 // A PR for this head→base pair already exists.
                 return findExistingPr(pullsEndpoint, coords.owner(), head, base);
             }
             logErrorResponse(response);
-            throw new RuntimeException("GitHub API error " + response.statusCode() + " creating PR for "
-                    + coords.owner() + "/" + coords.repo() + ": " + response.body());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            throw new RuntimeException("GitHub API error " + response.getStatusCode().value()
+                    + " creating PR for " + coords.owner() + "/" + coords.repo()
+                    + ": " + response.getBody());
+        } catch (RestClientException e) {
             throw new RuntimeException("Failed to create PR for " + coords.owner() + "/" + coords.repo(), e);
-        } catch (IOException e) {
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
             throw new RuntimeException("Failed to create PR for " + coords.owner() + "/" + coords.repo(), e);
         }
     }
@@ -77,50 +79,52 @@ public class GitHubService {
     private String findExistingPr(String pullsEndpoint, String owner, String head, String base) {
         String url = pullsEndpoint + "?head=" + owner + ":" + head + "&base=" + base + "&state=open";
         try {
-            HttpResponse<String> response = http.send(
-                    requestBuilder(url).GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() != 200) {
-                throw new RuntimeException("GitHub API error " + response.statusCode()
-                        + " listing PRs: " + response.body());
+            ResponseEntity<String> response = restTemplate.exchange(
+                    URI.create(url), HttpMethod.GET, new HttpEntity<>(githubHeaders()), String.class);
+            if (response.getStatusCode().value() != 200) {
+                throw new RuntimeException("GitHub API error " + response.getStatusCode().value()
+                        + " listing PRs: " + response.getBody());
             }
-            JsonNode prs = objectMapper.readTree(response.body());
+            JsonNode prs = objectMapper.readTree(response.getBody());
             if (prs.isArray() && !prs.isEmpty()) {
                 return prs.get(0).get("html_url").asText();
             }
             throw new RuntimeException("PR already exists for " + owner + "/" + head
                     + " but was not found in the open PR list");
-        } catch (IOException | InterruptedException e) {
-            Thread.currentThread().interrupt();
+        } catch (RestClientException e) {
+            throw new RuntimeException("Failed to list PRs for " + owner, e);
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
             throw new RuntimeException("Failed to list PRs for " + owner, e);
         }
     }
 
-    private void logErrorResponse(HttpResponse<String> response) {
-        log.warn("  GitHub API error response (status={}):", response.statusCode());
-        response.headers().map().forEach((name, values) ->
+    private void logErrorResponse(ResponseEntity<String> response) {
+        int status = response.getStatusCode().value();
+        log.warn("  GitHub API error response (status={}):", status);
+        response.getHeaders().forEach((name, values) ->
                 log.warn("    {}: {}", name, String.join(", ", values)));
-        if (response.statusCode() == 407) {
-            String proxyAuth = response.headers().firstValue("proxy-authenticate").orElse("(header absent)");
-            log.warn("  407 Proxy Authentication Required — proxy-authenticate: {}", proxyAuth);
-            log.warn("  Check git.proxy.username / git.proxy.password in user.properties");
+        if (status == 407) {
+            String proxyAuth = response.getHeaders().getFirst("proxy-authenticate");
+            log.warn("  407 Proxy Authentication Required — proxy-authenticate: {}",
+                    proxyAuth != null ? proxyAuth : "(header absent)");
+            log.warn("  Check git.proxy.host / git.proxy.port in user.properties");
         }
-        String body = response.body();
+        String body = response.getBody();
         if (body != null && !body.isBlank()) {
             log.warn("  Body: {}", body);
         }
     }
 
-    private HttpRequest.Builder requestBuilder(String url) {
-        HttpRequest.Builder builder = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(Duration.ofSeconds(30))
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28");
+    private HttpHeaders githubHeaders() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Accept", "application/vnd.github+json");
+        headers.set("X-GitHub-Api-Version", "2022-11-28");
         if (!token.isBlank()) {
-            builder.header("Authorization", "Bearer " + token);
+            headers.set("Authorization", "Bearer " + token);
         }
-        return builder;
+        return headers;
     }
 
     private static String apiBaseUrl(String host) {
@@ -138,7 +142,7 @@ public class GitHubService {
             String path = rest.substring(colon + 1);
             return ownerRepo(host, path);
         }
-        URI uri = URI.create(url);
+        java.net.URI uri = java.net.URI.create(url);
         return ownerRepo(uri.getHost(), uri.getPath());
     }
 

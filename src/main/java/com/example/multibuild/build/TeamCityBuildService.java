@@ -11,13 +11,12 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.http.*;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.RestTemplate;
 
-import java.io.IOException;
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.function.BiConsumer;
@@ -37,12 +36,12 @@ public class TeamCityBuildService implements BuildService {
 
     private final TeamCityProperties props;
     private final ObjectMapper objectMapper;
-    private final HttpClient httpClient;
+    private final RestTemplate restTemplate;
 
-    public TeamCityBuildService(TeamCityProperties props, ObjectMapper objectMapper, HttpClient httpClient) {
+    public TeamCityBuildService(TeamCityProperties props, ObjectMapper objectMapper, RestTemplate restTemplate) {
         this.props = props;
         this.objectMapper = objectMapper;
-        this.httpClient = httpClient;
+        this.restTemplate = restTemplate;
     }
 
     @Override
@@ -139,10 +138,10 @@ public class TeamCityBuildService implements BuildService {
     private Integer getAgentId(String buildId) {
         try {
             String url = props.getUrl() + "/app/rest/builds/id:" + buildId + "?fields=agent(id,name)";
-            HttpResponse<String> response = httpClient.send(
-                    jsonRequest("GET", url, null), HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() >= 300) return null;
-            JsonNode agentNode = objectMapper.readTree(response.body()).path("agent");
+            ResponseEntity<String> response = restTemplate.exchange(
+                    URI.create(url), HttpMethod.GET, new HttpEntity<>(tcHeaders()), String.class);
+            if (response.getStatusCode().value() >= 300) return null;
+            JsonNode agentNode = objectMapper.readTree(response.getBody()).path("agent");
             if (agentNode.isMissingNode()) return null;
             log.debug("Failed build {} ran on agent id={} name={}",
                     buildId, agentNode.path("id").asInt(), agentNode.path("name").asText());
@@ -158,13 +157,13 @@ public class TeamCityBuildService implements BuildService {
             String url = props.getUrl() + "/app/rest/agents" +
                     "?locator=compatible:(buildType:(id:" + configId + ")),enabled:true,connected:true,authorized:true" +
                     "&fields=agent(id,name)";
-            HttpResponse<String> response = httpClient.send(
-                    jsonRequest("GET", url, null), HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() >= 300) {
-                log.debug("Could not fetch compatible agents for {}: HTTP {}", configId, response.statusCode());
+            ResponseEntity<String> response = restTemplate.exchange(
+                    URI.create(url), HttpMethod.GET, new HttpEntity<>(tcHeaders()), String.class);
+            if (response.getStatusCode().value() >= 300) {
+                log.debug("Could not fetch compatible agents for {}: HTTP {}", configId, response.getStatusCode().value());
                 return null;
             }
-            JsonNode agents = objectMapper.readTree(response.body()).path("agent");
+            JsonNode agents = objectMapper.readTree(response.getBody()).path("agent");
             if (!agents.isArray()) return null;
             for (JsonNode agent : agents) {
                 int id = agent.path("id").asInt();
@@ -209,7 +208,7 @@ public class TeamCityBuildService implements BuildService {
             throw new RuntimeException("TeamCity is not configured: set teamcity.url and teamcity.token");
         }
         try {
-            Map<String, Object> payload = new java.util.LinkedHashMap<>();
+            Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("buildType", Map.of("id", configId));
             if (!branchName.isBlank()) {
                 payload.put("branchName", branchName);
@@ -223,13 +222,19 @@ public class TeamCityBuildService implements BuildService {
             payload.put("properties", Map.of("property", buildProps));
             String body = objectMapper.writeValueAsString(payload);
 
-            HttpResponse<String> response = httpClient.send(
-                    jsonRequest("POST", props.getUrl() + "/app/rest/buildQueue", body),
-                    HttpResponse.BodyHandlers.ofString());
+            HttpHeaders headers = tcHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            ResponseEntity<String> response = restTemplate.exchange(
+                    URI.create(props.getUrl() + "/app/rest/buildQueue"),
+                    HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
 
             assertSuccess(response, "trigger build " + configId);
-            return objectMapper.readTree(response.body()).get("id").asText();
-        } catch (IOException | InterruptedException e) {
+            return objectMapper.readTree(response.getBody()).get("id").asText();
+        } catch (RestClientException e) {
+            throw new RuntimeException("Failed to trigger TeamCity build for " + configId, e);
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
             throw new RuntimeException("Failed to trigger TeamCity build for " + configId, e);
         }
     }
@@ -243,12 +248,11 @@ public class TeamCityBuildService implements BuildService {
             try {
                 Thread.sleep(props.getPollIntervalMs());
 
-                HttpResponse<String> response = httpClient.send(
-                        jsonRequest("GET", url, null),
-                        HttpResponse.BodyHandlers.ofString());
+                ResponseEntity<String> response = restTemplate.exchange(
+                        URI.create(url), HttpMethod.GET, new HttpEntity<>(tcHeaders()), String.class);
 
                 assertSuccess(response, "poll build " + buildId);
-                JsonNode json = objectMapper.readTree(response.body());
+                JsonNode json = objectMapper.readTree(response.getBody());
                 String state = json.path("state").asText();
                 String status = json.path("status").asText();
 
@@ -266,7 +270,9 @@ public class TeamCityBuildService implements BuildService {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new RuntimeException("Interrupted while waiting for build " + buildId, e);
-            } catch (IOException e) {
+            } catch (RuntimeException e) {
+                throw e;
+            } catch (Exception e) {
                 log.warn("Error polling build {}", buildId, e);
             }
         }
@@ -278,25 +284,17 @@ public class TeamCityBuildService implements BuildService {
         return String.format("%d:%02d", s / 60, s % 60);
     }
 
-    private HttpRequest jsonRequest(String method, String url, String body) {
-        var builder = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .header("Authorization", "Bearer " + props.getToken())
-                .header("Accept", "application/json");
-
-        if ("POST".equals(method)) {
-            builder.header("Content-Type", "application/json")
-                   .POST(HttpRequest.BodyPublishers.ofString(body));
-        } else {
-            builder.GET();
-        }
-        return builder.build();
+    private HttpHeaders tcHeaders() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Authorization", "Bearer " + props.getToken());
+        headers.set("Accept", "application/json");
+        return headers;
     }
 
-    private void assertSuccess(HttpResponse<String> response, String operation) {
-        if (response.statusCode() >= 300) {
+    private void assertSuccess(ResponseEntity<String> response, String operation) {
+        if (response.getStatusCode().value() >= 300) {
             throw new RuntimeException("TeamCity " + operation + " failed (" +
-                    response.statusCode() + "): " + response.body());
+                    response.getStatusCode().value() + "): " + response.getBody());
         }
     }
 }

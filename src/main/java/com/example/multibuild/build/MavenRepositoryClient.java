@@ -4,12 +4,14 @@ import com.example.multibuild.model.Artifact;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestTemplate;
 
 import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 
@@ -20,11 +22,11 @@ public class MavenRepositoryClient {
     private static final Logger log = LoggerFactory.getLogger(MavenRepositoryClient.class);
 
     private final LightspeedProperties.MavenRepo mavenRepo;
-    private final HttpClient httpClient;
+    private final RestTemplate restTemplate;
 
-    public MavenRepositoryClient(LightspeedProperties props, HttpClient httpClient) {
+    public MavenRepositoryClient(LightspeedProperties props, RestTemplate restTemplate) {
         this.mavenRepo = props.getMavenRepo();
-        this.httpClient = httpClient;
+        this.restTemplate = restTemplate;
     }
 
     public boolean isReleasesConfigured() {
@@ -35,12 +37,11 @@ public class MavenRepositoryClient {
     public boolean isReleasePublished(Artifact a) {
         String url = releasePomUrl(a);
         try {
-            HttpResponse<Void> resp = httpClient.send(
-                    requestBuilder(url).method("HEAD", HttpRequest.BodyPublishers.noBody()).build(),
-                    HttpResponse.BodyHandlers.discarding());
-            if (resp.statusCode() == 200) return true;
-            if (resp.statusCode() == 404) return false;
-            log.warn("Unexpected status {} from {}", resp.statusCode(), url);
+            ResponseEntity<Void> resp = restTemplate.exchange(
+                    URI.create(url), HttpMethod.HEAD, new HttpEntity<>(mavenHeaders()), Void.class);
+            if (resp.getStatusCode().value() == 200) return true;
+            if (resp.getStatusCode().value() == 404) return false;
+            log.warn("Unexpected status {} from {}", resp.getStatusCode().value(), url);
             return false;
         } catch (Exception e) {
             log.warn("Could not reach Maven repository at {}: {}", url, e.getMessage());
@@ -57,32 +58,30 @@ public class MavenRepositoryClient {
     /** GET request; returns the response body, or null on 404 or error. */
     public String fetchXml(String url) {
         try {
-            HttpResponse<String> resp = httpClient.send(
-                    requestBuilder(url).GET().build(),
-                    HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() == 404) return null;
-            if (resp.statusCode() >= 300) {
-                log.warn("Unexpected status {} from {}", resp.statusCode(), url);
+            ResponseEntity<String> resp = restTemplate.exchange(
+                    URI.create(url), HttpMethod.GET, new HttpEntity<>(mavenHeaders()), String.class);
+            if (resp.getStatusCode().value() == 404) return null;
+            if (resp.getStatusCode().value() >= 300) {
+                log.warn("Unexpected status {} from {}", resp.getStatusCode().value(), url);
                 return null;
             }
-            return resp.body();
+            return resp.getBody();
         } catch (Exception e) {
             log.warn("Failed to fetch {}", url, e);
             return null;
         }
     }
 
-    public HttpRequest.Builder requestBuilder(String url) {
-        var builder = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .header("Accept", "application/xml");
+    private HttpHeaders mavenHeaders() {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Accept", "application/xml");
         String user = mavenRepo.getUsername();
         if (!user.isBlank()) {
             String creds = Base64.getEncoder().encodeToString(
                     (user + ":" + mavenRepo.getPassword()).getBytes(StandardCharsets.UTF_8));
-            builder.header("Authorization", "Basic " + creds);
+            headers.set("Authorization", "Basic " + creds);
         }
-        return builder;
+        return headers;
     }
 
     public static String groupPath(String groupId) {

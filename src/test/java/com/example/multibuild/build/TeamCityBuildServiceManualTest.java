@@ -61,7 +61,7 @@ class TeamCityBuildServiceManualTest {
         teamCityProps.setPollIntervalMs(5_000);
         teamCityProps.setTimeoutMs(600_000);
 
-        service = new TeamCityBuildService(teamCityProps, new ObjectMapper(), java.net.http.HttpClient.newHttpClient());
+        service = new TeamCityBuildService(teamCityProps, new ObjectMapper(), new org.springframework.web.client.RestTemplate());
         ReflectionTestUtils.setField(service, "buildMode", BuildMode.SNAPSHOT);
         ReflectionTestUtils.setField(service, "integrationBranch", branch);
 
