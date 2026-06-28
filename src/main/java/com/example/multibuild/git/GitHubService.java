@@ -12,6 +12,9 @@ import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
 import java.net.URI;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 
 @Service
 public class GitHubService {
@@ -20,6 +23,9 @@ public class GitHubService {
 
     @Value("${github.token:}")
     private String token;
+
+    @Value("${github.reviewers:}")
+    private String reviewersConfig;
 
     private final ObjectMapper objectMapper;
     private final RestTemplate restTemplate;
@@ -31,7 +37,7 @@ public class GitHubService {
 
     /**
      * Creates a PR from {@code head} into {@code base} in the GitHub repo identified by {@code repoUrl}.
-     * If a PR already exists for this head→base pair, returns its URL instead of failing.
+     * If a PR already exists for this head→base pair, returns its URL and adds reviewers to it.
      * Works with both github.com and GitHub Enterprise (inferred from the URL host).
      */
     public String createOrFindPr(String repoUrl, String head, String base, String title) {
@@ -57,11 +63,15 @@ public class GitHubService {
             log.info("  -> HTTP {}", response.getStatusCode().value());
 
             if (response.getStatusCode().value() == 201) {
-                return objectMapper.readTree(response.getBody()).get("html_url").asText();
+                JsonNode json = objectMapper.readTree(response.getBody());
+                PrInfo pr = new PrInfo(json.get("html_url").asText(), json.get("number").asLong());
+                requestReviewers(pullsEndpoint, pr.number());
+                return pr.url();
             }
             if (response.getStatusCode().value() == 422) {
-                // A PR for this head→base pair already exists.
-                return findExistingPr(pullsEndpoint, coords.owner(), head, base);
+                PrInfo pr = findExistingPr(pullsEndpoint, coords.owner(), head, base);
+                requestReviewers(pullsEndpoint, pr.number());
+                return pr.url();
             }
             logErrorResponse(response);
             throw new RuntimeException("GitHub API error " + response.getStatusCode().value()
@@ -76,7 +86,7 @@ public class GitHubService {
         }
     }
 
-    private String findExistingPr(String pullsEndpoint, String owner, String head, String base) {
+    private PrInfo findExistingPr(String pullsEndpoint, String owner, String head, String base) {
         String url = pullsEndpoint + "?head=" + owner + ":" + head + "&base=" + base + "&state=open";
         try {
             ResponseEntity<String> response = restTemplate.exchange(
@@ -87,7 +97,8 @@ public class GitHubService {
             }
             JsonNode prs = objectMapper.readTree(response.getBody());
             if (prs.isArray() && !prs.isEmpty()) {
-                return prs.get(0).get("html_url").asText();
+                JsonNode pr = prs.get(0);
+                return new PrInfo(pr.get("html_url").asText(), pr.get("number").asLong());
             }
             throw new RuntimeException("PR already exists for " + owner + "/" + head
                     + " but was not found in the open PR list");
@@ -98,6 +109,36 @@ public class GitHubService {
         } catch (Exception e) {
             throw new RuntimeException("Failed to list PRs for " + owner, e);
         }
+    }
+
+    private void requestReviewers(String pullsEndpoint, long prNumber) {
+        List<String> reviewers = reviewerList();
+        if (reviewers.isEmpty()) return;
+
+        String url = pullsEndpoint + "/" + prNumber + "/requested_reviewers";
+        try {
+            HttpHeaders headers = githubHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            String body = objectMapper.writeValueAsString(Map.of("reviewers", reviewers));
+            ResponseEntity<String> response = restTemplate.exchange(
+                    URI.create(url), HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+            if (response.getStatusCode().value() >= 300) {
+                log.warn("Failed to request reviewers on PR #{}: HTTP {} — {}",
+                        prNumber, response.getStatusCode().value(), response.getBody());
+            } else {
+                log.info("  -> Reviewers requested on PR #{}: {}", prNumber, reviewers);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to request reviewers on PR #{}", prNumber, e);
+        }
+    }
+
+    private List<String> reviewerList() {
+        if (reviewersConfig.isBlank()) return List.of();
+        return Arrays.stream(reviewersConfig.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isBlank())
+                .toList();
     }
 
     private void logErrorResponse(ResponseEntity<String> response) {
@@ -157,4 +198,6 @@ public class GitHubService {
     }
 
     record RepoCoords(String host, String owner, String repo) {}
+
+    private record PrInfo(String url, long number) {}
 }
