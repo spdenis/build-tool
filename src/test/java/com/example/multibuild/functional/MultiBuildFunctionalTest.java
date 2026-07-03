@@ -438,6 +438,42 @@ class MultiBuildFunctionalTest {
     }
 
     @Test
+    void dependencyUpdate_lightspeedBuiltVersion_expandsVersionInConsumer() throws Exception {
+        // Reproduces the multi-layer build loop bug:
+        //   Layer 1 (Lightspeed repo-a): after building, resume state records bare "1.0.0-SNAPSHOT"
+        //   Layer 2 (repo-b):            dep on lib-a must reference "1.0.0-<branch>-SNAPSHOT",
+        //                                NOT the bare "1.0.0-SNAPSHOT" stored in resume state.
+        Path workA = cloneFixture("repo-a");
+        Path workB = cloneFixture("repo-b");
+
+        List<RepositoryProject> projects = projectAggregator.aggregate(List.of(workA, workB));
+        Map<Artifact, Module> moduleMap = projects.stream()
+                .flatMap(p -> p.getModules().stream())
+                .collect(Collectors.toMap(Module::getArtifact, m -> m));
+
+        RepoConfig lightspeedConfig = new RepoConfig();
+        lightspeedConfig.setBuildService(BuildServiceType.LIGHTSPEED);
+
+        CommitMessageFormatter formatter = new CommitMessageFormatter();
+        ReflectionTestUtils.setField(formatter, "prefix", "");
+        DependencyVersionService depVersionService =
+                new DependencyVersionService(dependencyVersionUpdater, gitService, formatter);
+        ReflectionTestUtils.setField(depVersionService, "integrationBranch", INTEGRATION_BRANCH);
+        ReflectionTestUtils.setField(depVersionService, "dryMode", true);
+        ReflectionTestUtils.setField(depVersionService, "defaultBuildService", BuildServiceType.LOCAL);
+
+        Map<Path, RepoConfig> repoConfigByPath = Map.of(workA, lightspeedConfig, workB, new RepoConfig());
+        // Simulate layer 1 complete: resume state carries the bare pom version for the Lightspeed repo
+        Map<Path, String> builtVersionsByRepo = Map.of(workA, "1.0.0-SNAPSHOT");
+
+        depVersionService.apply(moduleMap, List.of(workB), repoConfigByPath, builtVersionsByRepo);
+
+        assertThat(Files.readString(workB.resolve("pom.xml")))
+                .contains("<artifactId>lib-a</artifactId>")
+                .contains("<version>1.0.0-" + INTEGRATION_BRANCH + "-SNAPSHOT</version>");
+    }
+
+    @Test
     void pomVersionUpdater_setVersions_updatesRootAndSubmodules() throws Exception {
         Path work = cloneFixture("repo-multi");
 

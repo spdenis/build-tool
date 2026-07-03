@@ -61,11 +61,19 @@ public class DependencyVersionService {
                         e -> {
                             Artifact a = e.getKey();
                             Module m = e.getValue();
+                            RepoConfig config = repoConfigByPath.get(m.getRepoRoot());
                             // On resume, prefer the version that was actually built over the
                             // current pom version (which may have been bumped to next snapshot).
+                            // Lightspeed repos record a bare -SNAPSHOT in the resume state because
+                            // that is what the pom carries; the artifact published to Maven has
+                            // -<branch>-SNAPSHOT appended by CI, so we must still expand it.
                             String builtVersion = builtVersionsByRepo.get(m.getRepoRoot());
-                            if (builtVersion != null) return builtVersion;
-                            RepoConfig config = repoConfigByPath.get(m.getRepoRoot());
+                            if (builtVersion != null) {
+                                if (isLightspeed(config) && !integrationBranch.isBlank()) {
+                                    return expandVersion(builtVersion, integrationBranch);
+                                }
+                                return builtVersion;
+                            }
                             if (config != null && config.isPreserveVersion()) {
                                 return a.getVersion();
                             }
@@ -105,11 +113,13 @@ public class DependencyVersionService {
     }
 
     // "1.0.1-SNAPSHOT" + "integration" → "1.0.1-integration-SNAPSHOT"
-    private static String expandVersion(String bareVersion, String branch) {
-        if (bareVersion.endsWith("-SNAPSHOT")) {
-            return bareVersion.substring(0, bareVersion.length() - "-SNAPSHOT".length())
-                    + "-" + branch + "-SNAPSHOT";
+    // Already-expanded versions (ending with -<branch>-SNAPSHOT) are returned unchanged.
+    private static String expandVersion(String version, String branch) {
+        String branchSuffix = "-" + branch + "-SNAPSHOT";
+        if (version.endsWith(branchSuffix)) return version;
+        if (version.endsWith("-SNAPSHOT")) {
+            return version.substring(0, version.length() - "-SNAPSHOT".length()) + branchSuffix;
         }
-        return bareVersion;
+        return version;
     }
 }
