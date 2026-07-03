@@ -22,10 +22,13 @@ public class DependencyVersionUpdater {
 
     private static final Logger log = LoggerFactory.getLogger(DependencyVersionUpdater.class);
 
+    private record PropRef(Path pomPath, Node node) {}
+
     // Updates <parent>, <dependency>, and <dependencyManagement> versions across all pom.xml
     // files for every in-scope artifact. Returns the repo roots that had at least one change.
     // Dependency versions specified via property placeholders (${prop}) are resolved through
-    // <properties>. Parent versions are always inline — placeholders are not supported there.
+    // <properties> — including when the property is defined in a parent pom within the same repo.
+    // Parent versions are always inline — placeholders are not supported there.
     public Set<Path> update(List<Path> repoRoots, Map<String, String> versionByKey) {
         Set<Path> modifiedRepos = new LinkedHashSet<>();
         for (Path repoRoot : repoRoots) {
@@ -37,39 +40,84 @@ public class DependencyVersionUpdater {
     }
 
     private boolean updateRepo(Path repoRoot, Map<String, String> versionByKey) {
-        boolean anyChanged = false;
-        for (Path pomFile : findPomFiles(repoRoot)) {
-            anyChanged |= updatePom(pomFile, versionByKey);
+        List<Path> pomFiles = findPomFiles(repoRoot);
+        if (pomFiles.isEmpty()) return false;
+
+        Map<Path, String> originals = new LinkedHashMap<>();
+        Map<Path, Document> docs = new LinkedHashMap<>();
+        XPath xp = XPathFactory.newInstance().newXPath();
+
+        for (Path pom : pomFiles) {
+            try {
+                String xml = Files.readString(pom, StandardCharsets.UTF_8);
+                originals.put(pom, xml);
+                docs.put(pom, XmlUtils.parseXml(xml));
+            } catch (Exception e) {
+                log.error("Failed to parse {}: {}", pom, e.getMessage());
+            }
         }
-        return anyChanged;
+
+        // Cross-pom property index so a placeholder in a child pom can resolve a
+        // property defined only in the parent pom within the same repo.
+        Map<String, PropRef> propIndex = buildPropIndex(docs, xp);
+
+        Set<Path> changedPoms = new LinkedHashSet<>();
+        // Shared across all poms in the repo to avoid double-writing the same property
+        // when it is referenced by dependencies in multiple child modules.
+        Map<String, String> updatedProps = new HashMap<>();
+
+        for (Map.Entry<Path, Document> entry : docs.entrySet()) {
+            Path pomPath = entry.getKey();
+            Document doc = entry.getValue();
+            try {
+                if (updateParent(doc, xp, versionByKey)) changedPoms.add(pomPath);
+                updateDepNodes(
+                        (NodeList) xp.evaluate("/project/dependencies/dependency", doc, XPathConstants.NODESET),
+                        xp, versionByKey, pomPath, propIndex, updatedProps, changedPoms);
+                updateDepNodes(
+                        (NodeList) xp.evaluate("/project/dependencyManagement/dependencies/dependency", doc, XPathConstants.NODESET),
+                        xp, versionByKey, pomPath, propIndex, updatedProps, changedPoms);
+            } catch (Exception e) {
+                log.error("Failed to update dependency versions in {}: {}", pomPath, e.getMessage());
+            }
+        }
+
+        for (Path pomPath : changedPoms) {
+            try {
+                String original = originals.get(pomPath);
+                XmlUtils.writeXml(docs.get(pomPath), pomPath, original.stripLeading().startsWith("<?xml"));
+                log.debug("Updated dependency versions in {}", pomPath);
+            } catch (Exception e) {
+                log.error("Failed to write {}: {}", pomPath, e.getMessage());
+            }
+        }
+
+        return !changedPoms.isEmpty();
     }
 
-    private boolean updatePom(Path pomPath, Map<String, String> versionByKey) {
-        try {
-            String originalXml = Files.readString(pomPath, StandardCharsets.UTF_8);
-            Document doc = XmlUtils.parseXml(originalXml);
-            XPath xp = XPathFactory.newInstance().newXPath();
-            // Track properties already updated in this pom to avoid double-writes when
-            // the same property is referenced by more than one dependency.
-            Map<String, String> updatedProps = new HashMap<>();
-
-            boolean changed = updateParent(doc, xp, versionByKey);
-            changed |= updateDepNodes(
-                    (NodeList) xp.evaluate("/project/dependencies/dependency", doc, XPathConstants.NODESET),
-                    xp, versionByKey, doc, updatedProps);
-            changed |= updateDepNodes(
-                    (NodeList) xp.evaluate("/project/dependencyManagement/dependencies/dependency", doc, XPathConstants.NODESET),
-                    xp, versionByKey, doc, updatedProps);
-
-            if (changed) {
-                XmlUtils.writeXml(doc, pomPath, originalXml.stripLeading().startsWith("<?xml"));
-                log.debug("Updated dependency versions in {}", pomPath);
+    // Builds a map of property name → its location (pom path + live DOM node) across all poms
+    // in the repo. When the same property is declared in multiple poms, the first occurrence
+    // (by sorted path order — child dirs sort before the root pom.xml) is recorded; subsequent
+    // definitions via putIfAbsent are skipped, matching Maven's child-overrides-parent semantics.
+    private Map<String, PropRef> buildPropIndex(Map<Path, Document> docs, XPath xp) {
+        Map<String, PropRef> index = new HashMap<>();
+        for (Map.Entry<Path, Document> entry : docs.entrySet()) {
+            try {
+                Node propsNode = XmlUtils.node(xp, "/project/properties", entry.getValue());
+                if (propsNode == null) continue;
+                NodeList children = propsNode.getChildNodes();
+                for (int i = 0; i < children.getLength(); i++) {
+                    Node child = children.item(i);
+                    if (child.getNodeType() == Node.ELEMENT_NODE) {
+                        String name = child.getLocalName() != null ? child.getLocalName() : child.getNodeName();
+                        index.putIfAbsent(name, new PropRef(entry.getKey(), child));
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Failed to index properties in {}: {}", entry.getKey(), e.getMessage());
             }
-            return changed;
-        } catch (Exception e) {
-            log.error("Failed to update dependency versions in {}: {}", pomPath, e.getMessage());
-            return false;
         }
+        return index;
     }
 
     private boolean updateParent(Document doc, XPath xp, Map<String, String> versionByKey) throws Exception {
@@ -90,9 +138,9 @@ public class DependencyVersionUpdater {
         return true;
     }
 
-    private boolean updateDepNodes(NodeList nodes, XPath xp, Map<String, String> versionByKey,
-                                   Document doc, Map<String, String> updatedProps) throws Exception {
-        boolean changed = false;
+    private void updateDepNodes(NodeList nodes, XPath xp, Map<String, String> versionByKey,
+                                Path currentPom, Map<String, PropRef> propIndex,
+                                Map<String, String> updatedProps, Set<Path> changedPoms) throws Exception {
         for (int i = 0; i < nodes.getLength(); i++) {
             Node dep = nodes.item(i);
             Node gId = XmlUtils.node(xp, "groupId", dep);
@@ -108,52 +156,33 @@ public class DependencyVersionUpdater {
             if (newVersion == null) continue;
 
             if (current.startsWith("${") && current.endsWith("}")) {
-                // Version is a property placeholder — update the property definition instead
                 String propName = current.substring(2, current.length() - 1);
                 if (!updatedProps.containsKey(propName)) {
-                    Node propNode = findProperty(doc, xp, propName);
-                    if (propNode != null) {
-                        String propValue = propNode.getTextContent().trim();
+                    PropRef ref = propIndex.get(propName);
+                    if (ref != null) {
+                        String propValue = ref.node().getTextContent().trim();
                         if (!newVersion.equals(propValue)) {
                             log.info("  {}:{} property {} {} -> {}",
                                     gId.getTextContent().trim(), aId.getTextContent().trim(),
                                     propName, propValue, newVersion);
-                            propNode.setTextContent(newVersion);
-                            changed = true;
+                            ref.node().setTextContent(newVersion);
+                            changedPoms.add(ref.pomPath());
                         }
                         updatedProps.put(propName, newVersion);
                     } else {
-                        log.warn("Property '{}' not found in <properties> for {}:{}; skipping",
+                        log.warn("Property '{}' not found for {}:{}; skipping",
                                 propName, gId.getTextContent().trim(), aId.getTextContent().trim());
                     }
                 }
             } else {
-                // Direct inline version
                 if (!newVersion.equals(current)) {
                     log.info("  {}:{} {} -> {}",
                             gId.getTextContent().trim(), aId.getTextContent().trim(), current, newVersion);
                     ver.setTextContent(newVersion);
-                    changed = true;
+                    changedPoms.add(currentPom);
                 }
             }
         }
-        return changed;
-    }
-
-    // Finds a child element of /project/properties whose local name matches propName.
-    // Using DOM traversal instead of XPath to handle any valid Maven property name.
-    private static Node findProperty(Document doc, XPath xp, String propName) throws Exception {
-        Node props = XmlUtils.node(xp, "/project/properties", doc);
-        if (props == null) return null;
-        NodeList children = props.getChildNodes();
-        for (int i = 0; i < children.getLength(); i++) {
-            Node child = children.item(i);
-            if (child.getNodeType() == Node.ELEMENT_NODE) {
-                String name = child.getLocalName() != null ? child.getLocalName() : child.getNodeName();
-                if (propName.equals(name)) return child;
-            }
-        }
-        return null;
     }
 
     private List<Path> findPomFiles(Path repoRoot) {
@@ -168,5 +197,4 @@ public class DependencyVersionUpdater {
             throw new RuntimeException("Failed to scan " + repoRoot, e);
         }
     }
-
 }

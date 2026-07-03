@@ -8,7 +8,8 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class DependencyVersionUpdaterTest {
 
@@ -118,6 +119,49 @@ class DependencyVersionUpdaterTest {
         updater.update(List.of(dir), Map.of("com.example:mylib", "1.1.0"));
 
         assertEquals(original, Files.readString(pom));
+    }
+
+    @Test
+    void updatesPropertyDefinedInParentPomWhenDepDeclaredInChildModule(@TempDir Path dir) throws Exception {
+        Path parentPom = dir.resolve("pom.xml");
+        Path childDir = Files.createDirectory(dir.resolve("child"));
+        Path childPom = childDir.resolve("pom.xml");
+
+        Files.writeString(parentPom, """
+                <project>
+                  <groupId>com.example</groupId>
+                  <artifactId>parent</artifactId>
+                  <version>2.0.0</version>
+                  <properties>
+                    <mylib.version>1.0.0</mylib.version>
+                  </properties>
+                </project>
+                """);
+
+        Files.writeString(childPom, """
+                <project>
+                  <parent>
+                    <groupId>com.example</groupId>
+                    <artifactId>parent</artifactId>
+                    <version>2.0.0</version>
+                  </parent>
+                  <artifactId>child</artifactId>
+                  <dependencies>
+                    <dependency>
+                      <groupId>com.example</groupId>
+                      <artifactId>mylib</artifactId>
+                      <version>${mylib.version}</version>
+                    </dependency>
+                  </dependencies>
+                </project>
+                """);
+
+        updater.update(List.of(dir), Map.of("com.example:mylib", "1.1.0"));
+
+        assertTrue(Files.readString(parentPom).contains("<mylib.version>1.1.0</mylib.version>"),
+                "property in root pom should be updated");
+        assertTrue(Files.readString(childPom).contains("<version>${mylib.version}</version>"),
+                "placeholder in child pom should be preserved");
     }
 
     private static int countOccurrences(String text, String sub) {
