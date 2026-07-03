@@ -1,5 +1,8 @@
 package com.example.multibuild.functional;
 
+import com.example.multibuild.build.DummyBuildService;
+import com.example.multibuild.build.LightspeedProperties;
+import com.example.multibuild.build.MavenRepositoryClient;
 import com.example.multibuild.git.JGitService;
 import com.example.multibuild.graph.DependencyGraph;
 import com.example.multibuild.maven.DependencyVersionUpdater;
@@ -7,15 +10,13 @@ import com.example.multibuild.maven.MavenParserImpl;
 import com.example.multibuild.maven.PomVersionUpdater;
 import com.example.multibuild.model.*;
 import com.example.multibuild.model.Module;
-import com.example.multibuild.service.BranchService;
-import com.example.multibuild.service.CommitMessageFormatter;
-import com.example.multibuild.service.DependencyVersionService;
-import com.example.multibuild.service.ProjectAggregator;
+import com.example.multibuild.service.*;
 import org.eclipse.jgit.api.Git;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.web.client.RestTemplate;
 
 import java.io.IOException;
 import java.net.URI;
@@ -448,6 +449,55 @@ class MultiBuildFunctionalTest {
                 .contains("<version>3.0.0</version>");
         assertThat(Files.readString(work.resolve("module-service").resolve("pom.xml")))
                 .contains("<version>3.0.0</version>");
+    }
+
+    // ── Release phase ─────────────────────────────────────────────────────────
+
+    @Test
+    void release_nextDevVersionBump_doesNotUpdateCrossRepoDependencies() throws Exception {
+        // lib-a (1.0.0-SNAPSHOT) has no cross-repo deps.
+        // service-b (2.0.0-SNAPSHOT) depends on lib-a:1.0.0-SNAPSHOT.
+        //
+        // Expected after a full release run:
+        //   Phase 1 pin:  lib-a → 1.0.0,  service-b → 2.0.0 (dep lib-a:1.0.0)
+        //   Phase 2 bump: lib-a → 1.0.1-SNAPSHOT, service-b → 2.0.1-SNAPSHOT
+        //                 service-b's dep on lib-a must stay at 1.0.0 (the released version),
+        //                 NOT be advanced to 1.0.1-SNAPSHOT.
+        Path workA = cloneFixture("repo-a");
+        Path workB = cloneFixture("repo-b");
+
+        List<RepositoryProject> projects = projectAggregator.aggregate(List.of(workA, workB));
+        Map<Artifact, Module> moduleMap = projects.stream()
+                .flatMap(p -> p.getModules().stream())
+                .collect(Collectors.toMap(Module::getArtifact, m -> m));
+        DependencyGraph<Path> graph = projectAggregator.buildGraph(projects);
+        List<List<Path>> layers = graph.topologicalLayers();
+
+        List<Path> repoRoots = List.of(workA, workB);
+        Map<Path, RepoConfig> repoConfigs = Map.of(workA, new RepoConfig(), workB, new RepoConfig());
+
+        ResumeState resumeState = new ResumeState();
+        resumeState.initRepos(layers, repoConfigs);
+
+        // releasesUrl is blank by default → isReleasesConfigured() == false → pre-flight skipped
+        MavenRepositoryClient mavenClient =
+                new MavenRepositoryClient(new LightspeedProperties(), new RestTemplate());
+
+        ReleaseService releaseService = new ReleaseService(
+                pomVersionUpdater, dependencyVersionUpdater, gitService,
+                new DummyBuildService(), mavenClient);
+        ReflectionTestUtils.setField(releaseService, "dryMode", true);
+
+        releaseService.execute(layers, moduleMap, repoRoots, repoConfigs, resumeState);
+
+        assertThat(pomVersionUpdater.getRootVersion(workA)).isEqualTo("1.0.1-SNAPSHOT");
+        assertThat(pomVersionUpdater.getRootVersion(workB)).isEqualTo("2.0.1-SNAPSHOT");
+
+        String pomB = Files.readString(workB.resolve("pom.xml"));
+        assertThat(pomB)
+                .contains("<artifactId>lib-a</artifactId>")
+                .contains("<version>1.0.0</version>");
+        assertThat(pomB).doesNotContain("1.0.1-SNAPSHOT");
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

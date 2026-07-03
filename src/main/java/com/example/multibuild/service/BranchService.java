@@ -143,7 +143,12 @@ public class BranchService {
                 String newVersion = isLightspeed(repoConfig)
                         ? versionUpdater.updateVersionsBare(repoDir)
                         : versionUpdater.updateVersions(repoDir, integrationBranch);
-                gitService.commitAll(repoDir, commitFormatter.format("chore: set version to " + newVersion));
+                boolean committed = gitService.commitAllIfDirty(repoDir,
+                        commitFormatter.format("chore: set version to " + newVersion));
+                if (!committed) {
+                    log.info("Version in {} already correct ({}) — skipping commit",
+                            repoDir.getFileName(), newVersion);
+                }
                 if (isDryRun(dryMode, repoConfig)) {
                     log.info("Dry mode — skipping push for {}", repoDir.getFileName());
                 } else {
