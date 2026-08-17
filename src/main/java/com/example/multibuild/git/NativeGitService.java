@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 @Service
 @ConditionalOnProperty(name = "git.implementation", havingValue = "native")
@@ -41,6 +42,18 @@ public class NativeGitService implements GitService {
     // configure no_proxy for bypass instead.
     @Value("${git.proxy.bypass:}")
     private String proxyBypass;
+
+    // Retries apply only to commands that talk to the remote (clone, fetch, ls-remote, push) —
+    // a transient network/remote error is worth retrying, a local failure (bad merge, dirty
+    // tree, etc.) is not and would just waste time re-running.
+    @Value("${git.retry.max-attempts:3}")
+    private int retryMaxAttempts;
+
+    @Value("${git.retry.initial-backoff-ms:1000}")
+    private long retryInitialBackoffMs;
+
+    @Value("${git.retry.backoff-multiplier:2.0}")
+    private double retryBackoffMultiplier;
 
     private Map<String, String> gitEnv() {
         Map<String, String> env = new HashMap<>(System.getenv());
@@ -107,6 +120,49 @@ public class NativeGitService implements GitService {
         }
     }
 
+    // Like exec(), but retries with exponential backoff — for commands that hit the remote.
+    private String execRemote(Path dir, String... cmd) {
+        return retry(() -> exec(dir, cmd), cmd);
+    }
+
+    // Like execLive(), but retries with exponential backoff — for commands that hit the remote.
+    private void execLiveRemote(Path dir, String... cmd) {
+        retry(() -> {
+            execLive(dir, cmd);
+            return null;
+        }, cmd);
+    }
+
+    private <T> T retry(Supplier<T> op, String[] cmd) {
+        long backoffMs = retryInitialBackoffMs;
+        RuntimeException lastException = null;
+        for (int attempt = 1; attempt <= retryMaxAttempts; attempt++) {
+            try {
+                return op.get();
+            } catch (RuntimeException e) {
+                lastException = e;
+                if (attempt == retryMaxAttempts) {
+                    throw e;
+                }
+                log.warn("  Remote git command failed on attempt {}/{}: {} — retrying in {}ms ({})",
+                        attempt, retryMaxAttempts, String.join(" ", cmd), backoffMs, e.getMessage());
+            }
+            sleep(backoffMs);
+            backoffMs = (long) (backoffMs * retryBackoffMultiplier);
+        }
+        // Unreachable: the loop always returns or throws on its last attempt.
+        throw lastException;
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting to retry git command", e);
+        }
+    }
+
     @Override
     public Path cloneRepo(String url, Path targetDir) {
         if (targetDir.toFile().exists() && targetDir.resolve(".git").toFile().exists()) {
@@ -130,7 +186,7 @@ public class NativeGitService implements GitService {
         if (cloneDepth > 0) {
             fetchCmd.addAll(List.of("--depth", String.valueOf(cloneDepth)));
         }
-        execLive(targetDir, fetchCmd.toArray(String[]::new));
+        execLiveRemote(targetDir, fetchCmd.toArray(String[]::new));
         return targetDir;
     }
 
@@ -143,7 +199,7 @@ public class NativeGitService implements GitService {
         }
         cmd.add(url);
         cmd.add(targetDir.toAbsolutePath().toString());
-        execLive(null, cmd.toArray(String[]::new));
+        execLiveRemote(null, cmd.toArray(String[]::new));
         return targetDir;
     }
 
@@ -160,7 +216,7 @@ public class NativeGitService implements GitService {
 
         // Use ls-remote to query the actual remote: local tracking refs may be absent
         // with shallow clones (git clone --depth N only fetches the default branch).
-        String lsRemote = exec(repoDir, "git", "ls-remote", "--heads", "origin", branchName);
+        String lsRemote = execRemote(repoDir, "git", "ls-remote", "--heads", "origin", branchName);
         if (!lsRemote.isBlank()) {
             // Register the branch in the remote's fetch refspecs before fetching.
             // Without this, shallow single-branch clones silently skip writing the
@@ -173,7 +229,7 @@ public class NativeGitService implements GitService {
             if (cloneDepth > 0) {
                 fetchCmd.addAll(List.of("--depth", String.valueOf(cloneDepth)));
             }
-            exec(repoDir, fetchCmd.toArray(String[]::new));
+            execRemote(repoDir, fetchCmd.toArray(String[]::new));
             // DWIM checkout: if local branch already exists, switches to it;
             // if only the tracking ref exists, auto-creates a local tracking branch.
             exec(repoDir, "git", "checkout", branchName);
@@ -222,7 +278,7 @@ public class NativeGitService implements GitService {
     public void push(Path repoDir) {
         String branch = exec(repoDir, "git", "rev-parse", "--abbrev-ref", "HEAD").trim();
         log.info("Pushing branch {} in {}", branch, repoDir.getFileName());
-        execLive(repoDir, "git", "push", "-u", "origin", branch);
+        execLiveRemote(repoDir, "git", "push", "-u", "origin", branch);
     }
 
     @Override
@@ -254,20 +310,20 @@ public class NativeGitService implements GitService {
         if (tags.isBlank()) return;
         log.info("Tag {} already exists in {}, deleting local and remote", tagName, repoDir.getFileName());
         exec(repoDir, "git", "tag", "-d", tagName);
-        execLive(repoDir, "git", "push", "origin", ":refs/tags/" + tagName);
+        execLiveRemote(repoDir, "git", "push", "origin", ":refs/tags/" + tagName);
         log.info("Deleted remote tag {} in {}", tagName, repoDir.getFileName());
     }
 
     @Override
     public void pushTag(Path repoDir, String tagName) {
         log.info("Pushing tag {} in {}", tagName, repoDir.getFileName());
-        execLive(repoDir, "git", "push", "origin", "refs/tags/" + tagName);
+        execLiveRemote(repoDir, "git", "push", "origin", "refs/tags/" + tagName);
     }
 
     @Override
     public void pushTagForce(Path repoDir, String tagName) {
         log.info("Force-pushing tag {} in {}", tagName, repoDir.getFileName());
-        execLive(repoDir, "git", "push", "--force", "origin", "refs/tags/" + tagName);
+        execLiveRemote(repoDir, "git", "push", "--force", "origin", "refs/tags/" + tagName);
     }
 
     private static String maskUrl(String url) {
