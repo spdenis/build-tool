@@ -7,6 +7,7 @@ import com.example.multibuild.git.GitService;
 import com.example.multibuild.maven.DependencyVersionUpdater;
 import com.example.multibuild.maven.PomVersionUpdater;
 import com.example.multibuild.model.Artifact;
+import com.example.multibuild.model.BuildServiceType;
 import com.example.multibuild.model.Module;
 import com.example.multibuild.model.RepoConfig;
 import com.example.multibuild.model.ResumeState;
@@ -28,6 +29,9 @@ public class ReleaseService {
 
     @Value("${dry.mode:false}")
     private boolean dryMode;
+
+    @Value("${build.service:LOCAL}")
+    private BuildServiceType defaultBuildService;
 
     private final PomVersionUpdater pomVersionUpdater;
     private final DependencyVersionUpdater dependencyVersionUpdater;
@@ -300,6 +304,11 @@ public class ReleaseService {
             String releaseVersion = releaseVersionByRepo.get(repoRoot);
             if (releaseVersion == null) continue;
 
+            if (resolveBuildService(repoConfigs.get(repoRoot)) == BuildServiceType.DUMMY) {
+                log.info("  [{}] Dummy build service — skipping already-released check", repoRoot.getFileName());
+                continue;
+            }
+
             List<Artifact> toCheck;
             if (Files.exists(repoRoot.resolve("pom.xml"))) {
                 toCheck = artifactsByRepo.getOrDefault(repoRoot, List.of()).stream()
@@ -333,6 +342,13 @@ public class ReleaseService {
         }
 
         log.info("  Pre-flight: all planned versions are available — proceeding");
+    }
+
+    // Mirrors DispatchingBuildService.resolveType: per-repo override, falling back to the global default.
+    private BuildServiceType resolveBuildService(RepoConfig config) {
+        return (config != null && config.getBuildService() != null)
+                ? config.getBuildService()
+                : defaultBuildService;
     }
 
     private String baseVersion(String version) {
