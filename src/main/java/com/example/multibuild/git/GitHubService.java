@@ -27,12 +27,62 @@ public class GitHubService {
     @Value("${github.reviewers:}")
     private String reviewersConfig;
 
+    // Retries apply only to remote/transient failures: connection errors and 5xx responses.
+    // 4xx responses (bad auth, validation, not-found) are the caller's problem and never retried.
+    @Value("${github.retry.max-attempts:3}")
+    private int retryMaxAttempts;
+
+    @Value("${github.retry.initial-backoff-ms:1000}")
+    private long retryInitialBackoffMs;
+
+    @Value("${github.retry.backoff-multiplier:2.0}")
+    private double retryBackoffMultiplier;
+
     private final ObjectMapper objectMapper;
     private final RestTemplate restTemplate;
 
     public GitHubService(ObjectMapper objectMapper, RestTemplate restTemplate) {
         this.objectMapper = objectMapper;
         this.restTemplate = restTemplate;
+    }
+
+    // Executes a GitHub API call, retrying with exponential backoff on connection failures
+    // and 5xx responses (transient/remote errors). Client errors (4xx) are returned as-is
+    // so callers can keep handling them (e.g. 422 "PR already exists") without a retry loop.
+    private ResponseEntity<String> exchangeWithRetry(URI uri, HttpMethod method, HttpEntity<String> entity) {
+        long backoffMs = retryInitialBackoffMs;
+        RestClientException lastException = null;
+        for (int attempt = 1; attempt <= retryMaxAttempts; attempt++) {
+            try {
+                ResponseEntity<String> response = restTemplate.exchange(uri, method, entity, String.class);
+                if (response.getStatusCode().value() < 500 || attempt == retryMaxAttempts) {
+                    return response;
+                }
+                log.warn("  GitHub API returned HTTP {} on attempt {}/{} for {} {} — retrying in {}ms",
+                        response.getStatusCode().value(), attempt, retryMaxAttempts, method, uri, backoffMs);
+            } catch (RestClientException e) {
+                lastException = e;
+                if (attempt == retryMaxAttempts) {
+                    throw e;
+                }
+                log.warn("  GitHub API request failed on attempt {}/{} for {} {} — retrying in {}ms ({})",
+                        attempt, retryMaxAttempts, method, uri, backoffMs, e.getMessage());
+            }
+            sleep(backoffMs);
+            backoffMs = (long) (backoffMs * retryBackoffMultiplier);
+        }
+        // Unreachable: the loop always returns or throws on its last attempt.
+        throw lastException != null ? lastException
+                : new IllegalStateException("Retry loop exited without a result for " + method + " " + uri);
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while waiting to retry GitHub API request", e);
+        }
     }
 
     /**
@@ -58,8 +108,8 @@ public class GitHubService {
             headers.setContentType(MediaType.APPLICATION_JSON);
             HttpEntity<String> entity = new HttpEntity<>(objectMapper.writeValueAsString(body), headers);
 
-            ResponseEntity<String> response = restTemplate.exchange(
-                    URI.create(pullsEndpoint), HttpMethod.POST, entity, String.class);
+            ResponseEntity<String> response = exchangeWithRetry(
+                    URI.create(pullsEndpoint), HttpMethod.POST, entity);
             log.info("  -> HTTP {}", response.getStatusCode().value());
 
             if (response.getStatusCode().value() == 201) {
@@ -89,8 +139,8 @@ public class GitHubService {
     private PrInfo findExistingPr(String pullsEndpoint, String owner, String head, String base) {
         String url = pullsEndpoint + "?head=" + owner + ":" + head + "&base=" + base + "&state=open";
         try {
-            ResponseEntity<String> response = restTemplate.exchange(
-                    URI.create(url), HttpMethod.GET, new HttpEntity<>(githubHeaders()), String.class);
+            ResponseEntity<String> response = exchangeWithRetry(
+                    URI.create(url), HttpMethod.GET, new HttpEntity<>(githubHeaders()));
             if (response.getStatusCode().value() != 200) {
                 throw new RuntimeException("GitHub API error " + response.getStatusCode().value()
                         + " listing PRs: " + response.getBody());
@@ -120,8 +170,8 @@ public class GitHubService {
             HttpHeaders headers = githubHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
             String body = objectMapper.writeValueAsString(Map.of("reviewers", reviewers));
-            ResponseEntity<String> response = restTemplate.exchange(
-                    URI.create(url), HttpMethod.POST, new HttpEntity<>(body, headers), String.class);
+            ResponseEntity<String> response = exchangeWithRetry(
+                    URI.create(url), HttpMethod.POST, new HttpEntity<>(body, headers));
             if (response.getStatusCode().value() >= 300) {
                 log.warn("Failed to request reviewers on PR #{}: HTTP {} — {}",
                         prNumber, response.getStatusCode().value(), response.getBody());
