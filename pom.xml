@@ -78,6 +78,22 @@
                     </execution>
                 </executions>
             </plugin>
+            <!-- Not bound to any lifecycle phase — run manually, e.g.:
+                 mvn rewrite:dryRun -Drewrite.activeRecipes=com.example.MyRecipe
+                 mvn rewrite:run    -Drewrite.activeRecipes=com.example.MyRecipe
+                 Custom recipes can be listed below in <activeRecipes> and/or declared
+                 in a rewrite.yml at the project root (picked up automatically).
+                 To use recipes from a file elsewhere, point at it with -Drewrite.configLocation:
+                 mvn rewrite:run -Drewrite.configLocation=/path/to/recipe.yml -Drewrite.activeRecipes=com.example.MyRecipe -->
+            <plugin>
+                <groupId>org.openrewrite.maven</groupId>
+                <artifactId>rewrite-maven-plugin</artifactId>
+                <version>6.46.1</version>
+                <configuration>
+                    <activeRecipes>
+                    </activeRecipes>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 </project>
