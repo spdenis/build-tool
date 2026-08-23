@@ -84,7 +84,14 @@
                  Custom recipes can be listed below in <activeRecipes> and/or declared
                  in a rewrite.yml at the project root (picked up automatically).
                  To use recipes from a file elsewhere, point at it with -Drewrite.configLocation:
-                 mvn rewrite:run -Drewrite.configLocation=/path/to/recipe.yml -Drewrite.activeRecipes=com.example.MyRecipe -->
+                 mvn rewrite:run -Drewrite.configLocation=/path/to/recipe.yml -Drewrite.activeRecipes=com.example.MyRecipe
+
+                 The rewrite-spring dependency below makes prebuilt Spring recipes available
+                 (e.g. the Spring Boot 3 -> 4 upgrade, which rewrites both pom.xml and Java sources —
+                 dependency/plugin versions, renamed starters, moved classes, deprecated APIs, config
+                 property migrations, etc.). Preview first, then apply:
+                 mvn rewrite:dryRun -Drewrite.activeRecipes=org.openrewrite.java.spring.boot4.UpgradeSpringBoot_4_0
+                 mvn rewrite:run    -Drewrite.activeRecipes=org.openrewrite.java.spring.boot4.UpgradeSpringBoot_4_0 -->
             <plugin>
                 <groupId>org.openrewrite.maven</groupId>
                 <artifactId>rewrite-maven-plugin</artifactId>
@@ -93,6 +100,13 @@
                     <activeRecipes>
                     </activeRecipes>
                 </configuration>
+                <dependencies>
+                    <dependency>
+                        <groupId>org.openrewrite.recipe</groupId>
+                        <artifactId>rewrite-spring</artifactId>
+                        <version>6.37.1</version>
+                    </dependency>
+                </dependencies>
             </plugin>
         </plugins>
     </build>
