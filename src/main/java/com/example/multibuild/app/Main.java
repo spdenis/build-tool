@@ -104,6 +104,12 @@ public class Main implements CommandLineRunner {
     }
 
     public static void main(String[] args) {
+        if (args.length >= 2 && System.getProperty("logging.file.name") == null) {
+            Path workDir = Paths.get(args[1]).toAbsolutePath().getParent();
+            if (workDir != null) {
+                System.setProperty("logging.file.name", workDir.resolve("multibuild").toString());
+            }
+        }
         SpringApplication.run(Main.class, args);
     }
 
