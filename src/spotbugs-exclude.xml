@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FindBugsFilter xmlns="https://github.com/spotbugs/filter/3.0.0"
+                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                 xsi:schemaLocation="https://github.com/spotbugs/filter/3.0.0 https://raw.githubusercontent.com/spotbugs/spotbugs/master/spotbugs/etc/findbugsfilter.xsd">
+
+    <!-- Main is a CLI entry point; System.exit(1) on the error paths is intentional. -->
+    <Match>
+        <Class name="com.example.multibuild.app.Main"/>
+        <Bug pattern="DM_EXIT"/>
+    </Match>
+
+    <!-- DTOs/config objects and constructor-injected services intentionally hold
+         direct references to what they're given (Jackson DTOs, Spring @Value-bound
+         config, standard constructor injection) rather than defensively copying. -->
+    <Match>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+    </Match>
+
+    <!-- Findings on Map.get()-style lookups already guarded by surrounding logic. -->
+    <Match>
+        <Bug pattern="NP_NULL_ON_SOME_PATH_FROM_RETURN_VALUE"/>
+    </Match>
+
+    <Match>
+        <Class name="com.example.multibuild.maven.MavenParserImpl"/>
+        <Bug pattern="REC_CATCH_EXCEPTION"/>
+    </Match>
+
+    <!-- Jackson serialization DTOs: fields are written by Main and read via
+         reflection when serialized to JSON output, which SpotBugs can't see. -->
+    <Match>
+        <Class name="com.example.multibuild.app.BuildResult$ArtifactDto"/>
+        <Bug pattern="URF_UNREAD_PUBLIC_OR_PROTECTED_FIELD"/>
+    </Match>
+    <Match>
+        <Class name="com.example.multibuild.app.BuildResult$DependencyDto"/>
+        <Bug pattern="URF_UNREAD_PUBLIC_OR_PROTECTED_FIELD"/>
+    </Match>
+</FindBugsFilter>
