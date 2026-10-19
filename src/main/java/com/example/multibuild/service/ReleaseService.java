@@ -51,9 +51,11 @@ public class ReleaseService {
         this.mavenClient = mavenClient;
     }
 
+    // outOfScopeDeps: repos the release scope depends on but which are not released in this run
+    // (build.target). Dependencies on them are pinned to an existing release of each.
     public void execute(List<List<Path>> buildLayers, Map<Artifact, Module> moduleMap,
-                        List<Path> repoRoots, Map<Path, RepoConfig> repoConfigs,
-                        ResumeState resumeState) {
+                        List<Path> repoRoots, Collection<Path> outOfScopeDeps,
+                        Map<Path, RepoConfig> repoConfigs, ResumeState resumeState) {
 
         // ── Release Phase 1: pin versions, tag, push ────────────────
         log.info("── Release Phase 1: pin versions, tag & push ({} repo(s)) ──", repoRoots.size());
@@ -84,6 +86,12 @@ public class ReleaseService {
         for (Map.Entry<Artifact, Module> entry : moduleMap.entrySet()) {
             String rv = releaseVersionByRepo.get(entry.getValue().getRepoRoot());
             if (rv != null) releaseVersionByKey.put(entry.getKey().key(), rv);
+        }
+
+        Map<Path, String> outOfScopeVersions = resolveOutOfScopeReleases(outOfScopeDeps, resumeState);
+        for (Map.Entry<Artifact, Module> entry : moduleMap.entrySet()) {
+            String rv = outOfScopeVersions.get(entry.getValue().getRepoRoot());
+            if (rv != null) releaseVersionByKey.putIfAbsent(entry.getKey().key(), rv);
         }
 
         if (mavenClient.isReleasesConfigured() && !resumeState.isReleasePhase1Complete()) {
@@ -284,6 +292,68 @@ public class ReleaseService {
         }
 
         log.info("── Release Phase 2 complete in {} ──────────────────────", elapsed(phase2Start));
+    }
+
+    // Repos outside the release scope are not released in this run, but in-scope repos may depend
+    // on them, and a release must not depend on a snapshot. Each one is pinned to the version
+    // recorded in the resume state (released earlier in this flow), otherwise to the latest
+    // release in the Maven repository that is not newer than the repo's current version.
+    private Map<Path, String> resolveOutOfScopeReleases(Collection<Path> repos, ResumeState resumeState) {
+        Map<Path, String> result = new LinkedHashMap<>();
+        if (repos.isEmpty()) return result;
+        log.info("  Resolving released versions of {} dependency repo(s) outside the build target...", repos.size());
+        Map<Path, String> completed = resumeState.getCompletedVersionsByRepo(repos);
+        List<String> unresolved = new ArrayList<>();
+        for (Path repo : repos) {
+            String version = completed.get(repo);
+            String source = "resume state";
+            if (version == null || version.endsWith("-SNAPSHOT")) {
+                Artifact root = pomVersionUpdater.getRootArtifact(repo);
+                version = root != null && mavenClient.isReleasesConfigured() ? latestReleaseUpTo(root) : null;
+                source = "Maven repository";
+            }
+            if (version == null) {
+                unresolved.add(repo.getFileName().toString());
+                continue;
+            }
+            log.info("  [{}] outside build target — dependencies pinned to {} (from {})",
+                    repo.getFileName(), version, source);
+            result.put(repo, version);
+        }
+        if (!unresolved.isEmpty()) {
+            throw new RuntimeException("Build target depends on repo(s) with no known release: "
+                    + String.join(", ", unresolved)
+                    + ". Release them first, include them in the build, or set build.target.update-deps=false.");
+        }
+        return result;
+    }
+
+    private String latestReleaseUpTo(Artifact root) {
+        String ceiling = baseVersion(root.getVersion());
+        return mavenClient.releasedVersions(root.getGroupId(), root.getArtifactId()).stream()
+                .filter(v -> v.matches("\\d+(\\.\\d+)*"))
+                .filter(v -> compareVersions(v, ceiling) <= 0)
+                .max(ReleaseService::compareVersions)
+                .orElse(null);
+    }
+
+    // Numeric segment-wise comparison; missing segments count as 0 (1.1 == 1.1.0 < 1.1.0.1).
+    public static int compareVersions(String a, String b) {
+        String[] x = a.split("\\."), y = b.split("\\.");
+        for (int i = 0; i < Math.max(x.length, y.length); i++) {
+            long xi = i < x.length ? parseSegment(x[i]) : 0;
+            long yi = i < y.length ? parseSegment(y[i]) : 0;
+            if (xi != yi) return Long.compare(xi, yi);
+        }
+        return 0;
+    }
+
+    private static long parseSegment(String s) {
+        try {
+            return Long.parseLong(s);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     private void checkVersionsNotAlreadyReleased(List<Path> repoRoots,

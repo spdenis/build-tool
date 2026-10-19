@@ -1,5 +1,6 @@
 package com.example.multibuild.build;
 
+import com.example.multibuild.maven.XmlUtils;
 import com.example.multibuild.model.Artifact;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -10,10 +11,13 @@ import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestTemplate;
+import org.w3c.dom.NodeList;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 
 @Component
 @EnableConfigurationProperties(LightspeedProperties.class)
@@ -47,6 +51,44 @@ public class MavenRepositoryClient {
             log.warn("Could not reach Maven repository at {}: {}", url, e.getMessage());
             return false;
         }
+    }
+
+    /**
+     * Like {@link #isReleasePublished}, but throws instead of returning false when the repository
+     * gives no definite answer (unreachable, auth failure, 5xx). Use where a false negative would
+     * cause a version to be reused.
+     */
+    public boolean releaseExists(Artifact a) {
+        String url = releasePomUrl(a);
+        int status;
+        try {
+            status = restTemplate.exchange(
+                    URI.create(url), HttpMethod.HEAD, new HttpEntity<>(mavenHeaders()), Void.class)
+                    .getStatusCode().value();
+        } catch (Exception e) {
+            throw new RuntimeException("Could not reach Maven repository at " + url + ": " + e.getMessage(), e);
+        }
+        if (status == 200) return true;
+        if (status == 404) return false;
+        throw new RuntimeException("Unexpected status " + status + " from " + url);
+    }
+
+    /** Versions listed in the artifact's release maven-metadata.xml; empty if none or unreachable. */
+    public List<String> releasedVersions(String groupId, String artifactId) {
+        String url = mavenRepo.getReleasesUrl().stripTrailing() + "/" +
+                groupPath(groupId) + "/" + artifactId + "/maven-metadata.xml";
+        String xml = fetchXml(url);
+        List<String> versions = new ArrayList<>();
+        if (xml == null) return versions;
+        try {
+            NodeList nodes = XmlUtils.parseXml(xml).getElementsByTagName("version");
+            for (int i = 0; i < nodes.getLength(); i++) {
+                versions.add(nodes.item(i).getTextContent().trim());
+            }
+        } catch (Exception e) {
+            log.warn("Could not parse {}: {}", url, e.getMessage());
+        }
+        return versions;
     }
 
     public String releasePomUrl(Artifact a) {

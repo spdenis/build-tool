@@ -1,5 +1,6 @@
 package com.example.multibuild.maven;
 
+import com.example.multibuild.model.Artifact;
 import org.apache.maven.model.Model;
 import org.apache.maven.model.io.xpp3.MavenXpp3Reader;
 import org.slf4j.Logger;
@@ -71,6 +72,26 @@ public class PomVersionUpdater {
     public String getRootVersion(Path repoDir) {
         RootInfo root = findRootInfo(findPomFiles(repoDir));
         return root != null ? root.oldVersion() : null;
+    }
+
+    // Returns the root artifact coordinates of the project in repoDir, or null if undetectable.
+    // groupId falls back to the parent's when the root pom inherits it.
+    public Artifact getRootArtifact(Path repoDir) {
+        List<Path> pomFiles = findPomFiles(repoDir);
+        if (pomFiles.isEmpty()) return null;
+        RootInfo root = findRootInfo(pomFiles);
+        if (root == null) return null;
+        String groupId = root.groupId();
+        if (groupId.isBlank()) {
+            try (FileReader fr = new FileReader(pomFiles.get(0).toFile(), StandardCharsets.UTF_8)) {
+                Model model = new MavenXpp3Reader().read(fr);
+                if (model.getParent() != null) groupId = model.getParent().getGroupId();
+            } catch (Exception e) {
+                log.warn("Could not read root pom: {}", e.getMessage());
+            }
+        }
+        if (groupId == null || groupId.isBlank() || root.artifactId().isBlank()) return null;
+        return new Artifact(groupId, root.artifactId(), root.oldVersion());
     }
 
     // Sets all module versions to an explicit version string.

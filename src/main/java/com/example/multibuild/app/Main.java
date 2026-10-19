@@ -69,6 +69,11 @@ public class Main implements CommandLineRunner {
     @Value("${build.target.with-deps:false}")
     private boolean buildTargetWithDeps;
 
+    // With build.target set, still update the target's dependencies on repos outside the build
+    // (to their current branch version, or to their released version in release mode).
+    @Value("${build.target.update-deps:true}")
+    private boolean buildTargetUpdateDeps;
+
     @Value("${build.pause-after:}")
     private String pauseAfterRepo;
 
@@ -145,7 +150,8 @@ public class Main implements CommandLineRunner {
                 buildMode, repoEntries.size(),
                 buildEnabled ? buildMode : "disabled", dryMode, skipGit);
         if (!buildTarget.isBlank()) {
-            log.info("  build.target={}  with-deps={}", buildTarget, buildTargetWithDeps);
+            log.info("  build.target={}  with-deps={}  update-deps={}",
+                    buildTarget, buildTargetWithDeps, buildTargetUpdateDeps);
         }
         if (!pauseAfterRepo.isBlank()) {
             log.info("  build.pause-after={}", pauseAfterRepo);
@@ -252,6 +258,16 @@ public class Main implements CommandLineRunner {
                 .flatMap(p -> p.getModules().stream())
                 .collect(Collectors.toMap(Module::getArtifact, m -> m));
 
+        // Repos whose versions are pushed into dependencies of the repos being built.
+        // All repos by default; with build.target and update-deps=false only the build scope.
+        Set<Path> buildScope = allLayers.stream().flatMap(List::stream).collect(Collectors.toSet());
+        boolean scopedDeps = !buildTarget.isBlank() && !buildTargetUpdateDeps;
+        Map<Artifact, Module> depVersionModules = scopedDeps
+                ? moduleMap.entrySet().stream()
+                        .filter(e -> buildScope.contains(e.getValue().getRepoRoot()))
+                        .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue))
+                : moduleMap;
+
         // Pre-compute version for each repo so the callback can record what was actually built.
         Map<Path, String> versionByRepo = new LinkedHashMap<>();
         for (Map.Entry<Artifact, Module> e : moduleMap.entrySet()) {
@@ -267,7 +283,11 @@ public class Main implements CommandLineRunner {
                     List<Path> releaseRepoRoots = buildTarget.isBlank()
                             ? clonedPaths
                             : allLayers.stream().flatMap(List::stream).toList();
-                    releaseService.execute(buildLayers, moduleMap, releaseRepoRoots, repoConfigByPath, resumeState);
+                    List<Path> outOfScopeDeps = buildTarget.isBlank() || !buildTargetUpdateDeps
+                            ? List.of()
+                            : directDependenciesOutside(graph, releaseRepoRoots);
+                    releaseService.execute(buildLayers, moduleMap, releaseRepoRoots, outOfScopeDeps,
+                            repoConfigByPath, resumeState);
                     if (willPause) {
                         long total = allLayers.stream().flatMap(List::stream).count();
                         log.info("══ Release PAUSED after '{}' (Phase 1 complete, {}/{} repo(s) built) ══",
@@ -302,7 +322,7 @@ public class Main implements CommandLineRunner {
                                         .map(e -> e.getKey().getFileName() + "=" + e.getValue())
                                         .collect(Collectors.joining(", ")));
                             }
-                            dependencyVersionService.apply(moduleMap, layerToBuild, repoConfigByPath,
+                            dependencyVersionService.apply(depVersionModules, layerToBuild, repoConfigByPath,
                                     builtVersionsByRepo);
                             buildService.buildAll(List.of(layerToBuild), moduleMap, repoConfigByPath,
                                     resumeState.getCompletedRepoNames(), Collections.emptyMap(),
@@ -575,6 +595,16 @@ public class Main implements CommandLineRunner {
         return layers.stream()
                 .map(layer -> layer.stream().filter(keep::contains).toList())
                 .filter(layer -> !layer.isEmpty())
+                .toList();
+    }
+
+    // Repos that any of scope's repos depend on directly but which are not in scope themselves.
+    private static List<Path> directDependenciesOutside(DependencyGraph<Path> graph, List<Path> scope) {
+        Set<Path> inScope = new HashSet<>(scope);
+        return scope.stream()
+                .flatMap(r -> graph.getAdjacencyList().getOrDefault(r, List.of()).stream())
+                .filter(d -> !inScope.contains(d))
+                .distinct()
                 .toList();
     }
 

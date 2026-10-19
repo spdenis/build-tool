@@ -29,6 +29,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class MultiBuildFunctionalTest {
 
@@ -66,11 +67,14 @@ class MultiBuildFunctionalTest {
         CommitMessageFormatter formatter = new CommitMessageFormatter();
         ReflectionTestUtils.setField(formatter, "prefix", "");
 
-        branchService = new BranchService(gitService, pomVersionUpdater, formatter);
+        branchService = new BranchService(gitService, pomVersionUpdater, formatter,
+                new PatchVersionResolver(pomVersionUpdater,
+                        new MavenRepositoryClient(new LightspeedProperties(), new RestTemplate())));
         ReflectionTestUtils.setField(branchService, "integrationBranch", INTEGRATION_BRANCH);
         ReflectionTestUtils.setField(branchService, "dryMode", false);
         ReflectionTestUtils.setField(branchService, "defaultBuildService", BuildServiceType.LOCAL);
         ReflectionTestUtils.setField(branchService, "versionMismatchMode", "fail");
+        ReflectionTestUtils.setField(branchService, "buildMode", BuildMode.SNAPSHOT);
 
         mavenParser = new MavenParserImpl();
         ReflectionTestUtils.setField(mavenParser, "declaredModulesOnly", false);
@@ -524,7 +528,7 @@ class MultiBuildFunctionalTest {
                 new DummyBuildService(), mavenClient);
         ReflectionTestUtils.setField(releaseService, "dryMode", true);
 
-        releaseService.execute(layers, moduleMap, repoRoots, repoConfigs, resumeState);
+        releaseService.execute(layers, moduleMap, repoRoots, List.of(), repoConfigs, resumeState);
 
         assertThat(pomVersionUpdater.getRootVersion(workA)).isEqualTo("1.0.1-SNAPSHOT");
         assertThat(pomVersionUpdater.getRootVersion(workB)).isEqualTo("2.0.1-SNAPSHOT");
@@ -534,6 +538,70 @@ class MultiBuildFunctionalTest {
                 .contains("<artifactId>lib-a</artifactId>")
                 .contains("<version>1.0.0</version>");
         assertThat(pomB).doesNotContain("1.0.1-SNAPSHOT");
+    }
+
+    @Test
+    void release_buildTarget_pinsDependencyOnOutOfScopeRepoToReleasedVersion() throws Exception {
+        // Only service-b is released; lib-a is outside the build target but was released
+        // earlier in this flow as 0.9.0 (recorded in the resume state).
+        // service-b's dep on lib-a must be pinned to 0.9.0, not left at 1.0.0-SNAPSHOT.
+        Path workA = cloneFixture("repo-a");
+        Path workB = cloneFixture("repo-b");
+
+        List<RepositoryProject> projects = projectAggregator.aggregate(List.of(workA, workB));
+        Map<Artifact, Module> moduleMap = projects.stream()
+                .flatMap(p -> p.getModules().stream())
+                .collect(Collectors.toMap(Module::getArtifact, m -> m));
+        Map<Path, RepoConfig> repoConfigs = Map.of(workA, new RepoConfig(), workB, new RepoConfig());
+
+        ResumeState resumeState = new ResumeState();
+        resumeState.initRepos(projectAggregator.buildGraph(projects).topologicalLayers(), repoConfigs);
+        resumeState.markCompleted(workA, "0.9.0");
+
+        ReleaseService releaseService = new ReleaseService(
+                pomVersionUpdater, dependencyVersionUpdater, gitService, new DummyBuildService(),
+                new MavenRepositoryClient(new LightspeedProperties(), new RestTemplate()));
+        ReflectionTestUtils.setField(releaseService, "dryMode", true);
+
+        releaseService.execute(List.of(List.of(workB)), moduleMap, List.of(workB), List.of(workA),
+                repoConfigs, resumeState);
+
+        assertThat(pomVersionUpdater.getRootVersion(workA)).isEqualTo("1.0.0-SNAPSHOT");
+        assertThat(pomVersionUpdater.getRootVersion(workB)).isEqualTo("2.0.1-SNAPSHOT");
+        assertThat(Files.readString(workB.resolve("pom.xml")))
+                .contains("<version>0.9.0</version>")
+                .doesNotContain("1.0.0-SNAPSHOT");
+    }
+
+    @Test
+    void release_buildTarget_failsWhenOutOfScopeDependencyHasNoRelease() throws Exception {
+        Path workA = cloneFixture("repo-a");
+        Path workB = cloneFixture("repo-b");
+
+        List<RepositoryProject> projects = projectAggregator.aggregate(List.of(workA, workB));
+        Map<Artifact, Module> moduleMap = projects.stream()
+                .flatMap(p -> p.getModules().stream())
+                .collect(Collectors.toMap(Module::getArtifact, m -> m));
+        Map<Path, RepoConfig> repoConfigs = Map.of(workA, new RepoConfig(), workB, new RepoConfig());
+        ResumeState resumeState = new ResumeState();
+        resumeState.initRepos(projectAggregator.buildGraph(projects).topologicalLayers(), repoConfigs);
+
+        ReleaseService releaseService = new ReleaseService(
+                pomVersionUpdater, dependencyVersionUpdater, gitService, new DummyBuildService(),
+                new MavenRepositoryClient(new LightspeedProperties(), new RestTemplate()));
+        ReflectionTestUtils.setField(releaseService, "dryMode", true);
+
+        assertThatThrownBy(() -> releaseService.execute(List.of(List.of(workB)), moduleMap,
+                List.of(workB), List.of(workA), repoConfigs, resumeState))
+                .hasMessageContaining("no known release: repo-a");
+        assertThat(pomVersionUpdater.getRootVersion(workB)).isEqualTo("2.0.0-SNAPSHOT");
+    }
+
+    @Test
+    void compareVersions_numericSegments() {
+        assertThat(ReleaseService.compareVersions("1.1.0.2", "1.1.1")).isNegative();
+        assertThat(ReleaseService.compareVersions("1.10.0", "1.9.0")).isPositive();
+        assertThat(ReleaseService.compareVersions("1.1", "1.1.0")).isZero();
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
