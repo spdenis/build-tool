@@ -28,8 +28,9 @@ public class DependencyGraph<T> {
     // each other and can be processed simultaneously. Layers are ordered so that each
     // layer's dependencies are fully covered by earlier layers.
     public List<List<T>> topologicalLayers() {
-        Map<T, Integer> inDegree = new HashMap<>();
-        Map<T, List<T>> reversedAdj = new HashMap<>();
+        // Linked maps keep the order stable: nodes in a layer follow insertion order.
+        Map<T, Integer> inDegree = new LinkedHashMap<>();
+        Map<T, List<T>> reversedAdj = new LinkedHashMap<>();
 
         for (Map.Entry<T, List<T>> entry : adjacencyList.entrySet()) {
             T node = entry.getKey();
@@ -111,6 +112,56 @@ public class DependencyGraph<T> {
 
         stack.pop();
         return null;
+    }
+
+    // Returns the dependency edges as a map of node → nodes that depend on it directly.
+    public Map<T, List<T>> getDependentsList() {
+        Map<T, List<T>> dependents = new LinkedHashMap<>();
+        for (T node : adjacencyList.keySet()) {
+            dependents.put(node, new ArrayList<>());
+        }
+        for (Map.Entry<T, List<T>> entry : adjacencyList.entrySet()) {
+            for (T dep : entry.getValue()) {
+                dependents.get(dep).add(entry.getKey());
+            }
+        }
+        return dependents;
+    }
+
+    public int edgeCount() {
+        return adjacencyList.values().stream().mapToInt(List::size).sum();
+    }
+
+    // Returns the subgraph made of the given nodes and the edges between them.
+    // Nodes not in this graph are ignored; node order follows this graph.
+    public DependencyGraph<T> subgraph(Collection<T> nodes) {
+        Set<T> keep = new HashSet<>(nodes);
+        DependencyGraph<T> sub = new DependencyGraph<>();
+        for (Map.Entry<T, List<T>> entry : adjacencyList.entrySet()) {
+            if (!keep.contains(entry.getKey())) continue;
+            sub.addNode(entry.getKey());
+        }
+        for (Map.Entry<T, List<T>> entry : adjacencyList.entrySet()) {
+            if (!keep.contains(entry.getKey())) continue;
+            for (T dep : entry.getValue()) {
+                if (keep.contains(dep)) sub.addEdge(entry.getKey(), dep);
+            }
+        }
+        return sub;
+    }
+
+    // Maps every node with the given function, e.g. repo paths to repo names.
+    public <R> DependencyGraph<R> map(java.util.function.Function<T, R> mapper) {
+        DependencyGraph<R> mapped = new DependencyGraph<>();
+        for (T node : adjacencyList.keySet()) {
+            mapped.addNode(mapper.apply(node));
+        }
+        for (Map.Entry<T, List<T>> entry : adjacencyList.entrySet()) {
+            for (T dep : entry.getValue()) {
+                mapped.addEdge(mapper.apply(entry.getKey()), mapper.apply(dep));
+            }
+        }
+        return mapped;
     }
 
     public List<T> topologicalSort() {

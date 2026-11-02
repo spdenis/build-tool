@@ -23,3 +23,9 @@
 hs_err_pid*
 replay_pid*
 user.properties
+
+# Maven build output
+/target/
+
+# IntelliJ IDEA project files
+/.idea/

@@ -3,7 +3,10 @@ package com.example.multibuild.app;
 import com.example.multibuild.build.BuildService;
 import com.example.multibuild.git.GitHubService;
 import com.example.multibuild.git.GitService;
+import com.example.multibuild.graph.AnalyzeScope;
 import com.example.multibuild.graph.DependencyGraph;
+import com.example.multibuild.graph.GraphFormat;
+import com.example.multibuild.graph.GraphReport;
 import com.example.multibuild.maven.PomVersionUpdater;
 import com.example.multibuild.model.*;
 import com.example.multibuild.model.Module;
@@ -20,6 +23,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.ComponentScan;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -77,6 +81,24 @@ public class Main implements CommandLineRunner {
     @Value("${build.pause-after:}")
     private String pauseAfterRepo;
 
+    // analyze command: blank target = whole graph; otherwise the subgraph around the target.
+    @Value("${analyze.target:}")
+    private String analyzeTarget;
+
+    @Value("${analyze.scope:downstream}")
+    private String analyzeScope;
+
+    @Value("${analyze.format:ascii}")
+    private String analyzeFormat;
+
+    // File to write the result to; blank = stdout.
+    @Value("${analyze.output:}")
+    private String analyzeOutput;
+
+    // Branch to analyze in every repo; blank = each repo's source branch.
+    @Value("${analyze.branch:}")
+    private String analyzeBranch;
+
     private final GitService gitService;
     private final BranchService branchService;
     private final PomVersionUpdater pomVersionUpdater;
@@ -129,6 +151,7 @@ public class Main implements CommandLineRunner {
             case "release-init"    -> runReleaseInit(args[1]);
             case "create-prs"      -> runCreatePrs(args[1]);
             case "update-snapshot" -> runUpdateSnapshot(args[1]);
+            case "analyze"         -> runAnalyze(args[1]);
             default -> {
                 System.err.println("[ERROR] Unknown command: " + args[0]);
                 printUsage();
@@ -451,11 +474,76 @@ public class Main implements CommandLineRunner {
         }
     }
 
+    // Prints the component dependency graph and build order. Never creates branches,
+    // commits or pushes: repos are cloned (or reused) and checked out on their source branch.
+    private void runAnalyze(String reposFile) throws Exception {
+        AnalyzeScope scope;
+        GraphFormat format;
+        try {
+            scope = AnalyzeScope.parse(analyzeScope);
+            format = GraphFormat.parse(analyzeFormat);
+        } catch (IllegalArgumentException e) {
+            System.err.println("[ERROR] " + e.getMessage());
+            System.exit(1);
+            return;
+        }
+
+        List<RepoConfig> repoEntries = loadRepos(reposFile);
+        Path workDir = Paths.get(cloneDir);
+        Files.createDirectories(workDir);
+
+        log.info("── Analyze: {} repo(s)  target={}  scope={}  format={} ──", repoEntries.size(),
+                analyzeTarget.isBlank() ? "(all)" : analyzeTarget, scope, format);
+        CloneResult cloned = skipGit
+                ? useLocalRepos(repoEntries, workDir)
+                : cloneRepos(repoEntries, workDir, (repoDir, entry) -> {
+                    String branch = analyzeBranch.isBlank()
+                            ? resolveSourceBranch(repoDir, entry.getEffectiveSourceBranch(defaultSourceBranch))
+                            : analyzeBranch;
+                    gitService.checkoutOrCreateBranch(repoDir, branch, branch);
+                    gitService.pull(repoDir);
+                });
+
+        List<RepositoryProject> projects = aggregator.aggregate(cloned.paths());
+        DependencyGraph<String> graph = aggregator.buildGraph(projects).map(p -> p.getFileName().toString());
+
+        GraphReport report;
+        try {
+            report = analyzeTarget.isBlank()
+                    ? GraphReport.full(graph)
+                    : GraphReport.around(graph, analyzeTarget, scope);
+        } catch (IllegalArgumentException e) {
+            System.err.println("[ERROR] " + e.getMessage());
+            System.exit(1);
+            return;
+        }
+
+        String rendered = format.renderer().render(report);
+        if (analyzeOutput.isBlank()) {
+            System.out.println();
+            System.out.print(rendered);
+        } else {
+            Path out = Paths.get(analyzeOutput);
+            if (out.toAbsolutePath().getParent() != null) {
+                Files.createDirectories(out.toAbsolutePath().getParent());
+            }
+            Files.writeString(out, rendered, StandardCharsets.UTF_8);
+            log.info("══ Analysis written to {} ══", out.toAbsolutePath());
+        }
+        if (report.hasCycle()) {
+            System.err.println("[ERROR] " + report.cycleError());
+            System.exit(1);
+        }
+    }
+
     private static void printUsage() {
         System.err.println("Usage: java -jar multibuild.jar build           repos.json");
         System.err.println("       java -jar multibuild.jar release-init    repos.json");
         System.err.println("       java -jar multibuild.jar create-prs      repos.json");
         System.err.println("       java -jar multibuild.jar update-snapshot repos.json");
+        System.err.println("       java -jar multibuild.jar analyze         repos.json"
+                + "  [--analyze.target=<repo>] [--analyze.scope=downstream|upstream|both]"
+                + " [--analyze.format=ascii|plantuml] [--analyze.output=<file>]");
     }
 
     private record CloneResult(List<Path> paths, Map<Path, RepoConfig> configByPath) {}
@@ -477,6 +565,17 @@ public class Main implements CommandLineRunner {
     }
 
     private CloneResult cloneAndBranch(List<RepoConfig> repoEntries, Path workDir) {
+        return cloneRepos(repoEntries, workDir, (cloned, entry) -> {
+            branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry);
+            if (entry.hasVersionOverride()) {
+                applyVersionOverride(cloned, entry.getVersion(), entry);
+            }
+        });
+    }
+
+    // Clones all repos in parallel and runs afterClone on each one.
+    private CloneResult cloneRepos(List<RepoConfig> repoEntries, Path workDir,
+                                   BiConsumer<Path, RepoConfig> afterClone) {
         int total = repoEntries.size();
         // Pre-sized array keeps insertion order without synchronization (each index written by one thread)
         Path[] clonedArray = new Path[total];
@@ -493,10 +592,7 @@ public class Main implements CommandLineRunner {
                     log.info("  Cloning {}", repoName);
                     try {
                         Path cloned = gitService.cloneRepo(cloneUrl, workDir.resolve(repoName));
-                        branchService.apply(cloned, resolveSourceBranch(cloned, entry.getEffectiveSourceBranch(defaultSourceBranch)), entry);
-                        if (entry.hasVersionOverride()) {
-                            applyVersionOverride(cloned, entry.getVersion(), entry);
-                        }
+                        afterClone.accept(cloned, entry);
                         clonedArray[idx] = cloned;
                         log.info("  Done: {}", repoName);
                     } catch (RuntimeException e) {
