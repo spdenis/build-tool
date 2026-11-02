@@ -83,7 +83,7 @@ class GraphReportTest {
         assertThat(report.hasCycle()).isTrue();
         assertThat(report.cycleError()).contains("Cycle detected");
         assertThat(new AsciiGraphRenderer().render(report)).contains("Build order: not available");
-        assertThat(new PlantUmlGraphRenderer().render(report)).contains("c1 --> c2", "c2 --> c1");
+        assertThat(new PlantUmlGraphRenderer().render(report)).contains("c2 <-- c1", "c1 <-- c2");
     }
 
     @Test
@@ -107,7 +107,8 @@ class GraphReportTest {
                 .startsWith("@startuml\n")
                 .endsWith("@enduml\n")
                 .contains("package \"Layer 1\" {\n  component \"util\" as c1 #LightSkyBlue\n}")
-                .contains("c2 --> c1")
+                .contains("c1 <-- c2")
+                .contains("c1 -[hidden]down-> c2")
                 .contains("  1. util\n  2. service\n  3. app\n");
     }
 
