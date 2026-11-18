@@ -249,13 +249,13 @@ public class NativeGitService implements GitService {
 
     @Override
     public void commitAll(Path repoDir, String message) {
-        exec(repoDir, "git", "add", ".");
+        exec(repoDir, "git", "add", "-A");
         exec(repoDir, "git", "commit", "-m", message);
     }
 
     @Override
     public boolean commitAllIfDirty(Path repoDir, String message) {
-        exec(repoDir, "git", "add", ".");
+        exec(repoDir, "git", "add", "-A");
         String staged = exec(repoDir, "git", "status", "--porcelain");
         if (staged.isBlank()) return false;
         exec(repoDir, "git", "commit", "-m", message);

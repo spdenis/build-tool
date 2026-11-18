@@ -1,9 +1,6 @@
 package com.example.multibuild.maven;
 
-import com.example.multibuild.model.RepositoryProject;
+import com.example.multibuild.buildsystem.ProjectParser;
 
-import java.nio.file.Path;
-
-public interface MavenParser {
-    RepositoryProject parse(Path repoDir);
+public interface MavenParser extends ProjectParser {
 }

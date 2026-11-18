@@ -1,6 +1,8 @@
 package com.example.multibuild.build;
 
+import com.example.multibuild.buildsystem.BuildSystem;
 import com.example.multibuild.git.GitService;
+import com.example.multibuild.gradle.GradleProperties;
 import com.example.multibuild.maven.XmlUtils;
 import com.example.multibuild.model.Artifact;
 import com.example.multibuild.model.BuildMode;
@@ -134,7 +136,7 @@ public class LightspeedBuildService implements BuildService {
             return;
         }
 
-        boolean hasPom = Files.exists(repoRoot.resolve("pom.xml"));
+        boolean hasPom = BuildSystem.hasBuildFile(repoRoot);
 
         if (release) {
             String releaseVersion = buildBranchByRepo.get(repoRoot);
@@ -145,7 +147,7 @@ public class LightspeedBuildService implements BuildService {
 
             List<Artifact> releaseArtifacts;
             if (!hasPom) {
-                // No pom.xml — release triggered by tag push in ReleaseService.
+                // No pom.xml / Gradle build — release triggered by tag push in ReleaseService.
                 // Poll for any explicitly declared artifacts in the repo config.
                 List<String> coords = repoConfig != null ? repoConfig.getReleaseArtifacts() : List.of();
                 if (coords.isEmpty()) {
@@ -173,8 +175,8 @@ public class LightspeedBuildService implements BuildService {
             pollUntilReleasePublished(repoRoot, releaseArtifacts);
         } else {
             if (!hasPom) {
-                // No pom.xml — trigger via Jenkinsfile commit; no Maven artifacts to poll (fire-and-forget)
-                log.info("  [LS] No pom.xml in {} — triggering via Jenkinsfile", repoRoot.getFileName());
+                // No build file — trigger via Jenkinsfile commit; no Maven artifacts to poll (fire-and-forget)
+                log.info("  [LS] No pom.xml or Gradle build in {} — triggering via Jenkinsfile", repoRoot.getFileName());
                 injectJenkinsfileAndPush(repoRoot);
                 return;
             }
@@ -228,16 +230,16 @@ public class LightspeedBuildService implements BuildService {
                 .toList();
     }
 
+    // The trigger commit changes a build property so CI always sees a new commit: a <properties> entry
+    // in the root pom.xml, or an entry in the root gradle.properties for Gradle builds.
     private void injectTriggerAndPush(Path repoRoot) {
-        Path pomPath = repoRoot.resolve("pom.xml");
-        if (!Files.exists(pomPath)) {
-            log.warn("No root pom.xml in {}, skipping trigger injection", repoRoot.getFileName());
-            return;
-        }
         try {
-            injectTimestamp(pomPath);
+            if (!injectTrigger(repoRoot, Instant.now().toString())) {
+                log.warn("No root pom.xml or Gradle build in {}, skipping trigger injection", repoRoot.getFileName());
+                return;
+            }
         } catch (Exception e) {
-            log.warn("Could not inject build trigger into {}", pomPath, e);
+            log.warn("Could not inject build trigger into {}", repoRoot.getFileName(), e);
         }
         gitService.commitAllIfDirty(repoRoot, commitFormatter.format("chore: trigger ci build"));
         gitService.push(repoRoot);
@@ -300,12 +302,27 @@ public class LightspeedBuildService implements BuildService {
 
     // --- Timestamp injection ---
 
-    private void injectTimestamp(Path pomPath) throws Exception {
+    // Writes the trigger timestamp into the repo's build. Returns false when the repo has no build file.
+    static boolean injectTrigger(Path repoRoot, String timestamp) throws Exception {
+        switch (BuildSystem.detect(repoRoot)) {
+            case GRADLE -> {
+                GradleProperties.set(repoRoot.resolve(GradleProperties.FILE_NAME), TRIGGER_PROP, timestamp);
+                return true;
+            }
+            case MAVEN -> {
+                injectTimestamp(repoRoot.resolve("pom.xml"), timestamp);
+                return true;
+            }
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    private static void injectTimestamp(Path pomPath, String timestamp) throws Exception {
         String originalXml = Files.readString(pomPath, StandardCharsets.UTF_8);
         Document doc = XmlUtils.parseXml(originalXml);
         XPath xp = XPathFactory.newInstance().newXPath();
-
-        String timestamp = Instant.now().toString();
 
         Node props = XmlUtils.node(xp, "/project/properties", doc);
         if (props == null) {

@@ -1,7 +1,8 @@
 package com.example.multibuild.service;
 
 import com.example.multibuild.git.GitService;
-import com.example.multibuild.maven.PomVersionUpdater;
+import com.example.multibuild.buildsystem.BuildSystem;
+import com.example.multibuild.buildsystem.VersionUpdater;
 import com.example.multibuild.model.BuildMode;
 import com.example.multibuild.model.BuildServiceType;
 import com.example.multibuild.model.RepoConfig;
@@ -10,7 +11,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -39,11 +39,11 @@ public class BranchService {
     private String versionMismatchMode;
 
     private final GitService gitService;
-    private final PomVersionUpdater versionUpdater;
+    private final VersionUpdater versionUpdater;
     private final CommitMessageFormatter commitFormatter;
     private final PatchVersionResolver patchVersionResolver;
 
-    public BranchService(GitService gitService, PomVersionUpdater versionUpdater,
+    public BranchService(GitService gitService, VersionUpdater versionUpdater,
                          CommitMessageFormatter commitFormatter, PatchVersionResolver patchVersionResolver) {
         this.gitService = gitService;
         this.versionUpdater = versionUpdater;
@@ -55,7 +55,7 @@ public class BranchService {
         return integrationBranch;
     }
 
-    // Enforces correct pom versions for all repos on the integration branch.
+    // Enforces correct project versions (pom.xml or Gradle) for all repos on the integration branch.
     // Lightspeed repos must have bare -SNAPSHOT (e.g. 1.0.1-SNAPSHOT) because the
     // CI pipeline appends the branch name itself; all others must end with -<branch>-SNAPSHOT.
     // In patch mode the version must additionally be a patch version (e.g. 1.1.0.1-...).
@@ -71,8 +71,8 @@ public class BranchService {
                 log.info("Skipping version validation for {} (preserveVersion=true)", repoDir.getFileName());
                 continue;
             }
-            if (!Files.exists(repoDir.resolve("pom.xml"))) {
-                log.info("Skipping version validation for {} (no pom.xml)", repoDir.getFileName());
+            if (!BuildSystem.hasBuildFile(repoDir)) {
+                log.info("Skipping version validation for {} (no pom.xml or Gradle build)", repoDir.getFileName());
                 continue;
             }
 
@@ -144,8 +144,8 @@ public class BranchService {
                 } else {
                     gitService.push(repoDir);
                 }
-            } else if (!Files.exists(repoDir.resolve("pom.xml"))) {
-                log.info("Created branch {} in {}, no pom.xml — skipping version update",
+            } else if (!BuildSystem.hasBuildFile(repoDir)) {
+                log.info("Created branch {} in {}, no pom.xml or Gradle build — skipping version update",
                         integrationBranch, repoDir.getFileName());
                 if (isDryRun(dryMode, repoConfig)) {
                     log.info("Dry mode — skipping push for {}", repoDir.getFileName());
@@ -153,7 +153,8 @@ public class BranchService {
                     gitService.push(repoDir);
                 }
             } else {
-                log.info("Created branch {} in {}, updating pom versions", integrationBranch, repoDir.getFileName());
+                log.info("Created branch {} in {}, updating {} versions", integrationBranch, repoDir.getFileName(),
+                        BuildSystem.detect(repoDir).name().toLowerCase());
                 String newVersion = updateBranchVersions(repoDir, repoConfig);
                 boolean committed = gitService.commitAllIfDirty(repoDir,
                         commitFormatter.format("chore: set version to " + newVersion));
@@ -181,7 +182,7 @@ public class BranchService {
         }
     }
 
-    // Rewrites all pom versions for the integration branch according to build.mode and build service.
+    // Rewrites all project versions for the integration branch according to build.mode and build service.
     // Returns the new version.
     private String updateBranchVersions(Path repoDir, RepoConfig config) {
         boolean lightspeed = isLightspeed(config);

@@ -1,5 +1,6 @@
 package com.example.multibuild.maven;
 
+import com.example.multibuild.buildsystem.DependencyUpdater;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -18,7 +19,7 @@ import java.util.*;
 import java.util.stream.Stream;
 
 @Component
-public class DependencyVersionUpdater {
+public class DependencyVersionUpdater implements DependencyUpdater {
 
     private static final Logger log = LoggerFactory.getLogger(DependencyVersionUpdater.class);
 
@@ -29,6 +30,7 @@ public class DependencyVersionUpdater {
     // Dependency versions specified via property placeholders (${prop}) are resolved through
     // <properties> — including when the property is defined in a parent pom within the same repo.
     // Parent versions are always inline — placeholders are not supported there.
+    @Override
     public Set<Path> update(List<Path> repoRoots, Map<String, String> versionByKey) {
         Set<Path> modifiedRepos = new LinkedHashSet<>();
         for (Path repoRoot : repoRoots) {

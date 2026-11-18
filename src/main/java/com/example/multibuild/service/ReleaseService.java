@@ -4,8 +4,9 @@ import com.example.multibuild.build.BuildFailedException;
 import com.example.multibuild.build.BuildService;
 import com.example.multibuild.build.MavenRepositoryClient;
 import com.example.multibuild.git.GitService;
-import com.example.multibuild.maven.DependencyVersionUpdater;
-import com.example.multibuild.maven.PomVersionUpdater;
+import com.example.multibuild.buildsystem.BuildSystem;
+import com.example.multibuild.buildsystem.DependencyUpdater;
+import com.example.multibuild.buildsystem.VersionUpdater;
 import com.example.multibuild.model.Artifact;
 import com.example.multibuild.model.BuildServiceType;
 import com.example.multibuild.model.Module;
@@ -16,7 +17,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.function.BiConsumer;
@@ -33,14 +33,14 @@ public class ReleaseService {
     @Value("${build.service:LOCAL}")
     private BuildServiceType defaultBuildService;
 
-    private final PomVersionUpdater pomVersionUpdater;
-    private final DependencyVersionUpdater dependencyVersionUpdater;
+    private final VersionUpdater pomVersionUpdater;
+    private final DependencyUpdater dependencyVersionUpdater;
     private final GitService gitService;
     private final BuildService buildService;
     private final MavenRepositoryClient mavenClient;
 
-    public ReleaseService(PomVersionUpdater pomVersionUpdater,
-                          DependencyVersionUpdater dependencyVersionUpdater,
+    public ReleaseService(VersionUpdater pomVersionUpdater,
+                          DependencyUpdater dependencyVersionUpdater,
                           GitService gitService,
                           BuildService buildService,
                           MavenRepositoryClient mavenClient) {
@@ -71,10 +71,10 @@ public class ReleaseService {
                 if (config != null && config.hasVersionOverride()) {
                     String release = config.getVersion();
                     releaseVersionByRepo.put(repoRoot, release);
-                    log.info("  [{}] No pom.xml — using version override {} as release version",
+                    log.info("  [{}] No build file — using version override {} as release version",
                             repoRoot.getFileName(), release);
                 } else {
-                    log.warn("  [{}] No pom.xml and no version override — skipping release", repoRoot.getFileName());
+                    log.warn("  [{}] No build file and no version override — skipping release", repoRoot.getFileName());
                 }
                 continue;
             }
@@ -99,7 +99,7 @@ public class ReleaseService {
         }
 
         if (!resumeState.isReleasePhase1Complete()) {
-            log.info("  Setting release versions in pom.xml files...");
+            log.info("  Setting release versions in build files...");
             for (Path repoRoot : repoRoots) {
                 String release = releaseVersionByRepo.get(repoRoot);
                 if (release == null) continue;
@@ -114,16 +114,16 @@ public class ReleaseService {
                 if (release == null) continue;
                 String tagName = release;
                 gitService.deleteTagIfExists(repoRoot, tagName);
-                if (Files.exists(repoRoot.resolve("pom.xml"))) {
+                if (BuildSystem.hasBuildFile(repoRoot)) {
                     boolean committed = gitService.commitAllIfDirty(repoRoot, "chore: release " + release);
                     if (committed) {
                         log.info("  [{}] Committed release version, tagging {}", repoRoot.getFileName(), tagName);
                     } else {
-                        log.info("  [{}] Nothing to commit (pom already at release version), tagging {} on HEAD",
+                        log.info("  [{}] Nothing to commit (already at release version), tagging {} on HEAD",
                                 repoRoot.getFileName(), tagName);
                     }
                 } else {
-                    log.info("  [{}] No pom.xml — tagging {} directly on HEAD", repoRoot.getFileName(), tagName);
+                    log.info("  [{}] No build file — tagging {} directly on HEAD", repoRoot.getFileName(), tagName);
                 }
                 // Tag is created locally here but pushed in Phase 2, just before each layer's
                 // build is triggered. Pushing all tags upfront would cause Jenkins to start
@@ -139,7 +139,7 @@ public class ReleaseService {
             resumeState.setReleasePhase1Complete(true);
             log.info("── Release Phase 1 complete in {} ──────────────────────", elapsed(phase1Start));
         } else {
-            log.info("  Skipping — already completed in a previous run, re-deriving versions from pom files");
+            log.info("  Skipping — already completed in a previous run, re-deriving versions from build files");
             // For repos already built in Phase 2, use the exact version recorded in the state
             // file. Reading from the pom would give the next-snapshot version (e.g. 1.0.1-SNAPSHOT
             // after a 1.0.0 release build), and baseVersion() would yield 1.0.1 instead of 1.0.0.
@@ -162,7 +162,7 @@ public class ReleaseService {
                     RepoConfig config = repoConfigs.get(repoRoot);
                     if (config != null && config.hasVersionOverride()) {
                         releaseVersionByRepo.put(repoRoot, config.getVersion());
-                        log.info("  [{}] No pom.xml — using version override {} on resume",
+                        log.info("  [{}] No build file — using version override {} on resume",
                                 repoRoot.getFileName(), config.getVersion());
                     }
                 }
@@ -192,7 +192,7 @@ public class ReleaseService {
                 if (resumeState.isCompleted(r) || tagByRepo.containsKey(r)) {
                     layerRepos.add(r);
                 } else {
-                    log.warn("  [{}] Skipping in release build — no pom.xml and no 'version' in repos.json",
+                    log.warn("  [{}] Skipping in release build — no build file and no 'version' in repos.json",
                             r.getFileName());
                 }
             }
@@ -269,8 +269,8 @@ public class ReleaseService {
             for (Path repoRoot : newlyBuilt) {
                 String release = releaseVersionByRepo.get(repoRoot);
                 if (release == null) continue;
-                if (!Files.exists(repoRoot.resolve("pom.xml"))) {
-                    log.info("  [{}] No pom.xml — skipping version bump", repoRoot.getFileName());
+                if (!BuildSystem.hasBuildFile(repoRoot)) {
+                    log.info("  [{}] No build file — skipping version bump", repoRoot.getFileName());
                     resumeState.markCompleted(repoRoot, release);
                     continue;
                 }
@@ -380,7 +380,7 @@ public class ReleaseService {
             }
 
             List<Artifact> toCheck;
-            if (Files.exists(repoRoot.resolve("pom.xml"))) {
+            if (BuildSystem.hasBuildFile(repoRoot)) {
                 toCheck = artifactsByRepo.getOrDefault(repoRoot, List.of()).stream()
                         .map(a -> new Artifact(a.getGroupId(), a.getArtifactId(), releaseVersion))
                         .toList();
@@ -408,7 +408,7 @@ public class ReleaseService {
             throw new RuntimeException(
                     "Release build aborted — the following versions already exist in the Maven repository:\n" +
                     String.join("\n", conflicts) + "\n" +
-                    "Update the pom.xml versions before starting a release build.");
+                    "Update the project versions before starting a release build.");
         }
 
         log.info("  Pre-flight: all planned versions are available — proceeding");

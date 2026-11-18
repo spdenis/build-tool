@@ -1,5 +1,6 @@
 package com.example.multibuild.build;
 
+import com.example.multibuild.buildsystem.BuildSystem;
 import com.example.multibuild.model.Artifact;
 import com.example.multibuild.model.Module;
 import com.example.multibuild.model.RepoConfig;
@@ -10,6 +11,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
@@ -19,12 +21,23 @@ import java.util.stream.Collectors;
 
 @Service
 @Qualifier("local")
-public class LocalMavenBuildService implements BuildService {
+// Builds repos on this machine: `mvn <build.maven.goals>` for Maven repos, and
+// `<gradle> <build.gradle.tasks>` for Gradle repos, where <gradle> is the repo's wrapper (./gradlew)
+// when present, else build.gradle.command (default: `gradle` from PATH). The default Gradle tasks
+// publish to the local Maven repository, so downstream repos — Maven or Gradle — resolve the
+// freshly built artifacts exactly as after `mvn install`.
+public class LocalBuildService implements BuildService {
 
-    private static final Logger log = LoggerFactory.getLogger(LocalMavenBuildService.class);
+    private static final Logger log = LoggerFactory.getLogger(LocalBuildService.class);
 
     @Value("${build.maven.goals:clean install}")
     private String goals;
+
+    @Value("${build.gradle.tasks:clean build publishToMavenLocal}")
+    private String gradleTasks;
+
+    @Value("${build.gradle.command:}")
+    private String gradleCommand;
 
     @Override
     public void buildAll(List<List<Path>> layers, Map<Artifact, Module> moduleMap,
@@ -101,22 +114,40 @@ public class LocalMavenBuildService implements BuildService {
 
     private void buildRepo(Path repoRoot) {
         log.info("  [LOCAL] Building {}", repoRoot.getFileName());
+        List<String> cmd = command(repoRoot);
+        String tool = BuildSystem.detect(repoRoot) == BuildSystem.GRADLE ? "Gradle" : "Maven";
         try {
-            runMaven(repoRoot);
+            run(repoRoot, cmd, tool);
         } catch (RuntimeException e) {
             throw new RuntimeException(
                     "Build failed in repository: " + repoRoot + "\n" +
-                    "  Goals  : " + goals + "\n" +
+                    "  Command: " + String.join(" ", cmd) + "\n" +
                     "  Reason : " + e.getMessage(), e);
         }
     }
 
-    private void runMaven(Path repoRoot) {
+    // Command line used to build the repo.
+    List<String> command(Path repoRoot) {
         boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
         List<String> cmd = new ArrayList<>();
-        cmd.add(isWindows ? "mvn.cmd" : "mvn");
-        cmd.addAll(Arrays.asList(goals.split("\\s+")));
+        if (BuildSystem.detect(repoRoot) == BuildSystem.GRADLE) {
+            Path wrapper = repoRoot.resolve(isWindows ? "gradlew.bat" : "gradlew");
+            if (Files.isRegularFile(wrapper)) {
+                cmd.add(wrapper.toAbsolutePath().toString());
+            } else if (gradleCommand != null && !gradleCommand.isBlank()) {
+                cmd.add(gradleCommand.trim());
+            } else {
+                cmd.add(isWindows ? "gradle.bat" : "gradle");
+            }
+            cmd.addAll(Arrays.asList(gradleTasks.trim().split("\\s+")));
+        } else {
+            cmd.add(isWindows ? "mvn.cmd" : "mvn");
+            cmd.addAll(Arrays.asList(goals.trim().split("\\s+")));
+        }
+        return cmd;
+    }
 
+    private void run(Path repoRoot, List<String> cmd, String tool) {
         try {
             int exitCode = new ProcessBuilder(cmd)
                     .directory(repoRoot.toFile())
@@ -125,10 +156,13 @@ public class LocalMavenBuildService implements BuildService {
                     .waitFor();
             if (exitCode != 0) {
                 throw new RuntimeException(
-                        "Maven build failed in " + repoRoot.getFileName() + " (exit code " + exitCode + ")");
+                        tool + " build failed in " + repoRoot.getFileName() + " (exit code " + exitCode + ")");
             }
-        } catch (IOException | InterruptedException e) {
-            throw new RuntimeException("Failed to run Maven in " + repoRoot.getFileName(), e);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to run " + tool + " in " + repoRoot.getFileName(), e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Interrupted while running " + tool + " in " + repoRoot.getFileName(), e);
         }
     }
 }

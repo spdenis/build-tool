@@ -1,7 +1,7 @@
 package com.example.multibuild.service;
 
 import com.example.multibuild.build.MavenRepositoryClient;
-import com.example.multibuild.maven.PomVersionUpdater;
+import com.example.multibuild.buildsystem.VersionUpdater;
 import com.example.multibuild.model.Artifact;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,16 +22,16 @@ public class PatchVersionResolver {
     private static final int PATCH_SEGMENTS = 4;
     private static final int MAX_PATCH_NUMBER = 999;
 
-    private final PomVersionUpdater pomVersionUpdater;
+    private final VersionUpdater pomVersionUpdater;
     private final MavenRepositoryClient mavenClient;
 
-    public PatchVersionResolver(PomVersionUpdater pomVersionUpdater, MavenRepositoryClient mavenClient) {
+    public PatchVersionResolver(VersionUpdater pomVersionUpdater, MavenRepositoryClient mavenClient) {
         this.pomVersionUpdater = pomVersionUpdater;
         this.mavenClient = mavenClient;
     }
 
     // Returns the patch base version (no qualifier) for the project in repoDir, e.g. "1.1.0.2".
-    // If the pom already carries a patch version, its base is kept as is.
+    // If the project already carries a patch version, its base is kept as is.
     public String resolve(Path repoDir) {
         Artifact root = pomVersionUpdater.getRootArtifact(repoDir);
         if (root == null) {

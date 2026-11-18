@@ -1,7 +1,7 @@
 package com.example.multibuild.service;
 
 import com.example.multibuild.git.GitService;
-import com.example.multibuild.maven.DependencyVersionUpdater;
+import com.example.multibuild.buildsystem.DependencyUpdater;
 import com.example.multibuild.model.Artifact;
 import com.example.multibuild.model.BuildServiceType;
 import com.example.multibuild.model.Module;
@@ -31,11 +31,11 @@ public class DependencyVersionService {
     @Value("${build.service:LOCAL}")
     private BuildServiceType defaultBuildService;
 
-    private final DependencyVersionUpdater updater;
+    private final DependencyUpdater updater;
     private final GitService gitService;
     private final CommitMessageFormatter commitFormatter;
 
-    public DependencyVersionService(DependencyVersionUpdater updater, GitService gitService,
+    public DependencyVersionService(DependencyUpdater updater, GitService gitService,
                                     CommitMessageFormatter commitFormatter) {
         this.updater = updater;
         this.gitService = gitService;

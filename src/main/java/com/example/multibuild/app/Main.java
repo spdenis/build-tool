@@ -1,13 +1,14 @@
 package com.example.multibuild.app;
 
 import com.example.multibuild.build.BuildService;
+import com.example.multibuild.buildsystem.VersionUpdater;
 import com.example.multibuild.git.GitHubService;
 import com.example.multibuild.git.GitService;
 import com.example.multibuild.graph.AnalyzeScope;
 import com.example.multibuild.graph.DependencyGraph;
 import com.example.multibuild.graph.GraphFormat;
 import com.example.multibuild.graph.GraphReport;
-import com.example.multibuild.maven.PomVersionUpdater;
+import com.example.multibuild.gradle.GradleMigrationService;
 import com.example.multibuild.model.*;
 import com.example.multibuild.model.Module;
 import com.example.multibuild.service.*;
@@ -99,9 +100,18 @@ public class Main implements CommandLineRunner {
     @Value("${analyze.branch:}")
     private String analyzeBranch;
 
+    // migrate-gradle: branch the migration is committed to. Blank = the integration branch (created like
+    // the build command does, including the -<branch>-SNAPSHOT version update).
+    @Value("${migrate.branch:}")
+    private String migrateBranch;
+
+    // migrate-gradle: comma-separated repo names to migrate (blank = all repos in repos.json).
+    @Value("${migrate.target:}")
+    private String migrateTarget;
+
     private final GitService gitService;
     private final BranchService branchService;
-    private final PomVersionUpdater pomVersionUpdater;
+    private final VersionUpdater pomVersionUpdater;
     private final ProjectAggregator aggregator;
     private final DependencyVersionService dependencyVersionService;
     private final BuildService buildService;
@@ -110,13 +120,14 @@ public class Main implements CommandLineRunner {
     private final CommitMessageFormatter commitFormatter;
     private final GitHubService gitHubService;
     private final UDeployService uDeployService;
+    private final GradleMigrationService gradleMigrationService;
 
     public Main(GitService gitService, BranchService branchService,
-                PomVersionUpdater pomVersionUpdater,
+                VersionUpdater pomVersionUpdater,
                 ProjectAggregator aggregator, DependencyVersionService dependencyVersionService,
                 BuildService buildService, ReleaseService releaseService, ObjectMapper objectMapper,
                 CommitMessageFormatter commitFormatter, GitHubService gitHubService,
-                UDeployService uDeployService) {
+                UDeployService uDeployService, GradleMigrationService gradleMigrationService) {
         this.gitService = gitService;
         this.branchService = branchService;
         this.pomVersionUpdater = pomVersionUpdater;
@@ -128,6 +139,7 @@ public class Main implements CommandLineRunner {
         this.commitFormatter = commitFormatter;
         this.gitHubService = gitHubService;
         this.uDeployService = uDeployService;
+        this.gradleMigrationService = gradleMigrationService;
     }
 
     public static void main(String[] args) {
@@ -152,6 +164,7 @@ public class Main implements CommandLineRunner {
             case "create-prs"      -> runCreatePrs(args[1]);
             case "update-snapshot" -> runUpdateSnapshot(args[1]);
             case "analyze"         -> runAnalyze(args[1]);
+            case "migrate-gradle"  -> runMigrateGradle(args[1]);
             default -> {
                 System.err.println("[ERROR] Unknown command: " + args[0]);
                 printUsage();
@@ -228,7 +241,7 @@ public class Main implements CommandLineRunner {
         }
 
         // ── Phase: parse & graph ───────────────────────────────────
-        log.info("── Phase 2/3: parse pom.xml & resolve dependency graph ");
+        log.info("── Phase 2/3: parse build files & resolve dependency graph ");
         List<RepositoryProject> projects = aggregator.aggregate(clonedPaths);
         DependencyGraph<Path> graph = aggregator.buildGraph(projects);
         List<List<Path>> buildLayers = graph.topologicalLayers();
@@ -536,6 +549,85 @@ public class Main implements CommandLineRunner {
         }
     }
 
+    // Converts the Maven repos to Gradle on a branch (see GradleMigrationService). The cross-repo
+    // dependency graph is verified to be unchanged per repo; failures are rolled back and reported.
+    private void runMigrateGradle(String reposFile) throws Exception {
+        try {
+            gradleMigrationService.dsl();
+        } catch (IllegalArgumentException e) {
+            System.err.println("[ERROR] " + e.getMessage());
+            System.exit(1);
+            return;
+        }
+        String branch = migrateBranch.isBlank() ? branchService.getIntegrationBranch() : migrateBranch;
+        if (!skipGit && branch.isBlank()) {
+            System.err.println("[ERROR] migrate.branch or integration.branch is required but not set.");
+            System.exit(1);
+        }
+
+        List<RepoConfig> repoEntries = loadRepos(reposFile);
+        if (!migrateTarget.isBlank()) {
+            Set<String> wanted = Arrays.stream(migrateTarget.split(","))
+                    .map(String::trim).filter(t -> !t.isEmpty())
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+            List<RepoConfig> selected = repoEntries.stream()
+                    .filter(e -> wanted.contains(repoName(e.getUrl())))
+                    .toList();
+            Set<String> found = selected.stream().map(e -> repoName(e.getUrl())).collect(Collectors.toSet());
+            List<String> unknown = wanted.stream().filter(w -> !found.contains(w)).toList();
+            if (!unknown.isEmpty()) {
+                System.err.println("[ERROR] migrate.target repo(s) not in " + reposFile + ": " + String.join(", ", unknown));
+                System.exit(1);
+            }
+            repoEntries = selected;
+        }
+        Path workDir = Paths.get(cloneDir);
+        Files.createDirectories(workDir);
+
+        log.info("── Migrate to Gradle: {} repo(s)  branch={}  dsl={}  dryMode={}  skipGit={} ──",
+                repoEntries.size(), skipGit ? "(local)" : branch,
+                gradleMigrationService.dsl().name().toLowerCase(), dryMode, skipGit);
+        boolean useIntegrationFlow = migrateBranch.isBlank();
+        CloneResult cloned = skipGit
+                ? useLocalRepos(repoEntries, workDir)
+                : cloneRepos(repoEntries, workDir, (repoDir, entry) -> {
+                    String source = resolveSourceBranch(repoDir, entry.getEffectiveSourceBranch(defaultSourceBranch));
+                    if (useIntegrationFlow) {
+                        branchService.apply(repoDir, source, entry);
+                    } else if (!gitService.checkoutOrCreateBranch(repoDir, branch, source)) {
+                        gitService.pull(repoDir);
+                    }
+                });
+
+        List<GradleMigrationService.Result> results = new ArrayList<>();
+        for (Path repoDir : cloned.paths()) {
+            results.add(gradleMigrationService.migrate(repoDir, cloned.configByPath().get(repoDir), !skipGit));
+        }
+
+        log.info("── Migration summary ─────────────────────────────────────");
+        for (GradleMigrationService.Result r : results) {
+            String detail = switch (r.status()) {
+                case MIGRATED -> r.warnings().isEmpty() ? "" : " (" + r.warnings().size() + " warning(s) — review above)";
+                case FAILED -> " — " + String.join("; ", r.errors());
+                default -> "";
+            };
+            log.info("  {}: {}{}", r.repoName(), r.status(), detail);
+        }
+        List<GradleMigrationService.Result> failed = results.stream()
+                .filter(r -> r.status() == GradleMigrationService.Status.FAILED)
+                .toList();
+        if (!failed.isEmpty()) {
+            System.err.println("\n[MIGRATION FAILED]");
+            failed.forEach(r -> System.err.println("  " + r.repoName() + ": " + String.join("; ", r.errors())));
+            System.exit(1);
+        }
+        log.info("══ Migration complete ══════════════════════════════════");
+    }
+
+    private static String repoName(String url) {
+        return url.substring(url.lastIndexOf('/') + 1).replace(".git", "");
+    }
+
     private static void printUsage() {
         System.err.println("Usage: java -jar multibuild.jar build           repos.json");
         System.err.println("       java -jar multibuild.jar release-init    repos.json");
@@ -544,6 +636,8 @@ public class Main implements CommandLineRunner {
         System.err.println("       java -jar multibuild.jar analyze         repos.json"
                 + "  [--analyze.target=<repo>] [--analyze.scope=downstream|upstream|both]"
                 + " [--analyze.format=ascii|plantuml] [--analyze.output=<file>]");
+        System.err.println("       java -jar multibuild.jar migrate-gradle  repos.json"
+                + "  [--migrate.branch=<branch>] [--migrate.target=<repo,...>] [--migrate.gradle.dsl=groovy|kotlin]");
     }
 
     private record CloneResult(List<Path> paths, Map<Path, RepoConfig> configByPath) {}

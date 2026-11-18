@@ -297,10 +297,16 @@ public class JGitService implements GitService {
         }
     }
 
+    // Stages new, modified and deleted files (like `git add -A`); addFilepattern(".") alone skips deletions.
+    private static void stageAll(Git git) throws GitAPIException {
+        git.add().addFilepattern(".").call();
+        git.add().addFilepattern(".").setUpdate(true).call();
+    }
+
     @Override
     public void commitAll(Path repoDir, String message) {
         try (Git git = Git.open(repoDir.toFile())) {
-            git.add().addFilepattern(".").call();
+            stageAll(git);
             git.commit().setMessage(message).call();
         } catch (GitAPIException | IOException e) {
             throw new RuntimeException("Failed to commit in " + repoDir, e);
@@ -310,7 +316,7 @@ public class JGitService implements GitService {
     @Override
     public boolean commitAllIfDirty(Path repoDir, String message) {
         try (Git git = Git.open(repoDir.toFile())) {
-            git.add().addFilepattern(".").call();
+            stageAll(git);
             if (git.status().call().isClean()) return false;
             git.commit().setMessage(message).call();
             return true;

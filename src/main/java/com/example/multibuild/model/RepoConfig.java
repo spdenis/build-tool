@@ -16,7 +16,7 @@ public class RepoConfig {
     private boolean dryRun;
     private boolean preserveVersion;
     // Artifact coordinates (groupId:artifactId) to poll in the Maven release repo after a release build.
-    // Required for repos without pom.xml; ignored for repos that have one (modules are discovered automatically).
+    // Required for repos without pom.xml / Gradle build; ignored for repos that have one (modules are discovered automatically).
     private List<String> releaseArtifacts;
 
     // uDeploy component name for this repository. When set, the update-snapshot command will
@@ -39,7 +39,7 @@ public class RepoConfig {
         return sourceBranch != null && !sourceBranch.isBlank() ? sourceBranch : defaultBranch;
     }
 
-    // When set, overrides the version read from pom.xml for all modules in this repo.
+    // When set, overrides the version read from pom.xml / gradle.properties for all modules in this repo.
     public String getVersion() { return version; }
     public void setVersion(String version) { this.version = version; }
 

@@ -1,5 +1,6 @@
 package com.example.multibuild.maven;
 
+import com.example.multibuild.buildsystem.VersionUpdater;
 import com.example.multibuild.model.Artifact;
 import org.apache.maven.model.Model;
 import org.apache.maven.model.io.xpp3.MavenXpp3Reader;
@@ -20,13 +21,14 @@ import java.util.List;
 import java.util.stream.Stream;
 
 @Component
-public class PomVersionUpdater {
+public class PomVersionUpdater implements VersionUpdater {
 
     private static final Logger log = LoggerFactory.getLogger(PomVersionUpdater.class);
 
     // Updates all pom.xml versions to <baseVersion>-SNAPSHOT (no branch qualifier).
     // Used for Lightspeed repos where the CI pipeline appends the branch name itself.
     // Returns the new version string.
+    @Override
     public String updateVersionsBare(Path repoDir) {
         List<Path> pomFiles = findPomFiles(repoDir);
         if (pomFiles.isEmpty()) {
@@ -47,6 +49,7 @@ public class PomVersionUpdater {
     // Updates all pom.xml versions to <baseVersion>-<branchName>-SNAPSHOT,
     // preserving the numeric part of the existing version.
     // Returns the new version string (for use in the commit message).
+    @Override
     public String updateVersions(Path repoDir, String branchName) {
         List<Path> pomFiles = findPomFiles(repoDir);
         if (pomFiles.isEmpty()) {
@@ -69,6 +72,7 @@ public class PomVersionUpdater {
     }
 
     // Returns the current root version of the project in repoDir, or null if undetectable.
+    @Override
     public String getRootVersion(Path repoDir) {
         RootInfo root = findRootInfo(findPomFiles(repoDir));
         return root != null ? root.oldVersion() : null;
@@ -76,6 +80,7 @@ public class PomVersionUpdater {
 
     // Returns the root artifact coordinates of the project in repoDir, or null if undetectable.
     // groupId falls back to the parent's when the root pom inherits it.
+    @Override
     public Artifact getRootArtifact(Path repoDir) {
         List<Path> pomFiles = findPomFiles(repoDir);
         if (pomFiles.isEmpty()) return null;
@@ -95,6 +100,7 @@ public class PomVersionUpdater {
     }
 
     // Sets all module versions to an explicit version string.
+    @Override
     public void setVersions(Path repoDir, String newVersion) {
         List<Path> pomFiles = findPomFiles(repoDir);
         RootInfo root = findRootInfo(pomFiles);

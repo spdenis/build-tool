@@ -1,7 +1,7 @@
 package com.example.multibuild.service;
 
 import com.example.multibuild.graph.DependencyGraph;
-import com.example.multibuild.maven.MavenParser;
+import com.example.multibuild.buildsystem.ProjectParser;
 import com.example.multibuild.model.Artifact;
 import com.example.multibuild.model.Dependency;
 import com.example.multibuild.model.Module;
@@ -22,16 +22,16 @@ public class ProjectAggregator {
 
     private static final Logger log = LoggerFactory.getLogger(ProjectAggregator.class);
 
-    private final MavenParser mavenParser;
+    private final ProjectParser parser;
 
-    public ProjectAggregator(MavenParser mavenParser) {
-        this.mavenParser = mavenParser;
+    public ProjectAggregator(ProjectParser parser) {
+        this.parser = parser;
     }
 
     public List<RepositoryProject> aggregate(List<Path> repoDirs) {
         List<RepositoryProject> projects = new ArrayList<>();
         for (Path dir : repoDirs) {
-            RepositoryProject project = mavenParser.parse(dir);
+            RepositoryProject project = parser.parse(dir);
             log.info("Parsed {}: {} module(s)", project.getName(), project.getModules().size());
             projects.add(project);
         }
