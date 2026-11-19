@@ -44,10 +44,13 @@ import java.util.stream.Stream;
 //   read from the local Maven repository (maven.repo.local, else <localRepository> in ~/.m2/settings.xml,
 //   else ~/.m2/repository); when one is missing the affected dependencies are reported as warnings.
 //   Managed versions become constraints in the configuration matching the managed scope.
-//   Annotation processing: Gradle only runs processors on the annotationProcessor path. Processors from
-//   maven-compiler-plugin <annotationProcessorPaths> — and, when none are configured, known processors found
-//   on the classpath (Lombok, MapStruct, Hibernate JPA model gen, Spring Boot configuration processor, ...),
-//   which Maven discovers automatically — become annotationProcessor / testAnnotationProcessor dependencies.
+//   Annotation processing: Gradle only runs processors on the annotationProcessor path, Maven also discovers
+//   them on the compile classpath. Processors from maven-compiler-plugin <annotationProcessorPaths> become
+//   annotationProcessor / testAnnotationProcessor dependencies. Without processor paths, a module whose
+//   build (or parent) declares maven-compiler-plugin gets implicit processing like Maven: the processor paths
+//   extend the compile configurations, so every processor on the classpath runs. Otherwise known processors
+//   found on the classpath (Lombok, MapStruct, Hibernate JPA model gen, Spring Boot configuration processor,
+//   ...) are added explicitly.
 //   <compilerArgs>, <parameters>true</parameters> and <proc> become options.compilerArgs. The compiler
 //   configuration is looked up like Maven merges it: module, in-repo parents, then external parents from
 //   the local Maven repository (spring-boot-starter-parent implies -parameters).
@@ -265,6 +268,7 @@ public class MavenToGradleConverter {
         boolean junit;
         boolean publishing;
         boolean processing;                // annotation processors / compiler args identical in all targets
+        boolean implicitProcessing;        // every target discovers processors on its compile classpath
 
         Shared(Pom parent, List<Pom> targets, Kind kind, boolean top, boolean perKind) {
             this.parent = parent;
@@ -749,6 +753,7 @@ public class MavenToGradleConverter {
                         Processing first = processing(targets.get(0), new LinkedHashSet<>());
                         sh.processing = !first.isEmpty()
                                 && targets.stream().allMatch(t -> processing(t, new LinkedHashSet<>()).equals(first));
+                        sh.implicitProcessing = targets.stream().allMatch(t -> processing(t, new LinkedHashSet<>()).implicit());
                         DistributionManagement dm = targets.get(0).distribution();
                         sh.publishing = targets.stream().allMatch(t -> t.distribution() == dm);
                     }
@@ -838,6 +843,11 @@ public class MavenToGradleConverter {
             }
             dependenciesBlock(s, deps, constraints);
             sharedContext = false;
+            if (sh.implicitProcessing) {
+                s.blank();
+                s.line("// annotation processors are discovered on the compile classpath, like maven-compiler-plugin does");
+                implicitProcessingBlock(s);
+            }
 
             if (sh.encoding != null) {
                 s.blank();
@@ -939,6 +949,11 @@ public class MavenToGradleConverter {
             }
 
             dependenciesBlock(s, deps, constraints);
+            if (processing != null && processing.implicit() && (top == null || !top.implicitProcessing)) {
+                s.blank();
+                s.line("// annotation processors are discovered on the compile classpath, like maven-compiler-plugin does");
+                implicitProcessingBlock(s);
+            }
 
             String encoding = kind != Kind.PLATFORM && (top == null || top.encoding == null)
                     ? resolve(pom, pom.properties().get("project.build.sourceEncoding")) : null;
@@ -1241,8 +1256,26 @@ public class MavenToGradleConverter {
         // A compiler plugin setting and the properties of the (external) pom it was found in.
         record CompilerSetting(Xpp3Dom node, Map<String, String> externalProps) {}
 
-        record Processing(List<String> dependencies, List<String> compilerArgs) {
-            boolean isEmpty() { return dependencies.isEmpty() && compilerArgs.isEmpty(); }
+        // implicit: the processor paths extend the compile configurations (Maven's classpath discovery).
+        record Processing(List<String> dependencies, List<String> compilerArgs, boolean implicit) {
+            boolean isEmpty() { return dependencies.isEmpty() && compilerArgs.isEmpty() && !implicit; }
+        }
+
+        // True when maven-compiler-plugin is declared by the module, an in-repo parent or an external parent.
+        boolean compilerPluginDeclared(Pom pom) {
+            for (Pom p = pom; p != null; p = p.parent) {
+                if (!compilerPlugins(p.model).isEmpty()) return true;
+            }
+            Parent ext = pom.externalParent();
+            for (int depth = 0; ext != null && depth < 15; depth++) {
+                if (ext.getGroupId() == null || ext.getVersion() == null || ext.getVersion().contains("${")) break;
+                if ("spring-boot-starter-parent".equals(ext.getArtifactId())) return true;   // configures it
+                Model model = externalModel(ext.getGroupId(), ext.getArtifactId(), ext.getVersion());
+                if (model == null) break;
+                if (!compilerPlugins(model).isEmpty()) return true;
+                ext = model.getParent();
+            }
+            return false;
         }
 
         static List<Plugin> compilerPlugins(Model model) {
@@ -1300,8 +1333,12 @@ public class MavenToGradleConverter {
         Processing processing(Pom pom, Set<String> usedProps) {
             List<String> deps = new ArrayList<>();
             List<String> args = new ArrayList<>();
-            if (pom.kind() == Kind.PLATFORM) return new Processing(deps, args);
+            if (pom.kind() == Kind.PLATFORM) return new Processing(deps, args, false);
             boolean versionless = false;
+            CompilerSetting proc = compilerSetting(pom, "proc");
+            String procValue = proc != null ? settingValue(pom, proc, proc.node().getValue()) : null;
+            boolean procNone = procValue != null && "none".equals(procValue.trim());
+            boolean implicit = false;
 
             CompilerSetting paths = compilerSetting(pom, "annotationProcessorPaths");
             List<String> processors = new ArrayList<>();
@@ -1326,8 +1363,18 @@ public class MavenToGradleConverter {
                     deps.add(call("annotationProcessor", coords));
                 }
                 for (String c : processors) deps.add(call("testAnnotationProcessor", c));
-            } else {
-                // No processor path configured: Maven runs processors found on the compile classpath.
+            } else if (!procNone && compilerPluginDeclared(pom)) {
+                // Maven runs every processor on the compile classpath: so does Gradle with extended paths.
+                implicit = true;
+                for (org.apache.maven.model.Dependency d : pom.dependencies()) {
+                    String key = resolve(pom, d.getGroupId()) + ":" + resolve(pom, d.getArtifactId());
+                    // provided → compileOnly is not on the test compile classpath in Gradle (it is in Maven)
+                    if (KNOWN_PROCESSORS.contains(key) && "provided".equals(scopeOf(pom, d))) {
+                        deps.add(call("testCompileOnly", str(coordinates(pom, d, usedProps))));
+                    }
+                }
+            } else if (!procNone) {
+                // No compiler configuration at all: add the processors Maven would discover explicitly.
                 for (org.apache.maven.model.Dependency d : pom.dependencies()) {
                     String key = resolve(pom, d.getGroupId()) + ":" + resolve(pom, d.getArtifactId());
                     if (!KNOWN_PROCESSORS.contains(key)) continue;
@@ -1372,12 +1419,8 @@ public class MavenToGradleConverter {
             if (parameters != null ? "true".equals(settingValue(pom, parameters, parameters.node().getValue())) : bootParent) {
                 if (!args.contains("-parameters")) args.add(0, "-parameters");
             }
-            CompilerSetting proc = compilerSetting(pom, "proc");
-            if (proc != null) {
-                String v = settingValue(pom, proc, proc.node().getValue());
-                if (v != null && !v.isBlank()) args.add("-proc:" + v.trim());
-            }
-            return new Processing(deps, args);
+            if (procValue != null && !procValue.isBlank()) args.add("-proc:" + procValue.trim());
+            return new Processing(deps, args, implicit);
         }
 
         static String text(Xpp3Dom node, String child) {
@@ -1407,6 +1450,16 @@ public class MavenToGradleConverter {
                 }
             }
             return result;
+        }
+
+        void implicitProcessingBlock(Script s) {
+            if (kts) {
+                s.line("configurations.named(\"annotationProcessor\") { extendsFrom(configurations[\"compileOnly\"], configurations[\"implementation\"]) }");
+                s.line("configurations.named(\"testAnnotationProcessor\") { extendsFrom(configurations[\"testCompileOnly\"], configurations[\"testImplementation\"]) }");
+            } else {
+                s.line("configurations.named('annotationProcessor') { extendsFrom(configurations.compileOnly, configurations.implementation) }");
+                s.line("configurations.named('testAnnotationProcessor') { extendsFrom(configurations.testCompileOnly, configurations.testImplementation) }");
+            }
         }
 
         void compilerArgsBlock(Script s, List<String> args) {
