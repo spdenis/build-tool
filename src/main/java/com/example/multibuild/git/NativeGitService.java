@@ -368,6 +368,12 @@ public class NativeGitService implements GitService {
     }
 
     @Override
+    public List<String> recentCommits(Path repoDir, int max) {
+        String out = exec(repoDir, "git", "log", "-n", String.valueOf(max), "--format=%h %s");
+        return out.isBlank() ? List.of() : List.of(out.strip().split("\\R"));
+    }
+
+    @Override
     public void createTag(Path repoDir, String tagName, String message) {
         exec(repoDir, "git", "tag", "-a", tagName, "-m", message);
         log.info("Created tag {} in {}", tagName, repoDir.getFileName());

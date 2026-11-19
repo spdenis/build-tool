@@ -492,6 +492,20 @@ public class JGitService implements GitService {
     }
 
     @Override
+    public List<String> recentCommits(Path repoDir, int max) {
+        try (Git git = Git.open(repoDir.toFile())) {
+            List<String> result = new ArrayList<>();
+            if (git.getRepository().resolve("HEAD") == null) return result;
+            for (RevCommit c : git.log().setMaxCount(max).call()) {
+                result.add(c.getId().abbreviate(7).name() + " " + c.getShortMessage());
+            }
+            return result;
+        } catch (GitAPIException | IOException e) {
+            throw new RuntimeException("Failed to read history of " + repoDir, e);
+        }
+    }
+
+    @Override
     public void createTag(Path repoDir, String tagName, String message) {
         try (Git git = Git.open(repoDir.toFile())) {
             git.tag().setName(tagName).setMessage(message).call();

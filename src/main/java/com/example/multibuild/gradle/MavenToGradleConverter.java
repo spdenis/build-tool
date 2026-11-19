@@ -167,7 +167,7 @@ public class MavenToGradleConverter {
         final Path file;
         final Path dir;
         final Model model;
-        final Pom parent;         // in-repo inheritance parent (null when the <parent> is external or absent)
+        Pom parent;               // in-repo inheritance parent (null when the <parent> is external or absent)
         final List<Pom> children = new ArrayList<>();
         String gradlePath;        // ":" for the repo root, ":a:b" for a/b
 
@@ -301,6 +301,7 @@ public class MavenToGradleConverter {
             Pom root = load(rootPomFile, null, new ArrayDeque<>());
             if (root == null) throw new IllegalArgumentException("Cannot read " + rootPomFile);
             for (Pom p : poms) internalByKey.putIfAbsent(p.key(), p);
+            linkParents();
 
             rootGroup = root.groupId();
             rootVersion = root.version();
@@ -387,6 +388,18 @@ public class MavenToGradleConverter {
                 aggregatorChain.pop();
             }
             return pom;
+        }
+
+        // A <parent> that is a pom of this repository but not an aggregator above the module (the common
+        // "parent/" sibling module reached via relativePath) is still the module's inheritance parent.
+        void linkParents() {
+            for (Pom p : poms) {
+                Parent declared = p.model.getParent();
+                if (p.parent != null || declared == null) continue;
+                Pom candidate = internalByKey.get(declared.getGroupId() + ":" + declared.getArtifactId());
+                if (candidate == null || candidate == p || inheritsFrom(candidate, p)) continue;
+                p.parent = candidate;
+            }
         }
 
         private static Pom inheritanceParent(Model model, Deque<Pom> aggregatorChain) {
@@ -690,8 +703,8 @@ public class MavenToGradleConverter {
         // java-library + api, war modules war + implementation), so mixed parents are still shared.
         void planSharing(List<Pom> modules) {
             for (Pom parent : poms) {
-                if (parent.kind() != Kind.AGGREGATOR) continue;
                 List<Pom> inheritors = poms.stream().filter(q -> inheritsFrom(q, parent)).toList();
+                if (inheritors.isEmpty()) continue;
                 Map<Kind, List<Pom>> byKind = new EnumMap<>(Kind.class);
                 for (Pom q : inheritors) {
                     if (modules.contains(q) && q.kind() != Kind.PLATFORM) {
@@ -717,6 +730,8 @@ public class MavenToGradleConverter {
                     }
                     sh.shared.addAll(sh.deps);
                     sh.shared.addAll(sh.managed);
+                    // An intermediate parent adding nothing: the outer block already applies the plugins.
+                    if (!top && sh.deps.isEmpty() && sh.managed.isEmpty()) continue;
                     if (top) {
                         sh.externalPlatform = parent.parent == null && parent.model.getParent() != null;
                         sh.java = common(targets, this::javaVersion);
@@ -1046,7 +1061,9 @@ public class MavenToGradleConverter {
                 }
                 String config = configuration(kind, scope, optionalOf(ctx, d));
                 if (config == null) {
-                    warnings.add(where + ": " + scope + "-scoped dependency " + key
+                    // A parent pom's own dependencies reach its in-repo children through the shared block.
+                    boolean inheritedInRepo = self != null && poms.stream().anyMatch(q -> q.parent == self);
+                    if (!inheritedInRepo) warnings.add(where + ": " + scope + "-scoped dependency " + key
                             + " of a parent pom is not inherited by consumers in Gradle — add it to them");
                     droppedKeys.add(key);
                     continue;

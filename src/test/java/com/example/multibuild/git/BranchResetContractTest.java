@@ -59,6 +59,8 @@ class BranchResetContractTest {
         write(work.resolve("b.txt"), "b");
         git.commitAllIfDirty(work, "second");
         assertThat(git.commitsAhead(work, "feature", "main")).containsExactly("second", "first");   // local only
+        assertThat(git.recentCommits(work, 2)).hasSize(2)
+                .allMatch(c -> c.matches("[0-9a-f]{7} .*")).extracting(c -> c.substring(8)).containsExactly("second", "first");
         git.push(work);
         assertThat(git.commitsAhead(work, "feature", "main")).containsExactly("second", "first");   // from origin
 

@@ -327,6 +327,42 @@ class GradleMigrationServiceTest {
     }
 
     @Test
+    void reset_thenKeepMaven_keepsPoms() throws Exception {
+        Path work = migratedAndPushed("repo-multi");            // first run removed the poms
+        assertThat(work.resolve("pom.xml")).doesNotExist();
+
+        assertThat(service.reset(work, "gradle-migration", "main", false, new RepoConfig()).ok()).isTrue();
+        ReflectionTestUtils.setField(service, "keepMaven", true);
+        assertThat(service.migrate(work, new RepoConfig(), true).status()).isEqualTo(GradleMigrationService.Status.MIGRATED);
+
+        assertThat(work.resolve("pom.xml")).exists();
+        assertThat(work.resolve("module-core/pom.xml")).exists();
+        assertThat(work.resolve("settings.gradle")).exists();
+        try (Git g = Git.open(work.toFile())) {
+            assertThat(filesIn(g, g.log().setMaxCount(1).call().iterator().next())).contains("pom.xml", "settings.gradle");
+        }
+    }
+
+    @Test
+    void keepMaven_whenSourceBranchAlreadyLostItsPoms_explainsWhich_commit() throws Exception {
+        // the migration (without keep.maven) ended up on main itself
+        Path remote = TestGit.initRemote("repo-a", tempDir);
+        Path work = git.cloneRepo(remote.toUri().toString(), tempDir.resolve("work/repo-a"));
+        assertThat(service.migrate(work, new RepoConfig(), true).status()).isEqualTo(GradleMigrationService.Status.MIGRATED);
+        String commit = git.recentCommits(work, 1).get(0).split(" ")[0];
+
+        assertThat(service.reset(work, "gradle-migration", "main", false, new RepoConfig()).ok()).isTrue();
+        ReflectionTestUtils.setField(service, "keepMaven", true);
+        GradleMigrationService.Result result = service.migrate(work, new RepoConfig(), true);
+
+        assertThat(work.resolve("pom.xml")).doesNotExist();
+        assertThat(result.status()).isEqualTo(GradleMigrationService.Status.ALREADY_GRADLE);
+        assertThat(result.warnings()).singleElement().asString()
+                .contains("has no pom.xml", "commit " + commit, "chore: migrate build from Maven to Gradle",
+                        "git revert " + commit);
+    }
+
+    @Test
     void reset_refusesBranchWithManualCommits_unlessForced() throws Exception {
         Path work = migratedAndPushed("repo-a");
         write(work.resolve("build.gradle"), read(work.resolve("build.gradle")) + "\n// hand-tuned\n");

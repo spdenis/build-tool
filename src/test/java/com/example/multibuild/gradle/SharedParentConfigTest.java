@@ -260,6 +260,102 @@ class SharedParentConfigTest {
         assertThat(read(repo.resolve("web/build.gradle.kts"))).doesNotContain("corp-root").contains("id(\"war\")");
     }
 
+    private static final String SPRING_TEST = "<dependency><groupId>org.springframework</groupId>"
+            + "<artifactId>spring-test</artifactId><version>6.1.2</version><scope>test</scope></dependency>";
+
+    @Test
+    void parentDependency_isDeclaredOnceForAllModules() {
+        write(repo.resolve("pom.xml"), """
+                <project><modelVersion>4.0.0</modelVersion>
+                  <groupId>com.acme</groupId><artifactId>parent</artifactId><version>1.0</version><packaging>pom</packaging>
+                  <modules><module>a</module><module>b</module></modules>
+                  <dependencies>%s</dependencies>
+                </project>""".formatted(SPRING_TEST));
+        for (String m : new String[]{"a", "b"}) {
+            write(repo.resolve(m + "/pom.xml"), """
+                    <project><modelVersion>4.0.0</modelVersion>
+                      <parent><groupId>com.acme</groupId><artifactId>parent</artifactId><version>1.0</version></parent>
+                      <artifactId>%s</artifactId></project>""".formatted(m));
+        }
+        migrate(GradleDsl.GROOVY);
+
+        assertThat(read(repo.resolve("build.gradle")))
+                .contains("subprojects {", "testImplementation 'org.springframework:spring-test:6.1.2'");
+        assertThat(read(repo.resolve("a/build.gradle"))).doesNotContain("spring-test");
+        assertThat(read(repo.resolve("b/build.gradle"))).doesNotContain("spring-test");
+    }
+
+    // pom.xml only aggregates; the modules' <parent> is the sibling parent/pom.xml (via relativePath),
+    // which itself has the corporate parent.
+    @Test
+    void siblingParentModule_isTheModulesParent() {
+        write(repo.resolve("pom.xml"), """
+                <project><modelVersion>4.0.0</modelVersion>
+                  <groupId>com.acme</groupId><artifactId>root</artifactId><version>1.0</version><packaging>pom</packaging>
+                  <modules><module>parent</module><module>a</module><module>b</module></modules>
+                </project>""");
+        write(repo.resolve("parent/pom.xml"), """
+                <project><modelVersion>4.0.0</modelVersion>
+                  <parent><groupId>com.corp</groupId><artifactId>corp-root</artifactId><version>12</version></parent>
+                  <groupId>com.acme</groupId><artifactId>acme-parent</artifactId><version>1.0</version><packaging>pom</packaging>
+                  <properties><guava.version>33.0.0-jre</guava.version></properties>
+                  <dependencyManagement><dependencies>
+                    <dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId><version>${guava.version}</version></dependency>
+                  </dependencies></dependencyManagement>
+                  <dependencies>%s</dependencies>
+                </project>""".formatted(SPRING_TEST));
+        for (String m : new String[]{"a", "b"}) {
+            write(repo.resolve(m + "/pom.xml"), """
+                    <project><modelVersion>4.0.0</modelVersion>
+                      <parent><groupId>com.acme</groupId><artifactId>acme-parent</artifactId><version>1.0</version>
+                        <relativePath>../parent</relativePath></parent>
+                      <artifactId>%s</artifactId>
+                      <dependencies><dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId></dependency></dependencies>
+                    </project>""".formatted(m));
+        }
+        MavenToGradleConverter.Conversion c = migrate(GradleDsl.GROOVY);
+
+        assertThat(read(repo.resolve("build.gradle")))
+                .contains("configure([project(':a'), project(':b')]) {", "// shared configuration from parent/pom.xml",
+                        "api platform('com.corp:corp-root:12')",
+                        "api \"com.google.guava:guava:${guavaVersion}\"",
+                        "testImplementation 'org.springframework:spring-test:6.1.2'");
+        for (String m : new String[]{"a", "b"}) {
+            assertThat(read(repo.resolve(m + "/build.gradle"))).as(m)
+                    .contains("api 'com.google.guava:guava'")
+                    .doesNotContain("spring-test", "acme-parent", "corp-root", "constraints");
+        }
+        // the parent is still published (as a platform with its managed versions)
+        assertThat(read(repo.resolve("parent/build.gradle")))
+                .contains("id 'java-platform'", "artifactId = 'acme-parent'", "com.google.guava:guava:${guavaVersion}");
+        assertThat(c.warnings()).noneMatch(w -> w.contains("spring-test"));
+    }
+
+    @Test
+    void nestedAggregator_getsOneBlock() {
+        write(repo.resolve("pom.xml"), """
+                <project><modelVersion>4.0.0</modelVersion>
+                  <groupId>com.acme</groupId><artifactId>root</artifactId><version>1.0</version><packaging>pom</packaging>
+                  <modules><module>services</module></modules>
+                  <dependencies>%s</dependencies>
+                </project>""".formatted(SPRING_TEST));
+        write(repo.resolve("services/pom.xml"), """
+                <project><modelVersion>4.0.0</modelVersion>
+                  <parent><groupId>com.acme</groupId><artifactId>root</artifactId><version>1.0</version></parent>
+                  <artifactId>services</artifactId><packaging>pom</packaging>
+                  <modules><module>a</module></modules>
+                </project>""");
+        write(repo.resolve("services/a/pom.xml"), """
+                <project><modelVersion>4.0.0</modelVersion>
+                  <parent><groupId>com.acme</groupId><artifactId>services</artifactId><version>1.0</version></parent>
+                  <artifactId>a</artifactId></project>""");
+        migrate(GradleDsl.GROOVY);
+
+        String root = read(repo.resolve("build.gradle"));
+        assertThat(root).containsOnlyOnce("configure([project(':services:a')])").contains("spring-test");
+        assertThat(read(repo.resolve("services/a/build.gradle"))).doesNotContain("spring-test");
+    }
+
     @Test
     void sharedDependencies_areUpdatedByTheBuildTool() {
         parentWithModules();

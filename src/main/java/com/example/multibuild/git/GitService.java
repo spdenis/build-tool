@@ -42,6 +42,9 @@ public interface GitService {
     // origin/<sourceBranch> (an existing local branch of that name is replaced).
     void createFreshBranch(Path repoDir, String branch, String sourceBranch);
 
+    // "<short id> <subject>" of the newest `max` commits reachable from HEAD.
+    List<String> recentCommits(Path repoDir, int max);
+
     void createTag(Path repoDir, String tagName, String message);
 
     // Deletes the tag locally and from the remote if it exists. No-op if it doesn't exist.
