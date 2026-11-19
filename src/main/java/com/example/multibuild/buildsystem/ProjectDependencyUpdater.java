@@ -12,7 +12,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-// Splits repos by build system and delegates each group to the matching dependency updater.
+// Splits repos by build system and delegates each group to the matching dependency updater. Repos that
+// still carry poms next to their Gradle build (migration in progress) are updated in both.
 @Component
 @Primary
 public class ProjectDependencyUpdater implements DependencyUpdater {
@@ -31,7 +32,10 @@ public class ProjectDependencyUpdater implements DependencyUpdater {
         List<Path> gradleRepos = new ArrayList<>();
         for (Path repo : repoRoots) {
             switch (BuildSystem.detect(repo)) {
-                case GRADLE -> gradleRepos.add(repo);
+                case GRADLE -> {
+                    gradleRepos.add(repo);
+                    if (BuildSystem.hasMavenBuild(repo)) mavenRepos.add(repo);
+                }
                 case MAVEN -> mavenRepos.add(repo);
                 case NONE -> { }
             }

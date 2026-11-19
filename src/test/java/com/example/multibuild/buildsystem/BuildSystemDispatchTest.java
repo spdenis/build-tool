@@ -92,4 +92,45 @@ class BuildSystemDispatchTest {
         assertThat(read(gradle.resolve("build.gradle"))).contains("com.example:lib-a:1.2.3");
         assertThat(read(maven.resolve("pom.xml"))).contains("<version>1.2.3</version>");
     }
+
+    // repo-b converted to Gradle with its pom kept (migrate.keep.maven=true)
+    private Path migratingRepo() {
+        Path repo = Fixtures.copy("repo-b", tempDir.resolve("migrating"));
+        com.example.multibuild.gradle.MavenToGradleConverter converter = new com.example.multibuild.gradle.MavenToGradleConverter();
+        converter.apply(converter.convert(repo, com.example.multibuild.gradle.GradleDsl.GROOVY).keepingMaven());
+        return repo;
+    }
+
+    @Test
+    void keptMavenBuild_gradleIsParsed_butVersionsAndDependenciesUpdateBoth() {
+        Path repo = migratingRepo();
+        assertThat(repo.resolve("pom.xml")).exists();
+        assertThat(BuildSystem.detect(repo)).isEqualTo(BuildSystem.GRADLE);
+        String pomVersion = new PomVersionUpdater().getRootVersion(repo);
+
+        ProjectVersionUpdater versions = new ProjectVersionUpdater(new PomVersionUpdater(),
+                new GradleVersionUpdater(new GradleParser()));
+        String newVersion = versions.updateVersions(repo, "int");
+        assertThat(newVersion).endsWith("-int-SNAPSHOT").isNotEqualTo(pomVersion);
+        assertThat(new GradleVersionUpdater(new GradleParser()).getRootVersion(repo)).isEqualTo(newVersion);
+        assertThat(new PomVersionUpdater().getRootVersion(repo)).isEqualTo(newVersion);
+
+        versions.updateVersionsBare(repo);
+        assertThat(new PomVersionUpdater().getRootVersion(repo)).isEqualTo(pomVersion);
+
+        ProjectDependencyUpdater deps = new ProjectDependencyUpdater(new DependencyVersionUpdater(),
+                new GradleDependencyUpdater());
+        assertThat(deps.update(List.of(repo), Map.of("com.example:lib-a", "9.9.9"))).containsExactly(repo);
+        assertThat(read(repo.resolve("build.gradle"))).contains("com.example:lib-a:9.9.9");
+        assertThat(read(repo.resolve("pom.xml"))).contains("<version>9.9.9</version>");
+
+        MavenParserImpl maven = new MavenParserImpl();
+        ReflectionTestUtils.setField(maven, "declaredModulesOnly", true);
+        // Gradle has priority: the dispatcher parses the Gradle build
+        ProjectParserDispatcher parser = new ProjectParserDispatcher(maven, new GradleParser());
+        assertThat(parser.parse(repo).getModules().get(0).getDirectory()).isEqualTo(repo);
+        write(repo.resolve("build.gradle"), read(repo.resolve("build.gradle")).replace("9.9.9", "7.7.7"));
+        assertThat(parser.parse(repo).getModules().get(0).getDependencies())
+                .anyMatch(d -> d.getArtifact().toString().equals("com.example:lib-a:7.7.7"));
+    }
 }

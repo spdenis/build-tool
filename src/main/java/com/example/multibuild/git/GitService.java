@@ -1,6 +1,7 @@
 package com.example.multibuild.git;
 
 import java.nio.file.Path;
+import java.util.List;
 
 public interface GitService {
     Path cloneRepo(String url, Path targetDir);
@@ -27,6 +28,19 @@ public interface GitService {
     // No-op when already up to date. Pushes unconditionally when no remote tracking ref exists.
     // Used to flush commits left behind by a previous dry-mode run.
     void pushIfAhead(Path repoDir);
+
+    // Subjects of the commits on `branch` (origin's copy when it exists there, else the local one) that are
+    // not on origin/<baseBranch>, newest first. Empty when the branch exists nowhere.
+    List<String> commitsAhead(Path repoDir, String branch, String baseBranch);
+
+    // Deletes `branch` (and its remote tracking ref) locally and, when deleteRemote is true, on origin.
+    // Missing branches are skipped.
+    // Returns true when a remote branch was deleted.
+    boolean deleteBranch(Path repoDir, String branch, boolean deleteRemote);
+
+    // Discards local changes and untracked files, then checks out `branch` freshly created from
+    // origin/<sourceBranch> (an existing local branch of that name is replaced).
+    void createFreshBranch(Path repoDir, String branch, String sourceBranch);
 
     void createTag(Path repoDir, String tagName, String message);
 

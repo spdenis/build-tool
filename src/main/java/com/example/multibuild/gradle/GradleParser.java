@@ -25,7 +25,7 @@ import java.util.Set;
 // publication's artifactId / archivesName when set, otherwise the project name.
 //
 // A single-project build is always one module. In a multi-project build a subproject is a module when it
-// applies a JVM/publishing plugin (directly or via the root's subprojects/allprojects block), has
+// applies a JVM/publishing plugin (directly or via the root's subprojects/allprojects/configure(...) block), has
 // src/main, or declares dependencies; the root is a module only if it applies such a plugin itself.
 @Component
 public class GradleParser implements ProjectParser {
@@ -44,9 +44,12 @@ public class GradleParser implements ProjectParser {
         // Configuration the root script applies to other projects.
         List<int[]> subBlocks = rootScript != null ? rootScript.blocks("subprojects") : List.of();
         List<int[]> allBlocks = rootScript != null ? rootScript.blocks("allprojects") : List.of();
+        List<GradleScript.TargetedBlock> configureBlocks = rootScript != null ? rootScript.configureBlocks() : List.of();
         List<int[]> sharedBlocks = new ArrayList<>(subBlocks);
         sharedBlocks.addAll(allBlocks);
-        List<int[]> rootOnly = rootScript != null ? rootScript.complementOf(sharedBlocks) : List.of();
+        List<int[]> otherProjects = new ArrayList<>(sharedBlocks);
+        configureBlocks.forEach(b -> otherProjects.add(b.range()));
+        List<int[]> rootOnly = rootScript != null ? rootScript.complementOf(otherProjects) : List.of();
 
         Set<String> subPlugins = new LinkedHashSet<>();
         List<DependencyRef> subDeps = new ArrayList<>();
@@ -77,6 +80,11 @@ public class GradleParser implements ProjectParser {
             if (!root) plugins.addAll(subPlugins);
             List<DependencyRef> deps = new ArrayList<>(allDeps);
             if (!root) deps.addAll(subDeps);
+            for (GradleScript.TargetedBlock block : configureBlocks) {
+                if (!block.paths().contains(project.path())) continue;
+                plugins.addAll(GradleDeclarations.plugins(rootScript, List.of(block.range())));
+                deps.addAll(GradleDeclarations.dependencies(rootScript, List.of(block.range())));
+            }
             if (script != null) {
                 plugins.addAll(GradleDeclarations.plugins(script, own));
                 deps.addAll(GradleDeclarations.dependencies(script, own));

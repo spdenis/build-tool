@@ -27,17 +27,28 @@ import java.util.stream.Stream;
 //   settings.gradle      rootProject.name = '<root artifactId>' + one include per module
 //   gradle.properties    group, version (single source of truth for the version) and every Maven
 //                        property used as a dependency version (lib-a.version → libAVersion)
-//   build.gradle         root: shared repositories; single-module repo: the module itself
-//   <module>/build.gradle  plugins, dependencies, publishing
+//   build.gradle         root: shared repositories + one shared block per in-repo parent pom;
+//                        single-module repo: the module itself
+//   <module>/build.gradle  only what the module declares itself
 //
 // Mapping:
 //   packaging jar → java-library, war → war, pom without modules (parent/BOM) → java-platform,
 //   pom with modules → plain aggregator project.
 //   scope compile → api (implementation for optional / war), provided → compileOnly (providedCompile for war),
-//   runtime → runtimeOnly, test → testImplementation.
+//   runtime → runtimeOnly, test → testImplementation. A dependency without <scope> / <optional> /
+//   <exclusions> takes them from dependencyManagement exactly like Maven does: from the pom and its in-repo
+//   parents, from external parents and from imported BOMs (scope import). Poms outside the repository are
+//   read from the local Maven repository (maven.repo.local, else <localRepository> in ~/.m2/settings.xml,
+//   else ~/.m2/repository); when one is missing the affected dependencies are reported as warnings.
+//   Managed versions become constraints in the configuration matching the managed scope.
 //   <parent> outside the repo → platform(parent) so managed versions and the cross-repo edge are kept;
 //   dependencyManagement → constraints { } (scope import → platform()).
-//   Dependencies and dependencyManagement inherited from in-repo parents are inlined into each module.
+//   An in-repo parent pom becomes a shared block in the root script — `subprojects { }` when every
+//   subproject inherits it, `configure([project(':a'), ...]) { }` otherwise — holding what the parent
+//   contributes: plugins, dependencies, dependencyManagement, Java version, encoding, JUnit platform and
+//   publishing. Contributions a child overrides (same dependency redeclared, a version property redefined)
+//   and parents whose inheritors mix packagings (jar + war) are inlined into each module instead, which
+//   keeps Maven's "child wins" semantics. BOM-like children (packaging pom) always get them inlined.
 //   Dependencies on modules of the same repo → project(':path').
 //   Every module applies maven-publish so `publishToMavenLocal` / `publish` replace `mvn install` / `mvn deploy`.
 // Anything without a generated equivalent (build plugins, profiles, system-scoped dependencies) is reported
@@ -65,14 +76,51 @@ public class MavenToGradleConverter {
     //   substitutions: external keys replaced by an equivalent (e.g. spring-boot-starter-parent → spring-boot-dependencies)
     public record Conversion(Path repoRoot, GradleDsl dsl, Map<Path, String> writes, List<Path> deletes,
                              List<String> warnings, Set<String> internalKeys, Set<String> droppedKeys,
-                             Map<String, String> substitutions) {}
+                             Map<String, String> substitutions) {
+        // Same conversion that leaves the Maven build in place (migrate.keep.maven=true).
+        public Conversion keepingMaven() {
+            return new Conversion(repoRoot, dsl, writes, List.of(), warnings, internalKeys, droppedKeys, substitutions);
+        }
+    }
+
+    // The Maven build files of a repo: every pom reachable through <modules>, plus the Maven wrapper.
+    public List<Path> mavenBuildFiles(Path repoRoot) {
+        Path rootPom = repoRoot.resolve("pom.xml");
+        if (!Files.isRegularFile(rootPom)) return List.of();
+        Run run = new Run(repoRoot, GradleDsl.GROOVY, Path.of(""));
+        run.load(rootPom, null, new ArrayDeque<>());
+        return run.mavenBuildFiles();
+    }
+
+    // Local Maven repository holding external parents / imported BOMs (blank = Maven's default location).
+    @org.springframework.beans.factory.annotation.Value("${maven.repo.local:}")
+    private String localRepository = "";
+
+    static Path defaultLocalRepository() {
+        String prop = System.getProperty("maven.repo.local");
+        if (prop != null && !prop.isBlank()) return Path.of(prop);
+        Path m2 = Path.of(System.getProperty("user.home"), ".m2");
+        Path settings = m2.resolve("settings.xml");
+        try {
+            if (Files.isRegularFile(settings)) {
+                Matcher m = Pattern.compile("<localRepository>\\s*([^<]+?)\\s*</localRepository>")
+                        .matcher(Files.readString(settings, StandardCharsets.UTF_8));
+                if (m.find()) return Path.of(m.group(1).replace("${user.home}", System.getProperty("user.home")));
+            }
+        } catch (IOException e) {
+            // fall through to the default
+        }
+        return m2.resolve("repository");
+    }
 
     public Conversion convert(Path repoRoot, GradleDsl dsl) {
         Path rootPom = repoRoot.resolve("pom.xml");
         if (!Files.isRegularFile(rootPom)) {
             throw new IllegalArgumentException("No pom.xml in " + repoRoot);
         }
-        return new Run(repoRoot, dsl).convert(rootPom);
+        Path local = localRepository == null || localRepository.isBlank()
+                ? defaultLocalRepository() : Path.of(localRepository);
+        return new Run(repoRoot, dsl, local).convert(rootPom);
     }
 
     // Writes the generated files and deletes the Maven build files.
@@ -189,6 +237,29 @@ public class MavenToGradleConverter {
         }
     }
 
+    // What an in-repo parent pom contributes to its inheriting modules, rendered once in the root script.
+    private static final class Shared {
+        final Pom parent;
+        final List<Pom> targets;
+        final Kind kind;
+        final boolean top;                 // outermost sharing parent of its targets
+        final List<org.apache.maven.model.Dependency> deps = new ArrayList<>();
+        final List<org.apache.maven.model.Dependency> managed = new ArrayList<>();
+        final Set<org.apache.maven.model.Dependency> shared = Collections.newSetFromMap(new IdentityHashMap<>());
+        boolean externalPlatform;
+        String java;
+        String encoding;
+        boolean junit;
+        boolean publishing;
+
+        Shared(Pom parent, List<Pom> targets, Kind kind, boolean top) {
+            this.parent = parent;
+            this.targets = targets;
+            this.kind = kind;
+            this.top = top;
+        }
+    }
+
     // ── conversion run ───────────────────────────────────────────────────────
 
     private static final class Run {
@@ -201,10 +272,20 @@ public class MavenToGradleConverter {
         final Map<String, String> substitutions = new LinkedHashMap<>();
         final Map<String, String> gradleProps = new LinkedHashMap<>();
         Map<String, Pom> internalByKey = new LinkedHashMap<>();
+        final Map<Pom, Shared> sharing = new LinkedHashMap<>();
+        // Inside a shared block of a Kotlin script configurations have no accessors: "api"(...).
+        boolean sharedContext;
         String rootGroup;
         String rootVersion;
 
-        Run(Path repoRoot, GradleDsl dsl) {
+        final Path localRepo;
+        final Map<String, Model> externalModels = new HashMap<>();
+        final Map<Pom, Map<String, org.apache.maven.model.Dependency>> managedIndexes = new IdentityHashMap<>();
+        final Map<Pom, Set<String>> unresolvedByPom = new IdentityHashMap<>();
+        final Set<String> scopeWarnings = new HashSet<>();
+
+        Run(Path repoRoot, GradleDsl dsl, Path localRepo) {
+            this.localRepo = localRepo;
             this.repoRoot = repoRoot;
             this.dsl = dsl;
             this.kts = dsl == GradleDsl.KOTLIN;
@@ -232,7 +313,8 @@ public class MavenToGradleConverter {
             if (single) {
                 writes.put(repoRoot.resolve(dsl.buildFile()), moduleScript(root, true));
             } else {
-                writes.put(repoRoot.resolve(dsl.buildFile()), rootScript());
+                planSharing(modules);
+                writes.put(repoRoot.resolve(dsl.buildFile()), rootScript(modules));
                 for (Pom m : modules) {
                     writes.put(m.dir.resolve(dsl.buildFile()), moduleScript(m, false));
                 }
@@ -241,24 +323,29 @@ public class MavenToGradleConverter {
             writes.put(repoRoot.resolve(GradleProperties.FILE_NAME), gradleProperties());
             writes.put(repoRoot.resolve(".gitignore"), gitignore());
 
-            List<Path> deletes = new ArrayList<>();
-            for (Pom p : poms) deletes.add(p.file);
-            for (String f : List.of("mvnw", "mvnw.cmd")) {
-                if (Files.isRegularFile(repoRoot.resolve(f))) deletes.add(repoRoot.resolve(f));
-            }
-            Path mvnWrapper = repoRoot.resolve(".mvn/wrapper");
-            if (Files.isDirectory(mvnWrapper)) {
-                try (Stream<Path> s = Files.list(mvnWrapper)) {
-                    s.filter(Files::isRegularFile).forEach(deletes::add);
-                } catch (IOException e) {
-                    warnings.add(".mvn/wrapper: could not list files — remove the Maven wrapper manually");
-                }
-            }
+            List<Path> deletes = mavenBuildFiles();
 
             Set<String> internalKeys = new LinkedHashSet<>();
             for (Pom p : poms) internalKeys.add(p.key());
             return new Conversion(repoRoot, dsl, writes, deletes, List.copyOf(warnings),
                     internalKeys, droppedKeys, substitutions);
+        }
+
+        List<Path> mavenBuildFiles() {
+            List<Path> files = new ArrayList<>();
+            for (Pom p : poms) files.add(p.file);
+            for (String f : List.of("mvnw", "mvnw.cmd")) {
+                if (Files.isRegularFile(repoRoot.resolve(f))) files.add(repoRoot.resolve(f));
+            }
+            Path mvnWrapper = repoRoot.resolve(".mvn/wrapper");
+            if (Files.isDirectory(mvnWrapper)) {
+                try (Stream<Path> s = Files.list(mvnWrapper)) {
+                    s.filter(Files::isRegularFile).forEach(files::add);
+                } catch (IOException e) {
+                    warnings.add(".mvn/wrapper: could not list files — remove the Maven wrapper manually");
+                }
+            }
+            return files;
         }
 
         // Follows <modules> declarations, mirroring the Maven parser's declared-modules scan.
@@ -331,6 +418,197 @@ public class MavenToGradleConverter {
             }
         }
 
+        // ── effective dependencyManagement (scope / optional / exclusions) ───
+
+        static String managementKey(String group, String artifact, String type, String classifier) {
+            return group + ":" + artifact + ":" + (type == null || type.isBlank() ? "jar" : type)
+                    + (classifier == null || classifier.isBlank() ? "" : ":" + classifier);
+        }
+
+        // Copy of `d` with ${...} in coordinates and scope expanded (left as-is when unresolvable).
+        static org.apache.maven.model.Dependency expanded(org.apache.maven.model.Dependency d,
+                                                          java.util.function.UnaryOperator<String> resolver) {
+            org.apache.maven.model.Dependency c = d.clone();
+            java.util.function.UnaryOperator<String> r = v -> {
+                if (v == null) return null;
+                String x = resolver.apply(v);
+                return x != null ? x : v;
+            };
+            c.setGroupId(r.apply(d.getGroupId()));
+            c.setArtifactId(r.apply(d.getArtifactId()));
+            c.setVersion(r.apply(d.getVersion()));
+            c.setScope(r.apply(d.getScope()));
+            c.setType(r.apply(d.getType()));
+            c.setClassifier(r.apply(d.getClassifier()));
+            return c;
+        }
+
+        static String managementKey(org.apache.maven.model.Dependency d) {
+            return managementKey(d.getGroupId(), d.getArtifactId(), d.getType(), d.getClassifier());
+        }
+
+        // Maven precedence: the pom's own and inherited (in-repo, then external parents) entries first,
+        // then entries of imported BOMs in declaration order; the first entry for a key wins.
+        Map<String, org.apache.maven.model.Dependency> managedIndex(Pom pom) {
+            Map<String, org.apache.maven.model.Dependency> cached = managedIndexes.get(pom);
+            if (cached != null) return cached;
+            Map<String, org.apache.maven.model.Dependency> index = new LinkedHashMap<>();
+            managedIndexes.put(pom, index);   // guards against import cycles
+            Set<String> unresolved = new LinkedHashSet<>();
+            List<org.apache.maven.model.Dependency> imports = new ArrayList<>();
+            for (org.apache.maven.model.Dependency d : pom.managed()) {
+                org.apache.maven.model.Dependency e = expanded(d, v -> resolve(pom, v));
+                index.putIfAbsent(managementKey(e), e);
+                if ("import".equals(e.getScope())) imports.add(e);
+            }
+            Parent ext = pom.externalParent();
+            if (ext != null) {
+                externalManaged(ext.getGroupId(), ext.getArtifactId(), ext.getVersion(), 0, unresolved)
+                        .forEach(index::putIfAbsent);
+            }
+            for (org.apache.maven.model.Dependency imp : imports) {
+                Pom internal = internalByKey.get(imp.getGroupId() + ":" + imp.getArtifactId());
+                Map<String, org.apache.maven.model.Dependency> imported = internal != null ? managedIndex(internal)
+                        : externalManaged(imp.getGroupId(), imp.getArtifactId(), imp.getVersion(), 0, unresolved);
+                if (internal != null) unresolved.addAll(unresolvedByPom.getOrDefault(internal, Set.of()));
+                imported.forEach(index::putIfAbsent);
+            }
+            unresolvedByPom.put(pom, unresolved);
+            return index;
+        }
+
+        // Effective dependencyManagement of a pom from the local Maven repository.
+        Map<String, org.apache.maven.model.Dependency> externalManaged(String g, String a, String v, int depth,
+                                                                      Set<String> unresolved) {
+            Map<String, org.apache.maven.model.Dependency> index = new LinkedHashMap<>();
+            if (depth > 15 || g == null || a == null || v == null || g.contains("${") || v.contains("${")) {
+                if (g != null && a != null) unresolved.add(g + ":" + a + ":" + v);
+                return index;
+            }
+            Model model = externalModel(g, a, v);
+            if (model == null) {
+                unresolved.add(g + ":" + a + ":" + v);
+                return index;
+            }
+            Map<String, String> props = externalProperties(model, depth);
+            List<org.apache.maven.model.Dependency> imports = new ArrayList<>();
+            if (model.getDependencyManagement() != null) {
+                for (org.apache.maven.model.Dependency d : model.getDependencyManagement().getDependencies()) {
+                    org.apache.maven.model.Dependency e = expanded(d, x -> expand(x, props));
+                    index.putIfAbsent(managementKey(e), e);
+                    if ("import".equals(e.getScope())) imports.add(e);
+                }
+            }
+            Parent parent = model.getParent();
+            if (parent != null) {
+                externalManaged(parent.getGroupId(), parent.getArtifactId(), parent.getVersion(), depth + 1, unresolved)
+                        .forEach(index::putIfAbsent);
+            }
+            for (org.apache.maven.model.Dependency imp : imports) {
+                externalManaged(imp.getGroupId(), imp.getArtifactId(), imp.getVersion(), depth + 1, unresolved)
+                        .forEach(index::putIfAbsent);
+            }
+            return index;
+        }
+
+        Model externalModel(String g, String a, String v) {
+            String key = g + ":" + a + ":" + v;
+            if (externalModels.containsKey(key)) return externalModels.get(key);
+            Path file = localRepo.resolve(g.replace('.', '/')).resolve(a).resolve(v).resolve(a + "-" + v + ".pom");
+            Model model = null;
+            if (Files.isRegularFile(file)) {
+                try (Reader r = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+                    model = new MavenXpp3Reader().read(r, false);
+                } catch (Exception e) {
+                    warnings.add(file + ": cannot be read (" + e.getMessage() + ")");
+                }
+            }
+            externalModels.put(key, model);
+            return model;
+        }
+
+        // Properties of an external pom: parent chain first, own properties win, plus project.* builtins.
+        Map<String, String> externalProperties(Model model, int depth) {
+            Map<String, String> props = new HashMap<>();
+            Parent parent = model.getParent();
+            if (parent != null && depth < 15) {
+                Model pm = externalModel(parent.getGroupId(), parent.getArtifactId(), parent.getVersion());
+                if (pm != null) props.putAll(externalProperties(pm, depth + 1));
+            }
+            model.getProperties().forEach((k, v) -> props.put(k.toString(), v.toString().trim()));
+            String group = model.getGroupId() != null ? model.getGroupId() : parent != null ? parent.getGroupId() : null;
+            String version = model.getVersion() != null ? model.getVersion() : parent != null ? parent.getVersion() : null;
+            for (String prefix : List.of("project.", "pom.", "")) {
+                if (group != null) props.put(prefix + "groupId", group);
+                if (version != null) props.put(prefix + "version", version);
+                props.put(prefix + "artifactId", model.getArtifactId());
+            }
+            if (parent != null) {
+                props.put("project.parent.version", parent.getVersion());
+                props.put("project.parent.groupId", parent.getGroupId());
+            }
+            return props;
+        }
+
+        static String expand(String value, Map<String, String> props) {
+            String current = value;
+            for (int depth = 0; depth < 10 && current.contains("${"); depth++) {
+                Matcher m = PLACEHOLDER.matcher(current);
+                StringBuilder sb = new StringBuilder();
+                while (m.find()) {
+                    String replacement = props.get(m.group(1));
+                    if (replacement == null) return null;
+                    m.appendReplacement(sb, Matcher.quoteReplacement(replacement));
+                }
+                m.appendTail(sb);
+                current = sb.toString();
+            }
+            return current.contains("${") ? null : current;
+        }
+
+        org.apache.maven.model.Dependency managedFor(Pom ctx, org.apache.maven.model.Dependency d) {
+            org.apache.maven.model.Dependency e = expanded(d, v -> resolve(ctx, v));
+            return managedIndex(ctx).get(managementKey(e));
+        }
+
+        // Effective scope: declared, else managed, else compile.
+        String scopeOf(Pom ctx, org.apache.maven.model.Dependency d) {
+            String declared = d.getScope() != null ? resolve(ctx, d.getScope()) : null;
+            if (declared != null && !declared.isBlank()) return declared;
+            org.apache.maven.model.Dependency m = managedFor(ctx, d);
+            if (m != null && m.getScope() != null && !m.getScope().isBlank() && !"import".equals(m.getScope())) {
+                return m.getScope();
+            }
+            if (d.getVersion() == null && m == null && !unresolvedByPom.getOrDefault(ctx, Set.of()).isEmpty()) {
+                String key = resolve(ctx, d.getGroupId()) + ":" + resolve(ctx, d.getArtifactId());
+                if (scopeWarnings.add(ctx.relativePath(repoRoot) + key)) {
+                    warnings.add(ctx.relativePath(repoRoot) + ": " + key + " is managed by "
+                            + String.join(", ", unresolvedByPom.get(ctx)) + ", not found in the local Maven repository "
+                            + localRepo + " — scope assumed compile; run 'mvn dependency:resolve' once and migrate "
+                            + "again, or check the generated configuration");
+                }
+            }
+            return "compile";
+        }
+
+        boolean optionalOf(Pom ctx, org.apache.maven.model.Dependency d) {
+            if (d.getOptional() != null) return d.isOptional();
+            org.apache.maven.model.Dependency m = managedFor(ctx, d);
+            return m != null && m.isOptional();
+        }
+
+        List<Exclusion> exclusionsOf(Pom ctx, org.apache.maven.model.Dependency d) {
+            org.apache.maven.model.Dependency m = managedFor(ctx, d);
+            if (m == null || m.getExclusions().isEmpty()) return d.getExclusions();
+            List<Exclusion> all = new ArrayList<>(d.getExclusions());
+            for (Exclusion e : m.getExclusions()) {
+                boolean present = all.stream().anyMatch(x -> Objects.equals(x.getGroupId(), e.getGroupId())
+                        && Objects.equals(x.getArtifactId(), e.getArtifactId()));
+                if (!present) all.add(e);
+            }
+            return all;
+        }
+
         // ── settings / properties / root ─────────────────────────────────────
 
         String settings(Pom root, List<Pom> modules) {
@@ -381,14 +659,158 @@ public class MavenToGradleConverter {
             return sb.toString();
         }
 
-        String rootScript() {
+        String rootScript(List<Pom> modules) {
             Script s = new Script();
             s.line("// " + HEADER);
             s.blank();
             s.open("allprojects");
             repositories(s);
             s.close();
+            for (Shared shared : sharing.values()) {
+                s.blank();
+                sharedBlock(s, shared, modules);
+            }
             return s.toString();
+        }
+
+        // ── shared parent configuration ──────────────────────────────────────
+
+        static boolean inheritsFrom(Pom pom, Pom parent) {
+            for (Pom p = pom.parent; p != null; p = p.parent) if (p == parent) return true;
+            return false;
+        }
+
+        void planSharing(List<Pom> modules) {
+            for (Pom parent : poms) {
+                if (parent.kind() != Kind.AGGREGATOR) continue;
+                List<Pom> inheritors = poms.stream().filter(q -> inheritsFrom(q, parent)).toList();
+                List<Pom> targets = inheritors.stream()
+                        .filter(q -> modules.contains(q) && q.kind() != Kind.PLATFORM).toList();
+                Set<Kind> kinds = EnumSet.noneOf(Kind.class);
+                targets.forEach(t -> kinds.add(t.kind()));
+                if (kinds.size() != 1) continue;
+                boolean top = sharing.keySet().stream().noneMatch(a -> inheritsFrom(parent, a));
+                Shared sh = new Shared(parent, targets, kinds.iterator().next(), top);
+
+                for (org.apache.maven.model.Dependency d : parent.model.getDependencies()) {
+                    if (shareable(parent, d, inheritors, targets, false)) sh.deps.add(d);
+                }
+                if (parent.model.getDependencyManagement() != null) {
+                    for (org.apache.maven.model.Dependency d : parent.model.getDependencyManagement().getDependencies()) {
+                        if (shareable(parent, d, inheritors, targets, true)) sh.managed.add(d);
+                    }
+                }
+                sh.shared.addAll(sh.deps);
+                sh.shared.addAll(sh.managed);
+                if (top) {
+                    sh.externalPlatform = parent.parent == null && parent.model.getParent() != null;
+                    sh.java = common(targets, this::javaVersion);
+                    sh.encoding = common(targets, t -> resolve(t, t.properties().get("project.build.sourceEncoding")));
+                    sh.junit = targets.stream().allMatch(t -> usesJUnitPlatform(t, t.dependencies()));
+                    DistributionManagement dm = targets.get(0).distribution();
+                    sh.publishing = targets.stream().allMatch(t -> t.distribution() == dm);
+                }
+                sharing.put(parent, sh);
+            }
+        }
+
+        // A parent's dependency can live in the shared block when no inheritor redeclares it, it is not a
+        // module of this repo, and it resolves the same in every target (no redefined version property).
+        boolean shareable(Pom parent, org.apache.maven.model.Dependency d, List<Pom> inheritors,
+                          List<Pom> targets, boolean managed) {
+            String mk = d.getManagementKey();
+            for (Pom q : inheritors) {
+                List<org.apache.maven.model.Dependency> own = managed
+                        ? (q.model.getDependencyManagement() != null ? q.model.getDependencyManagement().getDependencies() : List.of())
+                        : q.model.getDependencies();
+                if (own.stream().anyMatch(o -> o.getManagementKey().equals(mk))) return false;
+            }
+            String key = resolve(parent, d.getGroupId()) + ":" + resolve(parent, d.getArtifactId());
+            if (internalByKey.containsKey(key)) return false;
+            String scope = managed ? d.getScope() : scopeOf(parent, d);
+            for (Pom t : targets) {
+                String ts = managed ? d.getScope() : scopeOf(t, d);
+                if (!Objects.equals(scope, ts)) return false;
+            }
+            String coords = key + ":" + resolve(parent, d.getVersion());
+            for (Pom t : targets) {
+                String c = resolve(t, d.getGroupId()) + ":" + resolve(t, d.getArtifactId()) + ":" + resolve(t, d.getVersion());
+                if (!c.equals(coords)) return false;
+            }
+            return true;
+        }
+
+        static String common(List<Pom> targets, java.util.function.Function<Pom, String> value) {
+            String first = value.apply(targets.get(0));
+            if (first == null) return null;
+            for (Pom t : targets) if (!first.equals(value.apply(t))) return null;
+            return first;
+        }
+
+        List<Shared> sharedFor(Pom pom) {
+            return sharing.values().stream().filter(sh -> sh.targets.contains(pom)).toList();
+        }
+
+        Shared topSharedFor(Pom pom) {
+            return sharedFor(pom).stream().filter(sh -> sh.top).findFirst().orElse(null);
+        }
+
+        boolean isShared(Pom pom, org.apache.maven.model.Dependency d) {
+            return sharedFor(pom).stream().anyMatch(sh -> sh.shared.contains(d));
+        }
+
+        void sharedBlock(Script s, Shared sh, List<Pom> modules) {
+            boolean everySubproject = sh.parent.gradlePath.equals(":")
+                    && sh.targets.size() == modules.size()
+                    && modules.stream().noneMatch(m -> m.gradlePath.lastIndexOf(':') > 0);
+            if (everySubproject) {
+                s.open("subprojects");
+            } else {
+                List<String> projects = sh.targets.stream().map(t -> "project(" + str(t.gradlePath) + ")").toList();
+                s.open(kts ? "configure(listOf(" + String.join(", ", projects) + "))"
+                        : "configure([" + String.join(", ", projects) + "])");
+            }
+            s.line("// shared configuration from " + sh.parent.relativePath(repoRoot));
+            String kindPlugin = sh.kind == Kind.WAR ? "war" : "java-library";
+            s.line(kts ? "apply(plugin = \"" + kindPlugin + "\")" : "apply plugin: '" + kindPlugin + "'");
+            s.line(kts ? "apply(plugin = \"maven-publish\")" : "apply plugin: 'maven-publish'");
+
+            sharedContext = true;
+            Set<String> usedProps = new LinkedHashSet<>();
+            List<String> deps = new ArrayList<>();
+            List<String> constraints = new ArrayList<>();
+            render(sh.parent, sh.kind, sh.externalPlatform ? sh.parent.model.getParent() : null,
+                    sh.managed, sh.deps, null, deps, constraints, usedProps);
+            if (sh.junit) deps.add(call("testRuntimeOnly", str("org.junit.platform:junit-platform-launcher")));
+            if (kts && !usedProps.isEmpty()) {
+                s.blank();
+                for (String p : usedProps) s.line("val " + p + ": String by project");
+            }
+            if (sh.java != null) {
+                s.blank();
+                javaBlock(s, sh.java);
+            }
+            dependenciesBlock(s, deps, constraints);
+            sharedContext = false;
+
+            if (sh.encoding != null) {
+                s.blank();
+                encodingBlock(s, sh.encoding);
+            }
+            if (sh.junit) {
+                s.blank();
+                s.open(kts ? "tasks.withType<Test>().configureEach" : "tasks.withType(Test).configureEach");
+                s.line("useJUnitPlatform()");
+                s.close();
+            }
+            if (sh.publishing) {
+                s.blank();
+                s.open(kts ? "configure<PublishingExtension>" : "publishing");
+                publications(s, sh.kind, null);
+                publishRepositories(s, sh.targets.get(0).distribution());
+                s.close();
+            }
+            s.close();
         }
 
         void repositories(Script s) {
@@ -415,17 +837,23 @@ public class MavenToGradleConverter {
             List<String> deps = new ArrayList<>();
             List<String> constraints = new ArrayList<>();
             boolean junitPlatform = collectDependencies(pom, kind, deps, constraints, usedProps);
+            Shared top = single ? null : topSharedFor(pom);
+            boolean pluginsShared = !single && !sharedFor(pom).isEmpty();
 
             s.line("// " + HEADER);
-            s.blank();
-            s.open("plugins");
-            s.line(plugin(switch (kind) {
-                case WAR -> "war";
-                case PLATFORM -> "java-platform";
-                default -> "java-library";
-            }));
-            s.line(plugin("maven-publish"));
-            s.close();
+            // Groovy scripts see plugins applied by the root's shared block; Kotlin scripts still declare
+            // them so the type-safe accessors (api, java, publishing ...) are generated.
+            if (!pluginsShared || kts) {
+                s.blank();
+                s.open("plugins");
+                s.line(plugin(switch (kind) {
+                    case WAR -> "war";
+                    case PLATFORM -> "java-platform";
+                    default -> "java-library";
+                }));
+                s.line(plugin("maven-publish"));
+                s.close();
+            }
 
             if (kts && !usedProps.isEmpty()) {
                 s.blank();
@@ -440,13 +868,10 @@ public class MavenToGradleConverter {
                 if (versionDiffers) s.line("version = " + str(pom.version()));
             }
 
-            String javaVersion = kind != Kind.PLATFORM ? javaVersion(pom) : null;
+            String javaVersion = kind != Kind.PLATFORM && (top == null || top.java == null) ? javaVersion(pom) : null;
             if (javaVersion != null) {
                 s.blank();
-                s.open("java");
-                s.line("sourceCompatibility = JavaVersion.toVersion(" + str(javaVersion) + ")");
-                s.line("targetCompatibility = JavaVersion.toVersion(" + str(javaVersion) + ")");
-                s.close();
+                javaBlock(s, javaVersion);
             }
 
             if (kind == Kind.PLATFORM && !deps.isEmpty()) {
@@ -461,84 +886,148 @@ public class MavenToGradleConverter {
                 repositories(s);
             }
 
-            if (!deps.isEmpty() || !constraints.isEmpty()) {
-                s.blank();
-                s.open("dependencies");
-                if (!constraints.isEmpty()) {
-                    s.open("constraints");
-                    constraints.forEach(s::raw);
-                    s.close();
-                }
-                deps.forEach(s::raw);
-                s.close();
-            }
+            dependenciesBlock(s, deps, constraints);
 
-            String encoding = kind != Kind.PLATFORM ? resolve(pom, pom.properties().get("project.build.sourceEncoding")) : null;
+            String encoding = kind != Kind.PLATFORM && (top == null || top.encoding == null)
+                    ? resolve(pom, pom.properties().get("project.build.sourceEncoding")) : null;
             if (encoding != null) {
                 s.blank();
-                s.open(kts ? "tasks.withType<JavaCompile>().configureEach" : "tasks.withType(JavaCompile).configureEach");
-                s.line("options.encoding = " + str(encoding));
-                s.close();
+                encodingBlock(s, encoding);
             }
-            if (junitPlatform) {
+            if (junitPlatform && kind != Kind.PLATFORM && (top == null || !top.junit)) {
                 s.blank();
                 s.open(kts ? "tasks.named<Test>(\"test\")" : "tasks.named('test', Test)");
                 s.line("useJUnitPlatform()");
                 s.close();
             }
 
-            s.blank();
-            publishing(s, pom, kind, single);
+            String projectName = single ? pom.artifactId() : pom.gradlePath.substring(pom.gradlePath.lastIndexOf(':') + 1);
+            String artifactOverride = pom.artifactId().equals(projectName) ? null : pom.artifactId();
+            if (top != null && top.publishing) {
+                if (artifactOverride != null) {
+                    s.blank();
+                    s.line(kts ? "publishing.publications.named<MavenPublication>(\"maven\") { artifactId = " + str(artifactOverride) + " }"
+                            : "publishing.publications.maven.artifactId = " + str(artifactOverride));
+                }
+            } else {
+                s.blank();
+                s.open("publishing");
+                publications(s, kind, artifactOverride);
+                publishRepositories(s, pom.distribution());
+                s.close();
+            }
             return s.toString();
         }
 
-        // Fills deps/constraints with rendered statements. Returns true when JUnit 5 tests are present.
+        void dependenciesBlock(Script s, List<String> deps, List<String> constraints) {
+            if (deps.isEmpty() && constraints.isEmpty()) return;
+            s.blank();
+            s.open("dependencies");
+            if (!constraints.isEmpty()) {
+                s.open("constraints");
+                constraints.forEach(s::raw);
+                s.close();
+            }
+            deps.forEach(s::raw);
+            s.close();
+        }
+
+        void javaBlock(Script s, String javaVersion) {
+            s.open(kts && sharedContext ? "configure<JavaPluginExtension>" : "java");
+            s.line("sourceCompatibility = JavaVersion.toVersion(" + str(javaVersion) + ")");
+            s.line("targetCompatibility = JavaVersion.toVersion(" + str(javaVersion) + ")");
+            s.close();
+        }
+
+        void encodingBlock(Script s, String encoding) {
+            s.open(kts ? "tasks.withType<JavaCompile>().configureEach" : "tasks.withType(JavaCompile).configureEach");
+            s.line("options.encoding = " + str(encoding));
+            s.close();
+        }
+
+        static boolean usesJUnitPlatform(Pom pom, List<org.apache.maven.model.Dependency> deps) {
+            for (org.apache.maven.model.Dependency d : deps) {
+                String artifact = d.getArtifactId();
+                if (artifact != null && (artifact.startsWith("junit-jupiter") || artifact.equals("spring-boot-starter-test"))) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Fills deps/constraints with the module's own statements (contributions rendered by a shared
+        // parent block are left out). Returns true when JUnit 5 tests are present.
         boolean collectDependencies(Pom pom, Kind kind, List<String> deps, List<String> constraints,
                                     Set<String> usedProps) {
-            String where = pom.relativePath(repoRoot);
+            Shared top = topSharedFor(pom);
+            Parent parent = top != null && top.externalPlatform ? null : pom.externalParent();
+            List<org.apache.maven.model.Dependency> managed = pom.managed().stream().filter(d -> !isShared(pom, d)).toList();
+            List<org.apache.maven.model.Dependency> own = pom.dependencies().stream().filter(d -> !isShared(pom, d)).toList();
+            render(pom, kind, parent, managed, own, pom, deps, constraints, usedProps);
+            boolean junitPlatform = usesJUnitPlatform(pom, pom.dependencies());
+            if (junitPlatform && kind != Kind.PLATFORM && (top == null || !top.junit)) {
+                deps.add(call("testRuntimeOnly", str("org.junit.platform:junit-platform-launcher")));
+            }
+            return junitPlatform;
+        }
+
+        // Renders an external parent (as platform), managed dependencies and dependencies. `ctx` resolves
+        // placeholders; `self` is the module being written (null for a shared block).
+        void render(Pom ctx, Kind kind, Parent parent, List<org.apache.maven.model.Dependency> managed,
+                    List<org.apache.maven.model.Dependency> dependencies, Pom self,
+                    List<String> deps, List<String> constraints, Set<String> usedProps) {
+            String where = ctx.relativePath(repoRoot);
             String apiConfig = kind == Kind.WAR ? "implementation" : "api";
 
-            Parent parent = pom.externalParent();
             if (parent != null && parent.getGroupId() != null && parent.getArtifactId() != null) {
                 String key = parent.getGroupId() + ":" + parent.getArtifactId();
                 String artifact = parent.getArtifactId();
                 if ("org.springframework.boot:spring-boot-starter-parent".equals(key)) {
                     artifact = "spring-boot-dependencies";
                     substitutions.put(key, parent.getGroupId() + ":" + artifact);
-                    warnings.add(where + ": parent spring-boot-starter-parent replaced by platform(spring-boot-dependencies)"
-                            + " — consider the 'org.springframework.boot' Gradle plugin");
+                    String msg = "parent spring-boot-starter-parent replaced by platform(spring-boot-dependencies)"
+                            + " — consider the 'org.springframework.boot' Gradle plugin";
+                    if (warnings.stream().noneMatch(w -> w.endsWith(msg))) warnings.add(where + ": " + msg);
                 }
                 String coords = parent.getGroupId() + ":" + artifact
                         + (parent.getVersion() != null ? ":" + parent.getVersion() : "");
                 deps.add(call(apiConfig, "platform(" + str(coords) + ")"));
             }
 
-            for (org.apache.maven.model.Dependency d : pom.managed()) {
-                String key = resolve(pom, d.getGroupId()) + ":" + resolve(pom, d.getArtifactId());
-                if (internalByKey.containsKey(key)) continue;
-                String coords = coordinates(pom, d, usedProps);
+            for (org.apache.maven.model.Dependency d : managed) {
+                String key = resolve(ctx, d.getGroupId()) + ":" + resolve(ctx, d.getArtifactId());
+                Pom internal = internalByKey.get(key);
+                if (internal != null) {
+                    // An imported BOM of this repo: keep its managed versions via the project platform.
+                    if ("import".equals(d.getScope()) && internal.kind() == Kind.PLATFORM && internal != self
+                            && internal.gradlePath != null) {
+                        deps.add(call(apiConfig, "platform(project(" + str(internal.gradlePath) + "))"));
+                    }
+                    continue;
+                }
+                String coords = coordinates(ctx, d, usedProps);
                 if ("import".equals(d.getScope())) {
                     deps.add(call(apiConfig, "platform(" + str(coords) + ")"));
                 } else if (d.getVersion() != null) {
-                    constraints.add(call(apiConfig, str(coords)));
+                    String managedScope = d.getScope() == null ? "compile" : resolve(ctx, d.getScope());
+                    String constraintConfig = kind == Kind.PLATFORM || managedScope == null ? apiConfig
+                            : Objects.requireNonNullElse(configuration(kind, managedScope, false), apiConfig);
+                    constraints.add(kts && sharedContext ? "add(" + str(constraintConfig) + ", " + str(coords) + ")"
+                            : call(constraintConfig, str(coords)));
                 }
             }
 
-            boolean junitPlatform = false;
-            for (org.apache.maven.model.Dependency d : pom.dependencies()) {
-                String group = resolve(pom, d.getGroupId());
-                String artifact = resolve(pom, d.getArtifactId());
+            for (org.apache.maven.model.Dependency d : dependencies) {
+                String group = resolve(ctx, d.getGroupId());
+                String artifact = resolve(ctx, d.getArtifactId());
                 String key = group + ":" + artifact;
-                String scope = d.getScope() == null ? "compile" : d.getScope();
-                if (artifact != null && (artifact.startsWith("junit-jupiter") || artifact.equals("spring-boot-starter-test"))) {
-                    junitPlatform = true;
-                }
+                String scope = scopeOf(ctx, d);
                 if ("system".equals(scope)) {
                     warnings.add(where + ": system-scoped dependency " + key + " not migrated");
                     droppedKeys.add(key);
                     continue;
                 }
-                String config = configuration(kind, scope, d.isOptional());
+                String config = configuration(kind, scope, optionalOf(ctx, d));
                 if (config == null) {
                     warnings.add(where + ": " + scope + "-scoped dependency " + key
                             + " of a parent pom is not inherited by consumers in Gradle — add it to them");
@@ -548,7 +1037,7 @@ public class MavenToGradleConverter {
                 Pom internal = internalByKey.get(key);
                 String notation;
                 if (internal != null) {
-                    if (internal == pom) continue;
+                    if (internal == self) continue;
                     if (internal.kind() == Kind.AGGREGATOR || internal.gradlePath == null) {
                         warnings.add(where + ": dependency on aggregator " + key + " dropped");
                         continue;
@@ -561,15 +1050,11 @@ public class MavenToGradleConverter {
                     }
                 } else {
                     notation = "pom".equals(d.getType()) && "import".equals(scope)
-                            ? "platform(" + str(coordinates(pom, d, usedProps)) + ")"
-                            : str(coordinates(pom, d, usedProps));
+                            ? "platform(" + str(coordinates(ctx, d, usedProps)) + ")"
+                            : str(coordinates(ctx, d, usedProps));
                 }
-                deps.add(withExclusions(config, notation, d.getExclusions()));
+                deps.add(withExclusions(config, notation, exclusionsOf(ctx, d)));
             }
-            if (junitPlatform && kind != Kind.PLATFORM) {
-                deps.add(call("testRuntimeOnly", str("org.junit.platform:junit-platform-launcher")));
-            }
-            return junitPlatform;
         }
 
         String configuration(Kind kind, String scope, boolean optional) {
@@ -706,48 +1191,44 @@ public class MavenToGradleConverter {
             return null;
         }
 
-        void publishing(Script s, Pom pom, Kind kind, boolean single) {
+        void publications(Script s, Kind kind, String artifactId) {
             String component = switch (kind) {
                 case PLATFORM -> "javaPlatform";
                 case WAR -> "web";
                 default -> "java";
             };
-            String projectName = single ? pom.artifactId() : pom.gradlePath.substring(pom.gradlePath.lastIndexOf(':') + 1);
-            s.open("publishing");
             s.open("publications");
             s.open(kts ? "create<MavenPublication>(\"maven\")" : "maven(MavenPublication)");
             s.line(kts ? "from(components[\"" + component + "\"])" : "from components." + component);
-            if (!pom.artifactId().equals(projectName)) {
-                s.line("artifactId = " + str(pom.artifactId()));
+            if (artifactId != null) s.line("artifactId = " + str(artifactId));
+            s.close();
+            s.close();
+        }
+
+        void publishRepositories(Script s, DistributionManagement dm) {
+            if (dm == null || (dm.getRepository() == null && dm.getSnapshotRepository() == null)) return;
+            DeploymentRepository release = dm.getRepository();
+            DeploymentRepository snapshot = dm.getSnapshotRepository() != null ? dm.getSnapshotRepository() : release;
+            if (release == null) release = snapshot;
+            String name = gradleName(release.getId() != null ? release.getId() : "deploy");
+            s.open("repositories");
+            s.open("maven");
+            s.line("name = " + str(name));
+            if (Objects.equals(release.getUrl(), snapshot.getUrl())) {
+                s.line("url = uri(" + str(release.getUrl()) + ")");
+            } else if (kts) {
+                s.line("url = uri(if (version.toString().endsWith(\"SNAPSHOT\")) " + str(snapshot.getUrl())
+                        + " else " + str(release.getUrl()) + ")");
+            } else {
+                s.line("url = uri(version.toString().endsWith('SNAPSHOT') ? " + str(snapshot.getUrl())
+                        + " : " + str(release.getUrl()) + ")");
             }
+            s.line(kts ? "credentials(PasswordCredentials::class)" : "credentials(PasswordCredentials)");
             s.close();
             s.close();
-            DistributionManagement dm = pom.distribution();
-            if (dm != null && (dm.getRepository() != null || dm.getSnapshotRepository() != null)) {
-                DeploymentRepository release = dm.getRepository();
-                DeploymentRepository snapshot = dm.getSnapshotRepository() != null ? dm.getSnapshotRepository() : release;
-                if (release == null) release = snapshot;
-                String name = gradleName(release.getId() != null ? release.getId() : "deploy");
-                s.open("repositories");
-                s.open("maven");
-                s.line("name = " + str(name));
-                if (Objects.equals(release.getUrl(), snapshot.getUrl())) {
-                    s.line("url = uri(" + str(release.getUrl()) + ")");
-                } else if (kts) {
-                    s.line("url = uri(if (version.toString().endsWith(\"SNAPSHOT\")) " + str(snapshot.getUrl())
-                            + " else " + str(release.getUrl()) + ")");
-                } else {
-                    s.line("url = uri(version.toString().endsWith('SNAPSHOT') ? " + str(snapshot.getUrl())
-                            + " : " + str(release.getUrl()) + ")");
-                }
-                s.line(kts ? "credentials(PasswordCredentials::class)" : "credentials(PasswordCredentials)");
-                s.close();
-                s.close();
-                String msg = "distributionManagement migrated to publishing.repositories — set credentials via the "
-                        + name + "Username / " + name + "Password Gradle properties";
-                if (!warnings.contains(msg)) warnings.add(msg);
-            }
-            s.close();
+            String msg = "distributionManagement migrated to publishing.repositories — set credentials via the "
+                    + name + "Username / " + name + "Password Gradle properties";
+            if (!warnings.contains(msg)) warnings.add(msg);
         }
 
         // ── DSL helpers ──────────────────────────────────────────────────────
@@ -758,7 +1239,11 @@ public class MavenToGradleConverter {
         }
 
         String call(String config, String argument) {
-            return kts ? config + "(" + argument + ")" : config + " " + argument;
+            return kts ? cfg(config) + "(" + argument + ")" : config + " " + argument;
+        }
+
+        String cfg(String config) {
+            return kts && sharedContext ? "\"" + config + "\"" : config;
         }
 
         String plugin(String id) {
@@ -767,7 +1252,7 @@ public class MavenToGradleConverter {
 
         String withExclusions(String config, String notation, List<Exclusion> exclusions) {
             if (exclusions == null || exclusions.isEmpty()) return call(config, notation);
-            StringBuilder sb = new StringBuilder(config).append('(').append(notation).append(") {\n");
+            StringBuilder sb = new StringBuilder(cfg(config)).append('(').append(notation).append(") {\n");
             for (Exclusion e : exclusions) {
                 boolean anyGroup = e.getGroupId() == null || "*".equals(e.getGroupId());
                 boolean anyArtifact = e.getArtifactId() == null || "*".equals(e.getArtifactId());

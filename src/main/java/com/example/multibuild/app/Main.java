@@ -109,6 +109,14 @@ public class Main implements CommandLineRunner {
     @Value("${migrate.target:}")
     private String migrateTarget;
 
+    // migrate-gradle: start over — delete migrate.branch (locally and on origin, closing its PR) and migrate
+    // again from the source branch. Refused for branches with non-migration commits unless reset.force.
+    @Value("${migrate.reset:false}")
+    private boolean migrateReset;
+
+    @Value("${migrate.reset.force:false}")
+    private boolean migrateResetForce;
+
     private final GitService gitService;
     private final BranchService branchService;
     private final VersionUpdater pomVersionUpdater;
@@ -565,6 +573,13 @@ public class Main implements CommandLineRunner {
             System.exit(1);
         }
 
+        if (migrateReset && (migrateBranch.isBlank() || skipGit)) {
+            System.err.println("[ERROR] migrate.reset needs an explicit migrate.branch (the integration branch is never "
+                    + "deleted) and git (skip.git=false).");
+            System.exit(1);
+            return;
+        }
+
         List<RepoConfig> repoEntries = loadRepos(reposFile);
         if (!migrateTarget.isBlank()) {
             Set<String> wanted = Arrays.stream(migrateTarget.split(","))
@@ -584,15 +599,19 @@ public class Main implements CommandLineRunner {
         Path workDir = Paths.get(cloneDir);
         Files.createDirectories(workDir);
 
-        log.info("── Migrate to Gradle: {} repo(s)  branch={}  dsl={}  dryMode={}  skipGit={} ──",
+        log.info("── Migrate to Gradle: {} repo(s)  branch={}  dsl={}  dryMode={}  skipGit={}{} ──",
                 repoEntries.size(), skipGit ? "(local)" : branch,
-                gradleMigrationService.dsl().name().toLowerCase(), dryMode, skipGit);
+                gradleMigrationService.dsl().name().toLowerCase(), dryMode, skipGit,
+                migrateReset ? "  RESET" + (migrateResetForce ? " (forced)" : "") : "");
         boolean useIntegrationFlow = migrateBranch.isBlank();
+        Map<Path, GradleMigrationService.ResetResult> resets = new java.util.concurrent.ConcurrentHashMap<>();
         CloneResult cloned = skipGit
                 ? useLocalRepos(repoEntries, workDir)
                 : cloneRepos(repoEntries, workDir, (repoDir, entry) -> {
                     String source = resolveSourceBranch(repoDir, entry.getEffectiveSourceBranch(defaultSourceBranch));
-                    if (useIntegrationFlow) {
+                    if (migrateReset) {
+                        resets.put(repoDir, gradleMigrationService.reset(repoDir, branch, source, migrateResetForce, entry));
+                    } else if (useIntegrationFlow) {
                         branchService.apply(repoDir, source, entry);
                     } else if (!gitService.checkoutOrCreateBranch(repoDir, branch, source)) {
                         gitService.pull(repoDir);
@@ -601,12 +620,20 @@ public class Main implements CommandLineRunner {
 
         List<GradleMigrationService.Result> results = new ArrayList<>();
         for (Path repoDir : cloned.paths()) {
+            GradleMigrationService.ResetResult reset = resets.get(repoDir);
+            if (reset != null && !reset.ok()) {
+                log.error("  [{}] reset refused: {}", repoDir.getFileName(), reset.message());
+                results.add(new GradleMigrationService.Result(repoDir, GradleMigrationService.Status.FAILED,
+                        List.of(), List.of("reset refused: " + reset.message())));
+                continue;
+            }
             results.add(gradleMigrationService.migrate(repoDir, cloned.configByPath().get(repoDir), !skipGit));
         }
 
         log.info("── Migration summary ─────────────────────────────────────");
         for (GradleMigrationService.Result r : results) {
             String detail = switch (r.status()) {
+                case ALREADY_GRADLE -> r.warnings().isEmpty() ? "" : " — " + String.join("; ", r.warnings());
                 case MIGRATED -> r.warnings().isEmpty() ? "" : " (" + r.warnings().size() + " warning(s) — review above)";
                 case FAILED -> " — " + String.join("; ", r.errors());
                 default -> "";
@@ -637,7 +664,8 @@ public class Main implements CommandLineRunner {
                 + "  [--analyze.target=<repo>] [--analyze.scope=downstream|upstream|both]"
                 + " [--analyze.format=ascii|plantuml] [--analyze.output=<file>]");
         System.err.println("       java -jar multibuild.jar migrate-gradle  repos.json"
-                + "  [--migrate.branch=<branch>] [--migrate.target=<repo,...>] [--migrate.gradle.dsl=groovy|kotlin]");
+                + "  [--migrate.branch=<branch>] [--migrate.target=<repo,...>] [--migrate.gradle.dsl=groovy|kotlin]"
+                + " [--migrate.keep.maven=true] [--migrate.reset=true [--migrate.reset.force=true]]");
     }
 
     private record CloneResult(List<Path> paths, Map<Path, RepoConfig> configByPath) {}

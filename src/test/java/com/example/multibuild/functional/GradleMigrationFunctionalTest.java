@@ -10,6 +10,7 @@ import com.example.multibuild.buildsystem.ProjectVersionUpdater;
 import com.example.multibuild.git.JGitService;
 import com.example.multibuild.gradle.GradleDependencyUpdater;
 import com.example.multibuild.gradle.GradleMigrationService;
+import com.example.multibuild.gradle.GradleWrapperGenerator;
 import com.example.multibuild.gradle.GradleParser;
 import com.example.multibuild.gradle.GradleProperties;
 import com.example.multibuild.gradle.GradleVersionUpdater;
@@ -65,11 +66,11 @@ class GradleMigrationFunctionalTest {
         aggregator = new ProjectAggregator(new ProjectParserDispatcher(mavenParser, gradleParser));
         formatter = new CommitMessageFormatter();
         ReflectionTestUtils.setField(formatter, "prefix", "");
-        migration = new GradleMigrationService(new MavenToGradleConverter(), mavenParser, gradleParser, git, formatter);
+        migration = new GradleMigrationService(new MavenToGradleConverter(), mavenParser, gradleParser, git, formatter, new GradleWrapperGenerator());
         ReflectionTestUtils.setField(migration, "dsl", "groovy");
         ReflectionTestUtils.setField(migration, "generateWrapper", false);
-        ReflectionTestUtils.setField(migration, "gradleVersion", "8.10.2");
         ReflectionTestUtils.setField(migration, "dryMode", false);
+        ReflectionTestUtils.setField(migration, "keepMaven", false);
     }
 
     // ── graph ────────────────────────────────────────────────────────────────

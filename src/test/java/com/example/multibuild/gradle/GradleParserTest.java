@@ -175,6 +175,31 @@ class GradleParserTest {
                 .containsExactly("com.acme:x:1.1", "com.acme:y:2.2", "com.acme:z:3.3", "com.acme:w:1.1");
     }
 
+    @Test
+    void configureBlock_appliesOnlyToTargetedProjects() {
+        write(repo.resolve("settings.gradle.kts"), "include(\"a\", \"b\", \"c\")\n");
+        write(repo.resolve("gradle.properties"), "group=g\nversion=1\nlibVersion=3.0\n");
+        write(repo.resolve("build.gradle.kts"), """
+                configure(listOf(project(":a"), project(":b"))) {
+                    apply(plugin = "java-library")
+                    val libVersion: String by project
+                    dependencies {
+                        constraints { add("api", "com.acme:managed:2.0") }
+                        "api"("com.acme:shared:$libVersion")
+                    }
+                }
+                """);
+        write(repo.resolve("a/build.gradle.kts"), "dependencies { api(project(\":b\")) }\n");
+        write(repo.resolve("c/build.gradle.kts"), "plugins { `java-library` }\n");
+
+        RepositoryProject project = parser.parse(repo);
+
+        assertThat(project.getModules()).extracting(m -> m.getArtifact().getArtifactId()).containsExactly("a", "b", "c");
+        assertThat(deps(project.getModules().get(0))).containsExactly("com.acme:managed:2.0", "com.acme:shared:3.0");
+        assertThat(deps(project.getModules().get(1))).containsExactly("com.acme:managed:2.0", "com.acme:shared:3.0");
+        assertThat(deps(project.getModules().get(2))).isEmpty();
+    }
+
     private static List<String> deps(Module m) {
         return m.getDependencies().stream().map(d -> d.getArtifact().toString()).toList();
     }

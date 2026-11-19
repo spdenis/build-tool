@@ -133,16 +133,18 @@ class MavenToGradleConverterTest {
     }
 
     @Test
-    void aggregatorDependenciesAndParent_areInlinedIntoModules() {
+    void aggregatorDependenciesAndParent_areSharedFromRootScript() {
         Path parentDep = Fixtures.copy("repo-multi-parent-dep", tempDir);
         converter.apply(converter.convert(parentDep, GradleDsl.GROOVY));
-        assertThat(read(parentDep.resolve("module-y/build.gradle")))
-                .contains("api 'com.example:lib-a:1.0.0-SNAPSHOT'");
+        assertThat(read(parentDep.resolve("build.gradle")))
+                .contains("subprojects {", "api 'com.example:lib-a:1.0.0-SNAPSHOT'");
+        assertThat(read(parentDep.resolve("module-y/build.gradle"))).doesNotContain("lib-a");
 
         Path multiChild = Fixtures.copy("repo-multi-child", tempDir);
         converter.apply(converter.convert(multiChild, GradleDsl.GROOVY));
-        assertThat(read(multiChild.resolve("module-x/build.gradle")))
+        assertThat(read(multiChild.resolve("build.gradle")))
                 .contains("api platform('com.example:lib-a-parent:1.0.0-SNAPSHOT')");
+        assertThat(read(multiChild.resolve("module-x/build.gradle"))).doesNotContain("lib-a-parent");
     }
 
     @Test

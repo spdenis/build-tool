@@ -5,8 +5,9 @@ import java.nio.file.Path;
 import java.util.List;
 
 // Build system used by a repository, detected from the build files at its root.
-// Gradle wins when both are present: a repo migrated by migrate-gradle no longer has a pom.xml,
-// and a hand-migrated repo that still carries a stale pom.xml is built with Gradle.
+// Gradle wins when both are present: it is the build that is parsed and run. A repo migrated with
+// migrate.keep.maven=true keeps its poms until the migration is completed; meanwhile version and
+// dependency updates are applied to both builds (see hasMavenBuild) so the Maven build stays usable.
 public enum BuildSystem {
     MAVEN, GRADLE, NONE;
 
@@ -19,6 +20,11 @@ public enum BuildSystem {
         }
         if (Files.isRegularFile(repoRoot.resolve("pom.xml"))) return MAVEN;
         return NONE;
+    }
+
+    // True when a pom.xml sits next to a Gradle build (migration in progress, or a stale pom).
+    public static boolean hasMavenBuild(Path repoRoot) {
+        return Files.isRegularFile(repoRoot.resolve("pom.xml"));
     }
 
     // True when the repo has a build the tool can parse and version (pom.xml or Gradle build).

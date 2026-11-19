@@ -52,4 +52,15 @@ class LightspeedTriggerTest {
     void repoWithoutBuild_isNotTriggered() throws Exception {
         assertThat(LightspeedBuildService.injectTrigger(tempDir, "t1")).isFalse();
     }
+
+    @Test
+    void gradleRepoWithKeptPom_triggersBothBuilds() throws Exception {
+        Path repo = Fixtures.copy("repo-a", tempDir);
+        write(repo.resolve("settings.gradle"), "rootProject.name = 'lib-a'\n");
+
+        LightspeedBuildService.injectTrigger(repo, "t2");
+
+        assertThat(GradleProperties.read(repo.resolve("gradle.properties"))).containsEntry("build.trigger.timestamp", "t2");
+        assertThat(read(repo.resolve("pom.xml"))).contains("t2");
+    }
 }

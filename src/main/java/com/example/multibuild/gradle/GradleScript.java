@@ -6,6 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -62,6 +63,39 @@ final class GradleScript {
             int open = m.end() - 1;
             int close = matchingBrace(open);
             result.add(new int[]{open + 1, close});
+        }
+        return result;
+    }
+
+    // `configure([project(':a'), project(':b')]) { ... }` / `configure(listOf(project(":a"))) { ... }`:
+    // the project paths it targets and the block body range.
+    record TargetedBlock(Set<String> paths, int[] range) {}
+
+    private static final Pattern PROJECT_REF = Pattern.compile("project\\(\\s*[\"']([^\"']+)[\"']\\s*\\)");
+
+    List<TargetedBlock> configureBlocks() {
+        List<TargetedBlock> result = new ArrayList<>();
+        Matcher m = Pattern.compile("(?<![\\w$.])configure\\s*\\(").matcher(code);
+        while (m.find()) {
+            int open = m.end() - 1;
+            int depth = 0;
+            int close = -1;
+            for (int i = open; i < code.length(); i++) {
+                char c = code.charAt(i);
+                if (c == '(') depth++;
+                else if (c == ')' && --depth == 0) { close = i; break; }
+            }
+            if (close < 0) continue;
+            int brace = close + 1;
+            while (brace < code.length() && Character.isWhitespace(code.charAt(brace))) brace++;
+            if (brace >= code.length() || code.charAt(brace) != '{') continue;
+            Set<String> paths = new LinkedHashSet<>();
+            Matcher pm = PROJECT_REF.matcher(text.substring(open, close));
+            while (pm.find()) {
+                String path = pm.group(1);
+                paths.add(path.startsWith(":") ? path : ":" + path);
+            }
+            if (!paths.isEmpty()) result.add(new TargetedBlock(paths, new int[]{brace + 1, matchingBrace(brace)}));
         }
         return result;
     }

@@ -237,7 +237,10 @@ public class NativeGitService implements GitService {
         }
 
         log.info("Creating branch {} from origin/{} in {}", branchName, sourceBranch, repoDir.getFileName());
-        exec(repoDir, "git", "checkout", "-b", branchName, "origin/" + sourceBranch);
+        // --no-track: a branch created from origin/<source> would otherwise track the SOURCE branch, which
+        // makes `git push` fail ("upstream branch ... does not match the name of your current branch") or,
+        // with push.default=upstream, push onto the source branch.
+        exec(repoDir, "git", "checkout", "--no-track", "-b", branchName, "origin/" + sourceBranch);
         return true;
     }
 
@@ -274,11 +277,22 @@ public class NativeGitService implements GitService {
         exec(repoDir, "git", "reset", "--hard", "origin/" + branch);
     }
 
+    // Removes the upstream of `branch` when it is another branch (or any upstream when `any` is set).
+    private void dropForeignUpstream(Path repoDir, String branch, boolean any) {
+        String upstream = exec(repoDir, "git", "for-each-ref", "--format=%(upstream:short)", "refs/heads/" + branch).trim();
+        if (upstream.isEmpty() || (!any && upstream.equals("origin/" + branch))) return;
+        log.info("  [{}] Branch '{}' tracked '{}' — removing that upstream", repoDir.getFileName(), branch, upstream);
+        exec(repoDir, "git", "branch", "--unset-upstream", branch);
+    }
+
     @Override
     public void push(Path repoDir) {
         String branch = exec(repoDir, "git", "rev-parse", "--abbrev-ref", "HEAD").trim();
         log.info("Pushing branch {} in {}", branch, repoDir.getFileName());
-        execLiveRemote(repoDir, "git", "push", "-u", "origin", branch);
+        // Clones made by earlier versions may track another branch (e.g. origin/main): drop that upstream.
+        dropForeignUpstream(repoDir, branch, false);
+        // Full refspec: the destination is always the same-named branch, whatever push.default says.
+        execLiveRemote(repoDir, "git", "push", "-u", "origin", "refs/heads/" + branch + ":refs/heads/" + branch);
     }
 
     @Override
@@ -296,6 +310,61 @@ public class NativeGitService implements GitService {
                     repoDir.getFileName(), branch, aheadCount);
             push(repoDir);
         }
+    }
+
+    // Fetches origin/<branch> into its remote tracking ref. Returns false when origin has no such branch.
+    private boolean fetchBranch(Path repoDir, String branch) {
+        if (execRemote(repoDir, "git", "ls-remote", "--heads", "origin", branch).isBlank()) return false;
+        execRemote(repoDir, "git", "fetch", "origin", "+refs/heads/" + branch + ":refs/remotes/origin/" + branch);
+        return true;
+    }
+
+    private boolean refExists(Path repoDir, String ref) {
+        return !exec(repoDir, "git", "for-each-ref", ref).isBlank();
+    }
+
+    @Override
+    public List<String> commitsAhead(Path repoDir, String branch, String baseBranch) {
+        fetchBranch(repoDir, baseBranch);
+        String tip = fetchBranch(repoDir, branch) ? "refs/remotes/origin/" + branch : "refs/heads/" + branch;
+        if (!refExists(repoDir, tip)) return List.of();
+        List<String> cmd = new ArrayList<>(List.of("git", "log", "--format=%s", tip));
+        if (refExists(repoDir, "refs/remotes/origin/" + baseBranch)) cmd.add("^refs/remotes/origin/" + baseBranch);
+        String out = exec(repoDir, cmd.toArray(String[]::new));
+        return out.isBlank() ? List.of() : List.of(out.strip().split("\\R"));
+    }
+
+    @Override
+    public boolean deleteBranch(Path repoDir, String branch, boolean deleteRemote) {
+        String current = exec(repoDir, "git", "rev-parse", "--abbrev-ref", "HEAD").trim();
+        if (branch.equals(current)) {
+            throw new IllegalStateException("Cannot delete the checked-out branch " + branch + " in " + repoDir);
+        }
+        if (refExists(repoDir, "refs/heads/" + branch)) {
+            exec(repoDir, "git", "branch", "-D", branch);
+            log.info("  Deleted local branch {} in {}", branch, repoDir.getFileName());
+        }
+        boolean remoteDeleted = false;
+        if (deleteRemote && !execRemote(repoDir, "git", "ls-remote", "--heads", "origin", branch).isBlank()) {
+            execLiveRemote(repoDir, "git", "push", "origin", ":refs/heads/" + branch);
+            log.info("  Deleted remote branch origin/{} in {}", branch, repoDir.getFileName());
+            remoteDeleted = true;
+        }
+        // Drop the tracking ref too, so a later sync does not reset the branch back to the old remote copy.
+        if (refExists(repoDir, "refs/remotes/origin/" + branch)) {
+            exec(repoDir, "git", "branch", "-r", "-D", "origin/" + branch);
+        }
+        return remoteDeleted;
+    }
+
+    @Override
+    public void createFreshBranch(Path repoDir, String branch, String sourceBranch) {
+        exec(repoDir, "git", "reset", "--hard");
+        exec(repoDir, "git", "clean", "-fd");
+        fetchBranch(repoDir, sourceBranch);
+        exec(repoDir, "git", "checkout", "--no-track", "-B", branch, "origin/" + sourceBranch);
+        dropForeignUpstream(repoDir, branch, true);
+        log.info("  Created fresh branch {} from origin/{} in {}", branch, sourceBranch, repoDir.getFileName());
     }
 
     @Override

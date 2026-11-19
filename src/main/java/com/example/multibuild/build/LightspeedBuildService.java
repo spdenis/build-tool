@@ -307,6 +307,8 @@ public class LightspeedBuildService implements BuildService {
         switch (BuildSystem.detect(repoRoot)) {
             case GRADLE -> {
                 GradleProperties.set(repoRoot.resolve(GradleProperties.FILE_NAME), TRIGGER_PROP, timestamp);
+                // Migration in progress: a pipeline may still build the kept Maven build.
+                if (BuildSystem.hasMavenBuild(repoRoot)) injectTimestamp(repoRoot.resolve("pom.xml"), timestamp);
                 return true;
             }
             case MAVEN -> {

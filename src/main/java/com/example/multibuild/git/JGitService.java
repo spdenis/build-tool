@@ -273,10 +273,12 @@ public class JGitService implements GitService {
             }
 
             log.info("Creating branch {} from origin/{} in {}", branchName, sourceBranch, repoDir.getFileName());
+            // NOTRACK: the new branch must not track the source branch (see NativeGitService).
             git.checkout()
                     .setCreateBranch(true)
                     .setName(branchName)
                     .setStartPoint("refs/remotes/origin/" + sourceBranch)
+                    .setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.NOTRACK)
                     .call();
             return true;
 
@@ -395,6 +397,97 @@ public class JGitService implements GitService {
             }
         } catch (IOException e) {
             throw new RuntimeException("Failed to check ahead status in " + repoDir, e);
+        }
+    }
+
+    private <C extends TransportCommand<C, ?>> C withAuth(Git git, C command) {
+        command.setTransportConfigCallback(sshTransportCallback()).setTimeout(gitTimeoutSeconds);
+        if (!isSshRemote(git) && !githubToken.isBlank() && !remoteHasEmbeddedCredentials(git)) {
+            command.setCredentialsProvider(httpCredentials());
+        }
+        return command;
+    }
+
+    private boolean remoteHasBranch(Git git, String branch) throws GitAPIException {
+        return withAuth(git, git.lsRemote().setRemote("origin").setHeads(true)).call().stream()
+                .anyMatch(ref -> ref.getName().equals("refs/heads/" + branch));
+    }
+
+    // Fetches origin/<branch> into its remote tracking ref. Returns false when origin has no such branch.
+    private boolean fetchBranch(Git git, String branch) throws GitAPIException {
+        if (!remoteHasBranch(git, branch)) return false;
+        withAuth(git, git.fetch().setRemote("origin")
+                .setRefSpecs(new RefSpec("+refs/heads/" + branch + ":refs/remotes/origin/" + branch))).call();
+        return true;
+    }
+
+    @Override
+    public List<String> commitsAhead(Path repoDir, String branch, String baseBranch) {
+        try (Git git = Git.open(repoDir.toFile())) {
+            var repo = git.getRepository();
+            fetchBranch(git, baseBranch);
+            ObjectId tip = fetchBranch(git, branch) ? repo.resolve("refs/remotes/origin/" + branch)
+                    : repo.resolve("refs/heads/" + branch);
+            if (tip == null) return List.of();
+            ObjectId base = repo.resolve("refs/remotes/origin/" + baseBranch);
+            List<String> subjects = new ArrayList<>();
+            try (RevWalk walk = new RevWalk(repo)) {
+                walk.markStart(walk.parseCommit(tip));
+                if (base != null) walk.markUninteresting(walk.parseCommit(base));
+                for (RevCommit c : walk) subjects.add(c.getShortMessage());
+            }
+            return subjects;
+        } catch (GitAPIException | IOException e) {
+            throw new RuntimeException("Failed to list commits of " + branch + " in " + repoDir, e);
+        }
+    }
+
+    @Override
+    public boolean deleteBranch(Path repoDir, String branch, boolean deleteRemote) {
+        try (Git git = Git.open(repoDir.toFile())) {
+            var repo = git.getRepository();
+            if (branch.equals(repo.getBranch())) {
+                throw new IllegalStateException("Cannot delete the checked-out branch " + branch + " in " + repoDir);
+            }
+            if (repo.resolve("refs/heads/" + branch) != null) {
+                git.branchDelete().setBranchNames("refs/heads/" + branch).setForce(true).call();
+                log.info("  Deleted local branch {} in {}", branch, repoDir.getFileName());
+            }
+            boolean remoteDeleted = false;
+            if (deleteRemote && remoteHasBranch(git, branch)) {
+                withAuth(git, git.push().setRemote("origin").setRefSpecs(new RefSpec(":refs/heads/" + branch))).call();
+                log.info("  Deleted remote branch origin/{} in {}", branch, repoDir.getFileName());
+                remoteDeleted = true;
+            }
+            // Drop the tracking ref too, so a later sync does not reset the branch back to the old remote copy.
+            if (repo.resolve("refs/remotes/origin/" + branch) != null) {
+                git.branchDelete().setBranchNames("refs/remotes/origin/" + branch).setForce(true).call();
+            }
+            return remoteDeleted;
+        } catch (GitAPIException | IOException e) {
+            throw new RuntimeException("Failed to delete branch " + branch + " in " + repoDir, e);
+        }
+    }
+
+    @Override
+    public void createFreshBranch(Path repoDir, String branch, String sourceBranch) {
+        try (Git git = Git.open(repoDir.toFile())) {
+            git.reset().setMode(ResetCommand.ResetType.HARD).call();
+            git.clean().setCleanDirectories(true).call();
+            fetchBranch(git, sourceBranch);
+            String start = "refs/remotes/origin/" + sourceBranch;
+            if (!branch.equals(git.getRepository().getBranch())) {
+                boolean exists = git.getRepository().resolve("refs/heads/" + branch) != null;
+                git.checkout().setCreateBranch(!exists).setForced(true).setName(branch).setStartPoint(start)
+                        .setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.NOTRACK).call();
+            }
+            git.reset().setMode(ResetCommand.ResetType.HARD).setRef(start).call();
+            StoredConfig config = git.getRepository().getConfig();
+            config.unsetSection("branch", branch);
+            config.save();
+            log.info("  Created fresh branch {} from origin/{} in {}", branch, sourceBranch, repoDir.getFileName());
+        } catch (GitAPIException | IOException e) {
+            throw new RuntimeException("Failed to create branch " + branch + " in " + repoDir, e);
         }
     }
 
