@@ -6,6 +6,7 @@ import org.apache.maven.model.Exclusion;
 import org.apache.maven.model.Model;
 import org.apache.maven.model.Parent;
 import org.apache.maven.model.Plugin;
+import org.apache.maven.model.PluginExecution;
 import org.apache.maven.model.Repository;
 import org.apache.maven.model.io.xpp3.MavenXpp3Reader;
 import org.codehaus.plexus.util.xml.Xpp3Dom;
@@ -43,6 +44,13 @@ import java.util.stream.Stream;
 //   read from the local Maven repository (maven.repo.local, else <localRepository> in ~/.m2/settings.xml,
 //   else ~/.m2/repository); when one is missing the affected dependencies are reported as warnings.
 //   Managed versions become constraints in the configuration matching the managed scope.
+//   Annotation processing: Gradle only runs processors on the annotationProcessor path. Processors from
+//   maven-compiler-plugin <annotationProcessorPaths> — and, when none are configured, known processors found
+//   on the classpath (Lombok, MapStruct, Hibernate JPA model gen, Spring Boot configuration processor, ...),
+//   which Maven discovers automatically — become annotationProcessor / testAnnotationProcessor dependencies.
+//   <compilerArgs>, <parameters>true</parameters> and <proc> become options.compilerArgs. The compiler
+//   configuration is looked up like Maven merges it: module, in-repo parents, then external parents from
+//   the local Maven repository (spring-boot-starter-parent implies -parameters).
 //   <parent> outside the repo → platform(parent) so managed versions and the cross-repo edge are kept;
 //   dependencyManagement → constraints { } (scope import → platform()).
 //   An in-repo parent pom becomes a shared block in the root script — `subprojects { }` when every
@@ -256,6 +264,7 @@ public class MavenToGradleConverter {
         String encoding;
         boolean junit;
         boolean publishing;
+        boolean processing;                // annotation processors / compiler args identical in all targets
 
         Shared(Pom parent, List<Pom> targets, Kind kind, boolean top, boolean perKind) {
             this.parent = parent;
@@ -737,6 +746,9 @@ public class MavenToGradleConverter {
                         sh.java = common(targets, this::javaVersion);
                         sh.encoding = common(targets, t -> resolve(t, t.properties().get("project.build.sourceEncoding")));
                         sh.junit = targets.stream().allMatch(t -> usesJUnitPlatform(t, t.dependencies()));
+                        Processing first = processing(targets.get(0), new LinkedHashSet<>());
+                        sh.processing = !first.isEmpty()
+                                && targets.stream().allMatch(t -> processing(t, new LinkedHashSet<>()).equals(first));
                         DistributionManagement dm = targets.get(0).distribution();
                         sh.publishing = targets.stream().allMatch(t -> t.distribution() == dm);
                     }
@@ -814,6 +826,8 @@ public class MavenToGradleConverter {
             render(sh.parent, sh.kind, sh.externalPlatform ? sh.parent.model.getParent() : null,
                     sh.managed, sh.deps, null, deps, constraints, usedProps);
             if (sh.junit) deps.add(call("testRuntimeOnly", str("org.junit.platform:junit-platform-launcher")));
+            Processing processing = sh.processing ? processing(sh.targets.get(0), usedProps) : null;
+            if (processing != null) deps.addAll(processing.dependencies());
             if (kts && !usedProps.isEmpty()) {
                 s.blank();
                 for (String p : usedProps) s.line("val " + p + ": String by project");
@@ -828,6 +842,10 @@ public class MavenToGradleConverter {
             if (sh.encoding != null) {
                 s.blank();
                 encodingBlock(s, sh.encoding);
+            }
+            if (processing != null && !processing.compilerArgs().isEmpty()) {
+                s.blank();
+                compilerArgsBlock(s, processing.compilerArgs());
             }
             if (sh.junit) {
                 s.blank();
@@ -871,6 +889,8 @@ public class MavenToGradleConverter {
             boolean junitPlatform = collectDependencies(pom, kind, deps, constraints, usedProps);
             Shared top = single ? null : topSharedFor(pom);
             boolean pluginsShared = !single && !sharedFor(pom).isEmpty();
+            Processing processing = top != null && top.processing ? null : processing(pom, usedProps);
+            if (processing != null) deps.addAll(processing.dependencies());
 
             s.line("// " + HEADER);
             // Groovy scripts see plugins applied by the root's shared block; Kotlin scripts still declare
@@ -925,6 +945,10 @@ public class MavenToGradleConverter {
             if (encoding != null) {
                 s.blank();
                 encodingBlock(s, encoding);
+            }
+            if (processing != null && !processing.compilerArgs().isEmpty()) {
+                s.blank();
+                compilerArgsBlock(s, processing.compilerArgs());
             }
             if (junitPlatform && kind != Kind.PLATFORM && (top == null || !top.junit)) {
                 s.blank();
@@ -1199,6 +1223,197 @@ public class MavenToGradleConverter {
                 case "project.parent.groupId", "parent.groupId" -> parent != null ? parent.getGroupId() : null;
                 default -> null;
             };
+        }
+
+        // ── annotation processing / compiler arguments ───────────────────────
+
+        // Processors Maven discovers on the classpath (META-INF/services) and Gradle does not.
+        static final Set<String> KNOWN_PROCESSORS = Set.of(
+                "org.projectlombok:lombok", "org.projectlombok:lombok-mapstruct-binding",
+                "org.mapstruct:mapstruct-processor",
+                "org.hibernate:hibernate-jpamodelgen", "org.hibernate.orm:hibernate-jpamodelgen",
+                "org.springframework.boot:spring-boot-configuration-processor",
+                "org.springframework.boot:spring-boot-autoconfigure-processor",
+                "com.google.auto.value:auto-value", "com.google.auto.service:auto-service",
+                "org.immutables:value", "com.google.dagger:dagger-compiler", "com.querydsl:querydsl-apt",
+                "io.micronaut:micronaut-inject-java", "info.picocli:picocli-codegen");
+
+        // A compiler plugin setting and the properties of the (external) pom it was found in.
+        record CompilerSetting(Xpp3Dom node, Map<String, String> externalProps) {}
+
+        record Processing(List<String> dependencies, List<String> compilerArgs) {
+            boolean isEmpty() { return dependencies.isEmpty() && compilerArgs.isEmpty(); }
+        }
+
+        static List<Plugin> compilerPlugins(Model model) {
+            List<Plugin> result = new ArrayList<>();
+            if (model.getBuild() == null) return result;
+            for (Plugin p : model.getBuild().getPlugins()) {
+                if ("maven-compiler-plugin".equals(p.getArtifactId())) result.add(p);
+            }
+            if (model.getBuild().getPluginManagement() != null) {
+                for (Plugin p : model.getBuild().getPluginManagement().getPlugins()) {
+                    if ("maven-compiler-plugin".equals(p.getArtifactId())) result.add(p);
+                }
+            }
+            return result;
+        }
+
+        static Xpp3Dom child(Plugin plugin, String name) {
+            if (plugin.getConfiguration() instanceof Xpp3Dom cfg && cfg.getChild(name) != null) return cfg.getChild(name);
+            for (PluginExecution e : plugin.getExecutions()) {
+                if (!"default-compile".equals(e.getId())) continue;
+                if (e.getConfiguration() instanceof Xpp3Dom cfg && cfg.getChild(name) != null) return cfg.getChild(name);
+            }
+            return null;
+        }
+
+        // Nearest maven-compiler-plugin setting `name`: the module and its in-repo parents, then external parents.
+        CompilerSetting compilerSetting(Pom pom, String name) {
+            for (Pom p = pom; p != null; p = p.parent) {
+                for (Plugin plugin : compilerPlugins(p.model)) {
+                    Xpp3Dom node = child(plugin, name);
+                    if (node != null) return new CompilerSetting(node, Map.of());
+                }
+            }
+            Parent ext = pom.externalParent();
+            for (int depth = 0; ext != null && depth < 15; depth++) {
+                if (ext.getGroupId() == null || ext.getVersion() == null || ext.getVersion().contains("${")) break;
+                Model model = externalModel(ext.getGroupId(), ext.getArtifactId(), ext.getVersion());
+                if (model == null) break;
+                for (Plugin plugin : compilerPlugins(model)) {
+                    Xpp3Dom node = child(plugin, name);
+                    if (node != null) return new CompilerSetting(node, externalProperties(model, 0));
+                }
+                ext = model.getParent();
+            }
+            return null;
+        }
+
+        String settingValue(Pom pom, CompilerSetting setting, String raw) {
+            if (raw == null) return null;
+            String v = resolve(pom, raw.trim());
+            if (v == null && !setting.externalProps().isEmpty()) v = expand(raw.trim(), setting.externalProps());
+            return v;
+        }
+
+        Processing processing(Pom pom, Set<String> usedProps) {
+            List<String> deps = new ArrayList<>();
+            List<String> args = new ArrayList<>();
+            if (pom.kind() == Kind.PLATFORM) return new Processing(deps, args);
+            boolean versionless = false;
+
+            CompilerSetting paths = compilerSetting(pom, "annotationProcessorPaths");
+            List<String> processors = new ArrayList<>();
+            if (paths != null) {
+                for (Xpp3Dom path : paths.node().getChildren()) {
+                    org.apache.maven.model.Dependency d = new org.apache.maven.model.Dependency();
+                    d.setGroupId(text(path, "groupId"));
+                    d.setArtifactId(text(path, "artifactId"));
+                    d.setVersion(text(path, "version"));
+                    d.setClassifier(text(path, "classifier"));
+                    if (d.getGroupId() == null || d.getArtifactId() == null) continue;
+                    if (!paths.externalProps().isEmpty()) {
+                        d = expanded(d, v -> settingValue(pom, paths, v));
+                    }
+                    if (d.getVersion() == null) {
+                        org.apache.maven.model.Dependency m = managedFor(pom, d);
+                        if (m != null && m.getVersion() != null) d.setVersion(m.getVersion());
+                    }
+                    versionless |= d.getVersion() == null;
+                    String coords = str(coordinates(pom, d, usedProps));
+                    processors.add(coords);
+                    deps.add(call("annotationProcessor", coords));
+                }
+                for (String c : processors) deps.add(call("testAnnotationProcessor", c));
+            } else {
+                // No processor path configured: Maven runs processors found on the compile classpath.
+                for (org.apache.maven.model.Dependency d : pom.dependencies()) {
+                    String key = resolve(pom, d.getGroupId()) + ":" + resolve(pom, d.getArtifactId());
+                    if (!KNOWN_PROCESSORS.contains(key)) continue;
+                    String scope = scopeOf(pom, d);
+                    String coords = str(coordinates(pom, d, usedProps));
+                    versionless |= d.getVersion() == null;
+                    if ("test".equals(scope)) {
+                        deps.add(call("testAnnotationProcessor", coords));
+                        continue;
+                    }
+                    deps.add(call("annotationProcessor", coords));
+                    deps.add(call("testAnnotationProcessor", coords));
+                    // provided → compileOnly is not on the test compile classpath in Gradle (it is in Maven)
+                    if ("provided".equals(scope)) deps.add(call("testCompileOnly", coords));
+                }
+            }
+            if (versionless && !deps.isEmpty()) {
+                // processor paths do not see the platforms of api/implementation: add them explicitly
+                List<String> platforms = new ArrayList<>();
+                for (String platform : platformNotations(pom)) {
+                    platforms.add(call("annotationProcessor", platform));
+                    platforms.add(call("testAnnotationProcessor", platform));
+                }
+                deps.addAll(0, platforms);
+            }
+
+            CompilerSetting compilerArgs = compilerSetting(pom, "compilerArgs");
+            if (compilerArgs != null) {
+                for (Xpp3Dom arg : compilerArgs.node().getChildren()) {
+                    String v = settingValue(pom, compilerArgs, arg.getValue());
+                    if (v != null && !v.isBlank()) args.add(v);
+                }
+            }
+            CompilerSetting single = compilerSetting(pom, "compilerArgument");
+            if (single != null) {
+                String v = settingValue(pom, single, single.node().getValue());
+                if (v != null && !v.isBlank()) args.addAll(Arrays.asList(v.trim().split("\\s+")));
+            }
+            CompilerSetting parameters = compilerSetting(pom, "parameters");
+            boolean bootParent = pom.externalParent() != null
+                    && "spring-boot-starter-parent".equals(pom.externalParent().getArtifactId());
+            if (parameters != null ? "true".equals(settingValue(pom, parameters, parameters.node().getValue())) : bootParent) {
+                if (!args.contains("-parameters")) args.add(0, "-parameters");
+            }
+            CompilerSetting proc = compilerSetting(pom, "proc");
+            if (proc != null) {
+                String v = settingValue(pom, proc, proc.node().getValue());
+                if (v != null && !v.isBlank()) args.add("-proc:" + v.trim());
+            }
+            return new Processing(deps, args);
+        }
+
+        static String text(Xpp3Dom node, String child) {
+            Xpp3Dom c = node.getChild(child);
+            return c == null || c.getValue() == null || c.getValue().isBlank() ? null : c.getValue().trim();
+        }
+
+        // platform(...) notations the module gets: external parent (as platform) and imported BOMs.
+        List<String> platformNotations(Pom pom) {
+            List<String> result = new ArrayList<>();
+            Parent parent = pom.externalParent();
+            if (parent != null && parent.getGroupId() != null && parent.getArtifactId() != null) {
+                String artifact = "org.springframework.boot:spring-boot-starter-parent"
+                        .equals(parent.getGroupId() + ":" + parent.getArtifactId()) ? "spring-boot-dependencies" : parent.getArtifactId();
+                result.add("platform(" + str(parent.getGroupId() + ":" + artifact
+                        + (parent.getVersion() != null ? ":" + parent.getVersion() : "")) + ")");
+            }
+            for (org.apache.maven.model.Dependency d : pom.managed()) {
+                if (!"import".equals(d.getScope())) continue;
+                Pom internal = internalByKey.get(resolve(pom, d.getGroupId()) + ":" + resolve(pom, d.getArtifactId()));
+                if (internal != null) {
+                    if (internal.kind() == Kind.PLATFORM && internal.gradlePath != null) {
+                        result.add("platform(project(" + str(internal.gradlePath) + "))");
+                    }
+                } else {
+                    result.add("platform(" + str(coordinates(pom, d, new LinkedHashSet<>())) + ")");
+                }
+            }
+            return result;
+        }
+
+        void compilerArgsBlock(Script s, List<String> args) {
+            s.open(kts ? "tasks.withType<JavaCompile>().configureEach" : "tasks.withType(JavaCompile).configureEach");
+            String list = String.join(", ", args.stream().map(this::str).toList());
+            s.line(kts ? "options.compilerArgs.addAll(listOf(" + list + "))" : "options.compilerArgs += [" + list + "]");
+            s.close();
         }
 
         String javaVersion(Pom pom) {
