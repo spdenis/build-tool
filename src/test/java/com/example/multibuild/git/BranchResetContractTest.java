@@ -146,4 +146,37 @@ class BranchResetContractTest {
         assertThat(remoteRef(remote, "gradle-migration")).isNotNull();
         assertThat(upstreamOf(work, "gradle-migration")).isEqualTo("refs/heads/gradle-migration");
     }
+
+    @ParameterizedTest
+    @MethodSource("implementations")
+    void findCommitsAndRevert(String impl) throws Exception {
+        GitService git = git(impl);
+        Path remote = TestGit.initRemote("repo-a", tempDir);
+        Path work = git.cloneRepo(remote.toUri().toString(), tempDir.resolve("work/repo-a"));
+        write(work.resolve("gen.txt"), "generated");
+        git.commitAllIfDirty(work, "PROJ-1 chore: generate\n\nbody line");
+        write(work.resolve("other.txt"), "x");
+        git.commitAllIfDirty(work, "unrelated");
+
+        java.util.List<String> found = git.findCommits(work, java.util.List.of("chore: generate"), 50);
+        assertThat(found).singleElement().asString().matches("[0-9a-f]{40} PROJ-1 chore: generate(?s).*body line");
+
+        git.revert(work, found.get(0).substring(0, 40), "PROJ-1 revert it");
+        assertThat(work.resolve("gen.txt")).doesNotExist();
+        assertThat(work.resolve("other.txt")).exists();
+        assertThat(git.recentCommits(work, 1).get(0)).endsWith(" PROJ-1 revert it");
+
+        // conflicting revert: restored tree and an exception
+        write(work.resolve("other.txt"), "changed");
+        git.commitAllIfDirty(work, "edit other");
+        String unrelated = git.findCommits(work, java.util.List.of("unrelated"), 50).get(0).substring(0, 40);
+        write(work.resolve("other.txt"), "changed again");
+        git.commitAllIfDirty(work, "edit other again");
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> git.revert(work, unrelated, "nope"))
+                .hasMessageContaining("conflicts");
+        assertThat(work.resolve("other.txt")).hasContent("changed again");
+        try (Git g = Git.open(work.toFile())) {
+            assertThat(g.status().call().isClean()).isTrue();
+        }
+    }
 }

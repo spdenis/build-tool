@@ -343,23 +343,77 @@ class GradleMigrationServiceTest {
         }
     }
 
-    @Test
-    void keepMaven_whenSourceBranchAlreadyLostItsPoms_explainsWhich_commit() throws Exception {
-        // the migration (without keep.maven) ended up on main itself
-        Path remote = TestGit.initRemote("repo-a", tempDir);
-        Path work = git.cloneRepo(remote.toUri().toString(), tempDir.resolve("work/repo-a"));
+    // The migration landed on main itself (merged PR, or pushed there by an old version).
+    private Path migratedOnMain(String fixture) {
+        Path remote = TestGit.initRemote(fixture, tempDir);
+        Path work = git.cloneRepo(remote.toUri().toString(), tempDir.resolve("work/" + fixture));
         assertThat(service.migrate(work, new RepoConfig(), true).status()).isEqualTo(GradleMigrationService.Status.MIGRATED);
-        String commit = git.recentCommits(work, 1).get(0).split(" ")[0];
+        return work;
+    }
 
-        assertThat(service.reset(work, "gradle-migration", "main", false, new RepoConfig()).ok()).isTrue();
+    @Test
+    void keepMaven_onBranchWithoutPoms_explainsWhichCommitRemovedThem() {
+        Path work = migratedOnMain("repo-a");
+        String commit = git.recentCommits(work, 1).get(0).split(" ")[0];
+        git.checkoutOrCreateBranch(work, "gradle-migration", "main");
         ReflectionTestUtils.setField(service, "keepMaven", true);
+
         GradleMigrationService.Result result = service.migrate(work, new RepoConfig(), true);
 
-        assertThat(work.resolve("pom.xml")).doesNotExist();
         assertThat(result.status()).isEqualTo(GradleMigrationService.Status.ALREADY_GRADLE);
         assertThat(result.warnings()).singleElement().asString()
                 .contains("has no pom.xml", "commit " + commit, "chore: migrate build from Maven to Gradle",
                         "git revert " + commit);
+    }
+
+    @Test
+    void reset_whenSourceBranchAlreadyContainsMigration_revertsItAndMigratesAgain() throws Exception {
+        Path work = migratedOnMain("repo-multi");
+        org.eclipse.jgit.lib.ObjectId mainBefore = remoteRef(work, "main");
+
+        GradleMigrationService.ResetResult reset = service.reset(work, "gradle-migration", "main", false, new RepoConfig());
+
+        assertThat(reset.ok()).isTrue();
+        assertThat(reset.message()).contains("already contained the migration", "reverted 1 migration commit(s)");
+        assertThat(BuildSystem.detect(work)).isEqualTo(BuildSystem.MAVEN);
+        assertThat(work.resolve("module-core/pom.xml")).exists();
+
+        ReflectionTestUtils.setField(service, "keepMaven", true);
+        ReflectionTestUtils.setField(service, "dsl", "kotlin");
+        assertThat(service.migrate(work, new RepoConfig(), true).status()).isEqualTo(GradleMigrationService.Status.MIGRATED);
+        assertThat(work.resolve("pom.xml")).exists();
+        assertThat(work.resolve("settings.gradle.kts")).exists();
+        assertThat(work.resolve("settings.gradle")).doesNotExist();
+        assertThat(git.commitsAhead(work, "gradle-migration", "main")).hasSize(2)
+                .allMatch(c -> c.contains("chore: migrate build from Maven to Gradle") || c.contains("chore: revert Gradle migration"));
+        assertThat(remoteRef(work, "main")).isEqualTo(mainBefore);         // source branch untouched
+
+        // the PR gets merged; a later reset must not revert the already reverted commit again
+        try (Git g = Git.open(work.toFile())) {
+            g.push().setRemote("origin").setRefSpecs(new org.eclipse.jgit.transport.RefSpec("gradle-migration:main")).call();
+        }
+        ReflectionTestUtils.setField(service, "keepMaven", false);
+        GradleMigrationService.ResetResult again = service.reset(work, "gradle-migration", "main", false, new RepoConfig());
+        assertThat(again.ok()).as(again.message()).isTrue();
+        assertThat(again.message()).contains("reverted 1 migration commit(s)");
+        assertThat(BuildSystem.detect(work)).isEqualTo(BuildSystem.MAVEN);
+    }
+
+    @Test
+    void reset_whenGeneratedFilesWereEditedOnSourceBranch_refusesWithConflict() throws Exception {
+        Path work = migratedOnMain("repo-a");
+        write(work.resolve("build.gradle"), read(work.resolve("build.gradle")) + "// team edit\n");
+        git.commitAllIfDirty(work, "tune build");
+        git.push(work);
+
+        GradleMigrationService.ResetResult reset = service.reset(work, "gradle-migration", "main", false, new RepoConfig());
+
+        assertThat(reset.ok()).isFalse();
+        assertThat(reset.message()).contains("reverting it failed", "revert the migration there manually");
+        assertThat(read(work.resolve("build.gradle"))).contains("team edit");     // clean tree, nothing half-reverted
+        try (Git g = Git.open(work.toFile())) {
+            assertThat(g.status().call().isClean()).isTrue();
+        }
     }
 
     @Test

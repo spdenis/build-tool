@@ -506,6 +506,39 @@ public class JGitService implements GitService {
     }
 
     @Override
+    public List<String> findCommits(Path repoDir, List<String> needles, int max) {
+        try (Git git = Git.open(repoDir.toFile())) {
+            List<String> result = new ArrayList<>();
+            if (git.getRepository().resolve("HEAD") == null) return result;
+            for (RevCommit c : git.log().setMaxCount(max).call()) {
+                if (c.getParentCount() > 1) continue;
+                String message = c.getFullMessage();
+                if (needles.stream().anyMatch(message::contains)) result.add(c.getName() + " " + message.strip());
+            }
+            return result;
+        } catch (GitAPIException | IOException e) {
+            throw new RuntimeException("Failed to search history of " + repoDir, e);
+        }
+    }
+
+    @Override
+    public void revert(Path repoDir, String commitId, String message) {
+        try (Git git = Git.open(repoDir.toFile())) {
+            RevertCommand revert = git.revert().include(git.getRepository().resolve(commitId));
+            RevCommit reverted = revert.call();
+            List<String> conflicts = revert.getUnmergedPaths() != null ? revert.getUnmergedPaths() : List.of();
+            if (reverted == null || revert.getFailingResult() != null || !conflicts.isEmpty()) {
+                git.reset().setMode(ResetCommand.ResetType.HARD).call();
+                throw new IllegalStateException("revert of " + commitId.substring(0, 7) + " conflicts"
+                        + (conflicts.isEmpty() ? "" : " in " + String.join(", ", conflicts)));
+            }
+            git.commit().setAmend(true).setMessage(message).call();
+        } catch (GitAPIException | IOException e) {
+            throw new RuntimeException("Failed to revert " + commitId + " in " + repoDir, e);
+        }
+    }
+
+    @Override
     public void createTag(Path repoDir, String tagName, String message) {
         try (Git git = Git.open(repoDir.toFile())) {
             git.tag().setName(tagName).setMessage(message).call();

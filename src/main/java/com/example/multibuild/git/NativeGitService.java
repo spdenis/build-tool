@@ -374,6 +374,33 @@ public class NativeGitService implements GitService {
     }
 
     @Override
+    public List<String> findCommits(Path repoDir, List<String> needles, int max) {
+        String out = exec(repoDir, "git", "log", "-n", String.valueOf(max), "--no-merges", "--format=%H%x1f%s%x1f%B%x1e");
+        List<String> result = new ArrayList<>();
+        for (String record : out.split("\u001e")) {
+            String[] parts = record.strip().split("\u001f", 3);
+            if (parts.length < 3) continue;
+            if (needles.stream().anyMatch(parts[2]::contains)) result.add(parts[0] + " " + parts[2].strip());
+        }
+        return result;
+    }
+
+    @Override
+    public void revert(Path repoDir, String commitId, String message) {
+        try {
+            exec(repoDir, "git", "revert", "--no-edit", commitId);
+        } catch (RuntimeException e) {
+            try {
+                exec(repoDir, "git", "revert", "--abort");
+            } catch (RuntimeException ignored) {
+                // nothing in progress
+            }
+            throw new IllegalStateException("revert of " + commitId.substring(0, 7) + " conflicts: " + e.getMessage(), e);
+        }
+        exec(repoDir, "git", "commit", "--amend", "-m", message);
+    }
+
+    @Override
     public void createTag(Path repoDir, String tagName, String message) {
         exec(repoDir, "git", "tag", "-a", tagName, "-m", message);
         log.info("Created tag {} in {}", tagName, repoDir.getFileName());

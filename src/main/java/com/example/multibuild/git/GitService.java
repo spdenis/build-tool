@@ -45,6 +45,14 @@ public interface GitService {
     // "<short id> <subject>" of the newest `max` commits reachable from HEAD.
     List<String> recentCommits(Path repoDir, int max);
 
+    // Non-merge commits among the newest `max` reachable from HEAD whose full message contains any of
+    // `needles`, newest first, as "<full id> <full message>" (the subject is the message's first line).
+    List<String> findCommits(Path repoDir, List<String> needles, int max);
+
+    // Reverts `commitId` on the current branch as a new commit with `message`. On conflict the working tree
+    // is restored and an exception is thrown.
+    void revert(Path repoDir, String commitId, String message);
+
     void createTag(Path repoDir, String tagName, String message);
 
     // Deletes the tag locally and from the remote if it exists. No-op if it doesn't exist.
