@@ -1379,6 +1379,16 @@ public class MavenToGradleConverter {
                     String key = resolve(pom, d.getGroupId()) + ":" + resolve(pom, d.getArtifactId());
                     if (!KNOWN_PROCESSORS.contains(key)) continue;
                     String scope = scopeOf(pom, d);
+                    if (d.getVersion() == null) {
+                        // the processor path sees no constraints of api/implementation: pin the managed version
+                        org.apache.maven.model.Dependency m = managedFor(pom, d);
+                        String raw = declaredManagedVersion(pom, key);
+                        String version = raw != null ? raw : m != null ? m.getVersion() : null;
+                        if (version != null && resolve(pom, version) != null) {
+                            d = d.clone();
+                            d.setVersion(version);
+                        }
+                    }
                     String coords = str(coordinates(pom, d, usedProps));
                     versionless |= d.getVersion() == null;
                     if ("test".equals(scope)) {
@@ -1394,7 +1404,7 @@ public class MavenToGradleConverter {
             if (versionless && !deps.isEmpty()) {
                 // processor paths do not see the platforms of api/implementation: add them explicitly
                 List<String> platforms = new ArrayList<>();
-                for (String platform : platformNotations(pom)) {
+                for (String platform : platformNotations(pom, usedProps)) {
                     platforms.add(call("annotationProcessor", platform));
                     platforms.add(call("testAnnotationProcessor", platform));
                 }
@@ -1423,13 +1433,26 @@ public class MavenToGradleConverter {
             return new Processing(deps, args, implicit);
         }
 
+        // Version as written in the dependencyManagement of the module or an in-repo parent (e.g.
+        // "${lombok.version}"), so the rendered coordinates keep referring to the gradle.properties entry.
+        String declaredManagedVersion(Pom pom, String key) {
+            for (Pom p = pom; p != null; p = p.parent) {
+                if (p.model.getDependencyManagement() == null) continue;
+                for (org.apache.maven.model.Dependency m : p.model.getDependencyManagement().getDependencies()) {
+                    if ("import".equals(m.getScope()) || m.getVersion() == null) continue;
+                    if (key.equals(resolve(p, m.getGroupId()) + ":" + resolve(p, m.getArtifactId()))) return m.getVersion();
+                }
+            }
+            return null;
+        }
+
         static String text(Xpp3Dom node, String child) {
             Xpp3Dom c = node.getChild(child);
             return c == null || c.getValue() == null || c.getValue().isBlank() ? null : c.getValue().trim();
         }
 
         // platform(...) notations the module gets: external parent (as platform) and imported BOMs.
-        List<String> platformNotations(Pom pom) {
+        List<String> platformNotations(Pom pom, Set<String> usedProps) {
             List<String> result = new ArrayList<>();
             Parent parent = pom.externalParent();
             if (parent != null && parent.getGroupId() != null && parent.getArtifactId() != null) {
@@ -1446,7 +1469,7 @@ public class MavenToGradleConverter {
                         result.add("platform(project(" + str(internal.gradlePath) + "))");
                     }
                 } else {
-                    result.add("platform(" + str(coordinates(pom, d, new LinkedHashSet<>())) + ")");
+                    result.add("platform(" + str(coordinates(pom, d, usedProps)) + ")");
                 }
             }
             return result;
