@@ -9,6 +9,8 @@ import org.apache.maven.model.Plugin;
 import org.apache.maven.model.Repository;
 import org.apache.maven.model.io.xpp3.MavenXpp3Reader;
 import org.codehaus.plexus.util.xml.Xpp3Dom;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.io.IOException;
@@ -55,6 +57,8 @@ import java.util.stream.Stream;
 // as a warning.
 @Component
 public class MavenToGradleConverter {
+
+    private static final Logger log = LoggerFactory.getLogger(MavenToGradleConverter.class);
 
     static final String HEADER = "Migrated from Maven pom.xml by multibuild migrate-gradle.";
 
@@ -243,6 +247,7 @@ public class MavenToGradleConverter {
         final List<Pom> targets;
         final Kind kind;
         final boolean top;                 // outermost sharing parent of its targets
+        final boolean perKind;             // the parent's inheritors mix packagings: one block per kind
         final List<org.apache.maven.model.Dependency> deps = new ArrayList<>();
         final List<org.apache.maven.model.Dependency> managed = new ArrayList<>();
         final Set<org.apache.maven.model.Dependency> shared = Collections.newSetFromMap(new IdentityHashMap<>());
@@ -252,8 +257,9 @@ public class MavenToGradleConverter {
         boolean junit;
         boolean publishing;
 
-        Shared(Pom parent, List<Pom> targets, Kind kind, boolean top) {
+        Shared(Pom parent, List<Pom> targets, Kind kind, boolean top, boolean perKind) {
             this.parent = parent;
+            this.perKind = perKind;
             this.targets = targets;
             this.kind = kind;
             this.top = top;
@@ -272,7 +278,7 @@ public class MavenToGradleConverter {
         final Map<String, String> substitutions = new LinkedHashMap<>();
         final Map<String, String> gradleProps = new LinkedHashMap<>();
         Map<String, Pom> internalByKey = new LinkedHashMap<>();
-        final Map<Pom, Shared> sharing = new LinkedHashMap<>();
+        final List<Shared> sharing = new ArrayList<>();
         // Inside a shared block of a Kotlin script configurations have no accessors: "api"(...).
         boolean sharedContext;
         String rootGroup;
@@ -666,7 +672,7 @@ public class MavenToGradleConverter {
             s.open("allprojects");
             repositories(s);
             s.close();
-            for (Shared shared : sharing.values()) {
+            for (Shared shared : sharing) {
                 s.blank();
                 sharedBlock(s, shared, modules);
             }
@@ -680,37 +686,47 @@ public class MavenToGradleConverter {
             return false;
         }
 
+        // One shared block per in-repo parent and packaging of its inheriting modules (jar modules get
+        // java-library + api, war modules war + implementation), so mixed parents are still shared.
         void planSharing(List<Pom> modules) {
             for (Pom parent : poms) {
                 if (parent.kind() != Kind.AGGREGATOR) continue;
                 List<Pom> inheritors = poms.stream().filter(q -> inheritsFrom(q, parent)).toList();
-                List<Pom> targets = inheritors.stream()
-                        .filter(q -> modules.contains(q) && q.kind() != Kind.PLATFORM).toList();
-                Set<Kind> kinds = EnumSet.noneOf(Kind.class);
-                targets.forEach(t -> kinds.add(t.kind()));
-                if (kinds.size() != 1) continue;
-                boolean top = sharing.keySet().stream().noneMatch(a -> inheritsFrom(parent, a));
-                Shared sh = new Shared(parent, targets, kinds.iterator().next(), top);
-
-                for (org.apache.maven.model.Dependency d : parent.model.getDependencies()) {
-                    if (shareable(parent, d, inheritors, targets, false)) sh.deps.add(d);
-                }
-                if (parent.model.getDependencyManagement() != null) {
-                    for (org.apache.maven.model.Dependency d : parent.model.getDependencyManagement().getDependencies()) {
-                        if (shareable(parent, d, inheritors, targets, true)) sh.managed.add(d);
+                Map<Kind, List<Pom>> byKind = new EnumMap<>(Kind.class);
+                for (Pom q : inheritors) {
+                    if (modules.contains(q) && q.kind() != Kind.PLATFORM) {
+                        byKind.computeIfAbsent(q.kind(), k -> new ArrayList<>()).add(q);
                     }
                 }
-                sh.shared.addAll(sh.deps);
-                sh.shared.addAll(sh.managed);
-                if (top) {
-                    sh.externalPlatform = parent.parent == null && parent.model.getParent() != null;
-                    sh.java = common(targets, this::javaVersion);
-                    sh.encoding = common(targets, t -> resolve(t, t.properties().get("project.build.sourceEncoding")));
-                    sh.junit = targets.stream().allMatch(t -> usesJUnitPlatform(t, t.dependencies()));
-                    DistributionManagement dm = targets.get(0).distribution();
-                    sh.publishing = targets.stream().allMatch(t -> t.distribution() == dm);
+                for (Map.Entry<Kind, List<Pom>> group : byKind.entrySet()) {
+                    Kind kind = group.getKey();
+                    List<Pom> targets = group.getValue();
+                    boolean top = sharing.stream().noneMatch(b -> b.kind == kind && inheritsFrom(parent, b.parent));
+                    Shared sh = new Shared(parent, targets, kind, top, byKind.size() > 1);
+                    for (org.apache.maven.model.Dependency d : parent.model.getDependencies()) {
+                        if (shareable(parent, d, inheritors, targets, false)) sh.deps.add(d);
+                        else log.info("  {}: {} stays in each module (overridden by a child)",
+                                parent.relativePath(repoRoot), d.getManagementKey());
+                    }
+                    if (parent.model.getDependencyManagement() != null) {
+                        for (org.apache.maven.model.Dependency d : parent.model.getDependencyManagement().getDependencies()) {
+                            if (shareable(parent, d, inheritors, targets, true)) sh.managed.add(d);
+                            else log.info("  {}: managed {} stays in each module (overridden by a child)",
+                                    parent.relativePath(repoRoot), d.getManagementKey());
+                        }
+                    }
+                    sh.shared.addAll(sh.deps);
+                    sh.shared.addAll(sh.managed);
+                    if (top) {
+                        sh.externalPlatform = parent.parent == null && parent.model.getParent() != null;
+                        sh.java = common(targets, this::javaVersion);
+                        sh.encoding = common(targets, t -> resolve(t, t.properties().get("project.build.sourceEncoding")));
+                        sh.junit = targets.stream().allMatch(t -> usesJUnitPlatform(t, t.dependencies()));
+                        DistributionManagement dm = targets.get(0).distribution();
+                        sh.publishing = targets.stream().allMatch(t -> t.distribution() == dm);
+                    }
+                    sharing.add(sh);
                 }
-                sharing.put(parent, sh);
             }
         }
 
@@ -748,7 +764,7 @@ public class MavenToGradleConverter {
         }
 
         List<Shared> sharedFor(Pom pom) {
-            return sharing.values().stream().filter(sh -> sh.targets.contains(pom)).toList();
+            return sharing.stream().filter(sh -> sh.targets.contains(pom)).toList();
         }
 
         Shared topSharedFor(Pom pom) {
@@ -770,7 +786,8 @@ public class MavenToGradleConverter {
                 s.open(kts ? "configure(listOf(" + String.join(", ", projects) + "))"
                         : "configure([" + String.join(", ", projects) + "])");
             }
-            s.line("// shared configuration from " + sh.parent.relativePath(repoRoot));
+            s.line("// shared configuration from " + sh.parent.relativePath(repoRoot)
+                    + (sh.perKind ? " (" + (sh.kind == Kind.WAR ? "war" : "jar") + " modules)" : ""));
             String kindPlugin = sh.kind == Kind.WAR ? "war" : "java-library";
             s.line(kts ? "apply(plugin = \"" + kindPlugin + "\")" : "apply plugin: '" + kindPlugin + "'");
             s.line(kts ? "apply(plugin = \"maven-publish\")" : "apply plugin: 'maven-publish'");

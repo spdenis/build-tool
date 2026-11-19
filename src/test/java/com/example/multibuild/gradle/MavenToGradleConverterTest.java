@@ -210,25 +210,32 @@ class MavenToGradleConverterTest {
         MavenToGradleConverter.Conversion conversion = converter.convert(repo, GradleDsl.GROOVY);
         converter.apply(conversion);
 
-        String core = read(repo.resolve("core/build.gradle"));
-        assertThat(core)
-                .contains("api platform('org.junit:junit-bom:5.10.2')")
-                .contains("api(\"com.google.guava:guava:${guavaVersion}\") {\n        exclude group: 'com.google.code.findbugs', module: 'jsr305'\n    }")
-                .contains("compileOnly 'jakarta.servlet:jakarta.servlet-api:6.0.0'")
-                .contains("runtimeOnly 'org.postgresql:postgresql:42.7.1'")
-                .contains("testImplementation 'org.junit.jupiter:junit-jupiter'")
+        // parent configuration: once per packaging in the root script
+        String root = read(repo.resolve("build.gradle"));
+        assertThat(root)
+                .contains("configure([project(':core')]) {", "configure([project(':web')]) {")
+                .contains("api platform('org.junit:junit-bom:5.10.2')", "implementation platform('org.junit:junit-bom:5.10.2')")
                 .contains("testRuntimeOnly 'org.junit.platform:junit-platform-launcher'")
                 .contains("useJUnitPlatform()")
                 .contains("sourceCompatibility = JavaVersion.toVersion('17')")
                 .contains("options.encoding = 'UTF-8'")
-                .contains("artifactId = 'rich-core'")
+                .contains("apply plugin: 'war'", "from components.web", "from components.java")
                 .contains("url = uri(version.toString().endsWith('SNAPSHOT') ? 'https://nexus.acme.com/snapshots' : 'https://nexus.acme.com/releases')")
-                .contains("credentials(PasswordCredentials)")
-                .doesNotContain("com.sun:tools");
+                .contains("credentials(PasswordCredentials)");
+        String core = read(repo.resolve("core/build.gradle"));
+        assertThat(core)
+                .contains("api(\"com.google.guava:guava:${guavaVersion}\") {\n        exclude group: 'com.google.code.findbugs', module: 'jsr305'\n    }")
+                .contains("compileOnly 'jakarta.servlet:jakarta.servlet-api:6.0.0'")
+                .contains("runtimeOnly 'org.postgresql:postgresql:42.7.1'")
+                .contains("testImplementation 'org.junit.jupiter:junit-jupiter'")
+                .contains("publishing.publications.maven.artifactId = 'rich-core'")
+                .doesNotContain("com.sun:tools", "junit-bom", "JavaVersion", "useJUnitPlatform");
         String web = read(repo.resolve("web/build.gradle"));
         assertThat(web)
-                .contains("id 'war'", "implementation project(':core')",
-                        "providedCompile 'jakarta.servlet:jakarta.servlet-api:6.0.0'", "from components.web");
+                .contains("implementation project(':core')",
+                        "providedCompile 'jakarta.servlet:jakarta.servlet-api:6.0.0'",
+                        "publishing.publications.maven.artifactId = 'rich-web'")
+                .doesNotContain("junit-bom");
         assertThat(read(repo.resolve("build.gradle"))).contains("maven { url = uri('https://nexus.acme.com/maven') }");
         assertThat(GradleProperties.read(repo.resolve("gradle.properties")))
                 .containsEntry("group", "com.acme")

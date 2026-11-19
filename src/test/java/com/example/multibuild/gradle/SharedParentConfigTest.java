@@ -194,34 +194,70 @@ class SharedParentConfigTest {
         assertThat(read(repo.resolve("a/build.gradle"))).doesNotContain("slf4j", "plugins", "publishing");
     }
 
-    @Test
-    void mixedPackagingInheritors_fallBackToPerModuleConfig() {
+    // Root pom with the corporate parent; every module inherits the root; jar and war modules mixed.
+    private void corporateParentWithMixedModules() {
         write(repo.resolve("pom.xml"), """
                 <project>
                   <modelVersion>4.0.0</modelVersion>
-                  <groupId>com.acme</groupId><artifactId>p</artifactId><version>1.0</version>
+                  <parent><groupId>com.corp</groupId><artifactId>corp-root</artifactId><version>12</version></parent>
+                  <groupId>com.acme</groupId><artifactId>acme</artifactId><version>2.0.0-SNAPSHOT</version>
                   <packaging>pom</packaging>
-                  <modules><module>lib</module><module>web</module></modules>
+                  <modules><module>lib-a</module><module>lib-b</module><module>web</module></modules>
+                  <properties><java.version>21</java.version></properties>
                   <dependencies>
                     <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId><version>2.0.9</version></dependency>
                   </dependencies>
                 </project>
                 """);
-        write(repo.resolve("lib/pom.xml"), """
-                <project><modelVersion>4.0.0</modelVersion>
-                  <parent><groupId>com.acme</groupId><artifactId>p</artifactId><version>1.0</version></parent>
-                  <artifactId>lib</artifactId></project>
-                """);
+        for (String m : new String[]{"lib-a", "lib-b"}) {
+            write(repo.resolve(m + "/pom.xml"), """
+                    <project><modelVersion>4.0.0</modelVersion>
+                      <parent><groupId>com.acme</groupId><artifactId>acme</artifactId><version>2.0.0-SNAPSHOT</version></parent>
+                      <artifactId>%s</artifactId></project>
+                    """.formatted(m));
+        }
         write(repo.resolve("web/pom.xml"), """
                 <project><modelVersion>4.0.0</modelVersion>
-                  <parent><groupId>com.acme</groupId><artifactId>p</artifactId><version>1.0</version></parent>
-                  <artifactId>web</artifactId><packaging>war</packaging></project>
+                  <parent><groupId>com.acme</groupId><artifactId>acme</artifactId><version>2.0.0-SNAPSHOT</version></parent>
+                  <artifactId>web</artifactId><packaging>war</packaging>
+                  <dependencies>
+                    <dependency><groupId>com.acme</groupId><artifactId>lib-a</artifactId><version>${project.version}</version></dependency>
+                  </dependencies>
+                </project>
                 """);
+    }
+
+    @Test
+    void corporateParent_isDeclaredOnceInRoot_notInEveryModule() {
+        corporateParentWithMixedModules();
         migrate(GradleDsl.GROOVY);
 
-        assertThat(read(repo.resolve("build.gradle"))).doesNotContain("configure(", "subprojects");
-        assertThat(read(repo.resolve("lib/build.gradle"))).contains("id 'java-library'", "api 'org.slf4j:slf4j-api:2.0.9'");
-        assertThat(read(repo.resolve("web/build.gradle"))).contains("id 'war'", "implementation 'org.slf4j:slf4j-api:2.0.9'");
+        String root = read(repo.resolve("build.gradle"));
+        assertThat(root)
+                .contains("configure([project(':lib-a'), project(':lib-b')]) {",
+                        "// shared configuration from pom.xml (jar modules)",
+                        "api platform('com.corp:corp-root:12')", "api 'org.slf4j:slf4j-api:2.0.9'",
+                        "configure([project(':web')]) {", "// shared configuration from pom.xml (war modules)",
+                        "apply plugin: 'war'", "implementation platform('com.corp:corp-root:12')",
+                        "implementation 'org.slf4j:slf4j-api:2.0.9'", "from components.web",
+                        "sourceCompatibility = JavaVersion.toVersion('21')");
+        for (String m : new String[]{"lib-a", "lib-b", "web"}) {
+            assertThat(read(repo.resolve(m + "/build.gradle"))).as(m)
+                    .doesNotContain("corp-root", "slf4j", "plugins", "publishing", "JavaVersion");
+        }
+        assertThat(read(repo.resolve("web/build.gradle"))).contains("implementation project(':lib-a')");
+    }
+
+    @Test
+    void corporateParent_kotlin() {
+        corporateParentWithMixedModules();
+        migrate(GradleDsl.KOTLIN);
+
+        assertThat(read(repo.resolve("build.gradle.kts")))
+                .contains("\"api\"(platform(\"com.corp:corp-root:12\"))",
+                        "\"implementation\"(platform(\"com.corp:corp-root:12\"))", "apply(plugin = \"war\")");
+        assertThat(read(repo.resolve("lib-a/build.gradle.kts"))).doesNotContain("corp-root").contains("id(\"java-library\")");
+        assertThat(read(repo.resolve("web/build.gradle.kts"))).doesNotContain("corp-root").contains("id(\"war\")");
     }
 
     @Test
