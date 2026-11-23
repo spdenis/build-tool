@@ -19,7 +19,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 // The default build-logic layout: parent poms become convention plugins in an included build-logic build,
 // dependency versions live in gradle/libs.versions.toml, publishing (distributionManagement) is defined once
-// and Lombok comes from the base convention.
+// and Lombok comes from a Lombok convention applied only where a pom uses Lombok.
 class BuildLogicLayoutTest {
 
     @TempDir
@@ -214,15 +214,20 @@ class BuildLogicLayoutTest {
                 "configure<JavaPluginExtension> { withSourcesJar() }",
                 "// TODO org.apache.maven.plugins:maven-antrun-plugin (goals: run)");
 
-        // rule 5: Lombok lives in the base convention only
+        // rule 5: Lombok only in core (the only pom using it), through the Lombok convention
         String base = file("build-logic/src/main/kotlin/shop.java-conventions.gradle.kts");
-        assertThat(base).contains("id(\"java-library\")", "id(\"shop.publishing-conventions\")",
+        assertThat(base).contains("id(\"java-library\")", "id(\"shop.publishing-conventions\")").doesNotContain("lombok");
+        assertThat(file("build-logic/src/main/kotlin/shop.lombok-conventions.gradle.kts")).contains(
                 "\"compileOnly\"(libs.findLibrary(\"lombok\").get())",
                 "\"annotationProcessor\"(libs.findLibrary(\"lombok\").get())",
                 "\"testCompileOnly\"(libs.findLibrary(\"lombok\").get())",
                 "\"testAnnotationProcessor\"(libs.findLibrary(\"lombok\").get())");
-        assertThat(file("core/build.gradle.kts")).contains("id(\"shop.shop-parent-conventions\")", "api(libs.guava)")
-                .doesNotContain("lombok", "version");
+        assertThat(file("core/build.gradle.kts")).contains("id(\"shop.shop-parent-conventions\")",
+                "id(\"shop.lombok-conventions\")", "api(libs.guava)").doesNotContain("libs.lombok", "version");
+        for (String module : List.of("app", "web", "bom")) {
+            assertThat(file(module + "/build.gradle.kts")).doesNotContain("lombok");
+        }
+        assertThat(parent).doesNotContain("lombok");
 
         // rule 4: distributionManagement once, in the publishing convention
         String publishing = file("build-logic/src/main/kotlin/shop.publishing-conventions.gradle.kts");
@@ -258,7 +263,8 @@ class BuildLogicLayoutTest {
         assertThat(file("build-logic/build.gradle")).contains("id 'groovy-gradle-plugin'",
                 "implementation libs.spring.boot.gradle.plugin");
         assertThat(file("build-logic/settings.gradle")).contains("from(files('../gradle/libs.versions.toml'))");
-        assertThat(file("build-logic/src/main/groovy/shop.java-conventions.gradle")).contains(
+        assertThat(file("build-logic/src/main/groovy/shop.java-conventions.gradle")).doesNotContain("lombok");
+        assertThat(file("build-logic/src/main/groovy/shop.lombok-conventions.gradle")).contains(
                 "def libs = extensions.getByType(VersionCatalogsExtension).named('libs')",
                 "compileOnly libs.findLibrary('lombok').get()", "annotationProcessor libs.findLibrary('lombok').get()");
         assertThat(file("build-logic/src/main/groovy/shop.shop-parent-conventions.gradle")).contains(
@@ -266,8 +272,9 @@ class BuildLogicLayoutTest {
                 "def integrationTest = tasks.register('integrationTest', Test)");
         assertThat(file("build-logic/src/main/groovy/shop.publishing-conventions.gradle")).contains(
                 "maven(MavenPublication) { publication ->", "https://artifactory.acme.com/libs-release");
-        assertThat(file("core/build.gradle")).contains("id 'shop.shop-parent-conventions'", "api libs.guava")
-                .doesNotContain("lombok");
+        assertThat(file("core/build.gradle")).contains("id 'shop.shop-parent-conventions'", "id 'shop.lombok-conventions'",
+                "api libs.guava");
+        assertThat(file("app/build.gradle")).doesNotContain("lombok");
         assertThat(file("app/build.gradle")).contains("id 'shop.spring-boot-conventions'", "springBoot {",
                 "mainClass = 'com.acme.shop.App'");
     }
@@ -293,7 +300,7 @@ class BuildLogicLayoutTest {
         assertThat(file("build.gradle.kts")).contains("id(\"example.java-conventions\")", "id(\"checkstyle\")",
                 "api(libs.guava)", "tasks.named<Jar>(\"jar\")", "attributes(mapOf(\"Main-Class\" to \"org.example.Tool\"))",
                 "configure<CheckstyleExtension>", "configFile = rootProject.file(\"config/checkstyle.xml\")",
-                "isIgnoreFailures = true").doesNotContain("lombok", "repositories");
+                "isIgnoreFailures = true", "id(\"example.lombok-conventions\")").doesNotContain("libs.lombok", "repositories");
         assertThat(file("gradle/libs.versions.toml")).contains(
                 "guava = { module = \"com.google.guava:guava\", version = \"33.2.1-jre\" }",
                 "lombok = { module = \"org.projectlombok:lombok\", version = \"1.18.46\" }");
@@ -308,10 +315,13 @@ class BuildLogicLayoutTest {
         write(repo.resolve("pom.xml"), """
                 <project><modelVersion>4.0.0</modelVersion>
                   <groupId>org.example</groupId><artifactId>tool</artifactId><version>2.0</version>
+                  <dependencies>
+                    <dependency><groupId>org.projectlombok</groupId><artifactId>lombok</artifactId><scope>provided</scope></dependency>
+                  </dependencies>
                 </project>""");
         migrate(GradleDsl.KOTLIN);
 
-        assertThat(file("build.gradle.kts")).contains("id(\"corp.java-conventions\")");
+        assertThat(file("build.gradle.kts")).contains("id(\"corp.java-conventions\")", "id(\"corp.lombok-conventions\")");
         assertThat(file("gradle/libs.versions.toml")).contains("lombok = { module = \"org.projectlombok:lombok\", version = \"1.18.48\" }");
         assertThat(file("build-logic/settings.gradle.kts")).contains(
                 "maven { url = uri(\"https://artifactory.acme.com/gradle-plugins\") }").doesNotContain("gradlePluginPortal()");
@@ -371,5 +381,75 @@ class BuildLogicLayoutTest {
         migrate(GradleDsl.GROOVY, "tools-groovy");
         assertThat(file("build.gradle")).contains("id 'example.spotbugs-conventions'", "spotbugs {", "tasks.named('shadowJar') {",
                 "sourceSets.main.java.srcDir file('src/extra/java')");
+    }
+
+    private void parentAndChildren(String parentDependencies) {
+        write(repo.resolve("pom.xml"), """
+                <project><modelVersion>4.0.0</modelVersion>
+                  <groupId>com.acme</groupId><artifactId>parent</artifactId><version>1.0</version><packaging>pom</packaging>
+                  <modules><module>a</module><module>b</module></modules>
+                  <dependencyManagement><dependencies>
+                    <dependency><groupId>org.projectlombok</groupId><artifactId>lombok</artifactId><version>1.18.46</version></dependency>
+                  </dependencies></dependencyManagement>
+                  <dependencies>%s</dependencies>
+                </project>""".formatted(parentDependencies));
+        for (String m : List.of("a", "b")) {
+            write(repo.resolve(m + "/pom.xml"), """
+                    <project><modelVersion>4.0.0</modelVersion>
+                      <parent><groupId>com.acme</groupId><artifactId>parent</artifactId><version>1.0</version></parent>
+                      <artifactId>%s</artifactId>
+                      %s
+                    </project>""".formatted(m, m.equals("a") ? """
+                    <dependencies><dependency><groupId>org.projectlombok</groupId><artifactId>lombok</artifactId>
+                      <scope>provided</scope></dependency></dependencies>""" : ""));
+        }
+    }
+
+    @Test
+    void lombokManagedByParent_onlyTheModuleUsingItAppliesTheLombokConvention() throws IOException {
+        parentAndChildren("");
+        migrate(GradleDsl.KOTLIN);
+
+        assertThat(file("a/build.gradle.kts")).contains("id(\"acme.parent-conventions\")", "id(\"acme.lombok-conventions\")");
+        assertThat(file("b/build.gradle.kts")).contains("id(\"acme.parent-conventions\")").doesNotContain("lombok");
+        assertThat(file("build-logic/src/main/kotlin/acme.parent-conventions.gradle.kts")).doesNotContain("lombok");
+        assertThat(file("build-logic/src/main/kotlin/acme.java-conventions.gradle.kts")).doesNotContain("lombok");
+        assertThat(file("gradle/libs.versions.toml")).contains("lombok = { module = \"org.projectlombok:lombok\", version = \"1.18.46\" }");
+    }
+
+    @Test
+    void lombokDependencyOfTheParent_isAppliedByTheParentConvention_likeMavenInheritance() throws IOException {
+        parentAndChildren("""
+                <dependency><groupId>org.projectlombok</groupId><artifactId>lombok</artifactId><scope>provided</scope></dependency>""");
+        migrate(GradleDsl.KOTLIN);
+
+        assertThat(file("build-logic/src/main/kotlin/acme.parent-conventions.gradle.kts")).contains("id(\"acme.lombok-conventions\")");
+        assertThat(file("a/build.gradle.kts")).doesNotContain("lombok");
+        assertThat(file("b/build.gradle.kts")).doesNotContain("lombok");
+    }
+
+    @Test
+    void noModuleUsesLombok_noLombokConventionAtAll() throws IOException {
+        write(repo.resolve("pom.xml"), """
+                <project><modelVersion>4.0.0</modelVersion>
+                  <groupId>org.example</groupId><artifactId>tool</artifactId><version>2.0</version>
+                </project>""");
+        migrate(GradleDsl.KOTLIN);
+
+        assertThat(file("build.gradle.kts")).doesNotContain("lombok");
+        assertThat(repo.resolve("build-logic/src/main/kotlin/example.lombok-conventions.gradle.kts")).doesNotExist();
+        assertThat(file("gradle/libs.versions.toml")).doesNotContain("lombok");
+    }
+
+    @Test
+    void lombokScopeAll_putsLombokIntoTheBaseConvention() throws IOException {
+        ReflectionTestUtils.setField(converter, "lombokScope", "all");
+        parentAndChildren("");
+        migrate(GradleDsl.KOTLIN);
+
+        assertThat(file("build-logic/src/main/kotlin/acme.java-conventions.gradle.kts"))
+                .contains("\"compileOnly\"(libs.findLibrary(\"lombok\").get())");
+        assertThat(file("a/build.gradle.kts")).doesNotContain("lombok");
+        assertThat(repo.resolve("build-logic/src/main/kotlin/acme.lombok-conventions.gradle.kts")).doesNotExist();
     }
 }

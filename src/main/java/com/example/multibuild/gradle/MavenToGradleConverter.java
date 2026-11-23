@@ -31,7 +31,9 @@ import java.util.stream.Stream;
 //   gradle/libs.versions.toml   every external dependency; Maven version properties → [versions]
 //   gradle.properties           group, version
 //   build-logic/                included build of precompiled convention plugins:
-//     <p>.java-conventions             java-library + Lombok (compileOnly / annotationProcessor, main and test)
+//     <p>.java-conventions             java-library
+//     <p>.lombok-conventions           Lombok (compileOnly / annotationProcessor, main and test), applied by the
+//                                      modules whose pom uses Lombok (migrate.gradle.lombok.scope=all: in the base)
 //     <p>.publishing-conventions       maven-publish + the single distributionManagement of the repo
 //     <p>.<parent>-conventions         per in-repo parent pom: everything the shared root block below holds,
 //                                      plus the parent's build plugins (MavenPluginTranslator)
@@ -138,18 +140,25 @@ public class MavenToGradleConverter {
     @org.springframework.beans.factory.annotation.Value("${migrate.gradle.lombok.version:1.18.48}")
     private String lombokVersion = "1.18.48";
 
+    // used (default): Lombok only in modules whose pom uses it (own or inherited dependency, processor path),
+    // through <prefix>.lombok-conventions; all: in the base convention of every Java module.
+    @org.springframework.beans.factory.annotation.Value("${migrate.gradle.lombok.scope:used}")
+    private String lombokScope = "used";
+
     // Repository build-logic resolves Gradle plugins from (e.g. an Artifactory remote of the Gradle plugin
     // portal); blank = gradlePluginPortal() + mavenCentral().
     @org.springframework.beans.factory.annotation.Value("${migrate.gradle.plugin.repository:}")
     private String pluginRepository = "";
 
-    record Options(boolean conventions, String prefix, String lombokVersion, String pluginRepository) {}
+    record Options(boolean conventions, String prefix, String lombokVersion, String pluginRepository,
+                   boolean lombokEverywhere) {}
 
     private Options options() {
         boolean conventions = !"root-script".equalsIgnoreCase(layout == null ? "" : layout.trim());
         return new Options(conventions, conventionPrefix == null ? "" : conventionPrefix.trim(),
                 lombokVersion == null || lombokVersion.isBlank() ? "1.18.48" : lombokVersion.trim(),
-                pluginRepository == null ? "" : pluginRepository.trim());
+                pluginRepository == null ? "" : pluginRepository.trim(),
+                "all".equalsIgnoreCase(lombokScope == null ? "" : lombokScope.trim()));
     }
 
     static Path defaultLocalRepository() {
@@ -417,11 +426,18 @@ public class MavenToGradleConverter {
             prefix = !opts.prefix().isBlank() ? opts.prefix() : defaultPrefix(root);
             usedConventionIds.add(baseId());
             usedConventionIds.add(publishingId());
+            usedConventionIds.add(lombokId());
             List<Pom> built = single ? List.of(root) : modules;
             if (!single) {
                 planSharing(modules);
                 for (Shared sh : sharing) conventionIds.put(sh, uniqueId(sh.parent.artifactId()
                         + (sh.perKind && sh.kind == Kind.WAR ? "-war" : "")));
+                // a parent declaring Lombok as a dependency gives it to all its children (as in Maven)
+                for (Shared sh : sharing) {
+                    if (!opts.lombokEverywhere() && declaresLombok(sh.parent) && sh.targets.stream().allMatch(this::usesLombok)) {
+                        lombokShared.add(sh);
+                    }
+                }
             }
             Map<Path, String> scripts = new LinkedHashMap<>();
             for (Pom m : built) scripts.put(m.dir.resolve(dsl.buildFile()), moduleScript(m, single));
@@ -431,6 +447,7 @@ public class MavenToGradleConverter {
             for (Shared sh : sharing) scripts.put(conventionFile(conventionIds.get(sh)), conventionScript(sh));
             scripts.put(conventionFile(publishingId()), publishingConvention(root, built));
             scripts.put(conventionFile(baseId()), baseConvention(built));
+            if (lombokApplied) scripts.put(conventionFile(lombokId()), lombokConvention(built));
             features.forEach((id, script) -> scripts.put(conventionFile(id), script));
             scripts.put(repoRoot.resolve("build-logic").resolve(dsl.buildFile()), buildLogicScript());
             scripts.put(repoRoot.resolve("build-logic").resolve(dsl.settingsFile()), buildLogicSettings());
@@ -448,6 +465,40 @@ public class MavenToGradleConverter {
         String baseId() { return prefix + ".java-conventions"; }
 
         String publishingId() { return prefix + ".publishing-conventions"; }
+
+        String lombokId() { return prefix + ".lombok-conventions"; }
+
+        final Set<Shared> lombokShared = Collections.newSetFromMap(new IdentityHashMap<>());
+        boolean lombokApplied;
+
+        static boolean isLombok(org.apache.maven.model.Dependency d) {
+            return "org.projectlombok".equals(d.getGroupId()) && "lombok".equals(d.getArtifactId());
+        }
+
+        boolean lombokProcessorPath(Pom pom) {
+            CompilerSetting paths = compilerSetting(pom, "annotationProcessorPaths");
+            if (paths == null) return false;
+            for (Xpp3Dom path : paths.node().getChildren()) {
+                if ("org.projectlombok".equals(text(path, "groupId")) && "lombok".equals(text(path, "artifactId"))) return true;
+            }
+            return false;
+        }
+
+        // The module compiles with Lombok: own or inherited dependency, or a compiler processor path.
+        boolean usesLombok(Pom pom) {
+            return pom.dependencies().stream().anyMatch(Run::isLombok) || lombokProcessorPath(pom);
+        }
+
+        // The parent itself (or its in-repo parents) declares Lombok as a dependency.
+        boolean declaresLombok(Pom parent) {
+            return parent.dependencies().stream().anyMatch(Run::isLombok);
+        }
+
+        // Does a module need to apply the Lombok convention itself (not through a parent's convention)?
+        boolean appliesLombok(Pom pom) {
+            if (opts.lombokEverywhere() || !usesLombok(pom)) return false;
+            return sharedFor(pom).stream().noneMatch(lombokShared::contains);
+        }
 
         String uniqueId(String name) {
             String base = prefix + "." + VersionCatalog.Builder.sanitize(name).replaceFirst("-conventions$", "");
@@ -620,19 +671,49 @@ public class MavenToGradleConverter {
 
         // Script header of a convention plugin: plugins block and the catalog handle.
         void conventionHeader(Script s, String comment, List<String> pluginIds) {
+            conventionHeader(s, comment, pluginIds, true);
+        }
+
+        void conventionHeader(Script s, String comment, List<String> pluginIds, boolean catalogHandle) {
             s.line("// " + HEADER);
             s.line("// " + comment);
             s.blank();
             s.open("plugins");
             for (String id : pluginIds) s.line(plugin(id));
             s.close();
+            if (!catalogHandle) return;
             s.blank();
             s.line(kts ? "val libs = the<VersionCatalogsExtension>().named(\"libs\")"
                     : "def libs = extensions.getByType(VersionCatalogsExtension).named('libs')");
         }
 
         String baseConvention(List<Pom> built) {
+            Script s = new Script();
+            List<String> ids = List.of("java-library", publishingId());
             sharedContext = true;
+            if (!opts.lombokEverywhere()) {
+                conventionHeader(s, "Base convention of every Java module of this build.", ids, false);
+                sharedContext = false;
+                return s.toString();
+            }
+            conventionHeader(s, "Base convention of every Java module of this build.", ids, true);
+            lombokDependencies(s, built);
+            sharedContext = false;
+            return s.toString();
+        }
+
+        // Applied by the modules (or parent conventions) that use Lombok.
+        String lombokConvention(List<Pom> built) {
+            Script s = new Script();
+            sharedContext = true;
+            conventionHeader(s, "Lombok for the modules whose pom uses it (provided dependency + annotation processor in Maven).",
+                    List.of("java-library"), true);
+            lombokDependencies(s, built);
+            sharedContext = false;
+            return s.toString();
+        }
+
+        void lombokDependencies(Script s, List<Pom> built) {
             String alias = lombokAliases.stream().filter(catalog::hasVersion).findFirst().orElse(null);
             if (alias == null) {
                 org.apache.maven.model.Dependency probe = new org.apache.maven.model.Dependency();
@@ -651,11 +732,9 @@ public class MavenToGradleConverter {
             Set<String> versions = new TreeSet<>();
             for (String a : lombokAliases) if (catalog.hasVersion(a)) versions.add(catalog.versionOf(a));
             if (versions.size() > 1) {
-                warnings.add("Lombok versions " + versions + " are used in the repo — the base convention uses "
+                warnings.add("Lombok versions " + versions + " are used in the repo — the Lombok convention uses "
                         + catalog.versionOf(alias) + " for every module");
             }
-            Script s = new Script();
-            conventionHeader(s, "Base convention of every Java module of this build.", List.of("java-library", publishingId()));
             s.blank();
             s.open("dependencies");
             s.line("// Lombok for main and test code (provided dependency + annotation processor in Maven)");
@@ -664,8 +743,6 @@ public class MavenToGradleConverter {
                 s.line(call(config, lombok));
             }
             s.close();
-            sharedContext = false;
-            return s.toString();
         }
 
         // maven-publish, the publication of the module's component and the repositories of the single
@@ -746,6 +823,10 @@ public class MavenToGradleConverter {
             List<String> ids = new ArrayList<>();
             ids.add(outerConvention(sh));
             if (sh.kind == Kind.WAR) ids.add("war");
+            if (lombokShared.contains(sh)) {
+                ids.add(lombokId());
+                lombokApplied = true;
+            }
             ids.addAll(plugins.corePlugins);
             ids.addAll(plugins.thirdParty.keySet());
             Script s = new Script();
@@ -1440,6 +1521,10 @@ public class MavenToGradleConverter {
                 } else {
                     s.line(plugin(single ? baseId() : conventionOf(pom)));
                     if (kind == Kind.WAR) s.line(plugin("war"));
+                    if (appliesLombok(pom)) {
+                        s.line(plugin(lombokId()));
+                        lombokApplied = true;
+                    }
                     for (String id : ownPlugins.corePlugins) s.line(plugin(id));
                     for (String id : ownPlugins.thirdParty.keySet()) s.line(plugin(featureConvention(id)));
                 }
