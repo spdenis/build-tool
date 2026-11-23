@@ -1,5 +1,7 @@
 package com.example.multibuild.functional;
 
+import com.example.multibuild.gradle.VersionCatalog;
+
 import com.example.multibuild.build.DummyBuildService;
 import com.example.multibuild.build.LightspeedProperties;
 import com.example.multibuild.build.MavenRepositoryClient;
@@ -155,7 +157,7 @@ class GradleMigrationFunctionalTest {
     // ── dependency version propagation ───────────────────────────────────────
 
     @Test
-    void dependencyVersionService_updatesGradlePropertyAndCommits() throws Exception {
+    void dependencyVersionService_updatesCatalogVersionAndCommits() throws Exception {
         Path libA = migratedOnMain("repo-a");
         Path consumer = migratedOnMain("repo-b-property");
         versionUpdater.setVersions(libA, "1.0.0-" + INTEGRATION_BRANCH + "-SNAPSHOT");
@@ -164,8 +166,10 @@ class GradleMigrationFunctionalTest {
         dependencyVersionService(true).apply(moduleMap(projects), List.of(libA, consumer),
                 Map.of(libA, new RepoConfig(), consumer, new RepoConfig()), Map.of());
 
-        assertThat(GradleProperties.read(consumer.resolve("gradle.properties")))
-                .containsEntry("libAVersion", "1.0.0-" + INTEGRATION_BRANCH + "-SNAPSHOT");
+        // the Maven property lib-a.version became the catalog's [versions] entry used by the library
+        VersionCatalog catalog = VersionCatalog.read(consumer);
+        assertThat(catalog.versions.get("lib-a").value()).isEqualTo("1.0.0-" + INTEGRATION_BRANCH + "-SNAPSHOT");
+        assertThat(catalogVersion(consumer, "com.example:lib-a")).isEqualTo("1.0.0-" + INTEGRATION_BRANCH + "-SNAPSHOT");
         try (Git g = Git.open(consumer.toFile())) {
             assertThat(g.log().setMaxCount(1).call().iterator().next().getFullMessage())
                     .isEqualTo("chore: update dependency versions for " + INTEGRATION_BRANCH);
@@ -185,8 +189,8 @@ class GradleMigrationFunctionalTest {
                 repos.stream().collect(Collectors.toMap(r -> r, r -> new RepoConfig())), Map.of());
 
         assertThat(read(mavenConsumer.resolve("pom.xml"))).contains("<version>1.0.7-SNAPSHOT</version>");
-        assertThat(read(gradleConsumer.resolve("module-service/build.gradle")))
-                .contains("api 'com.example:lib-a:1.0.7-SNAPSHOT'");
+        assertThat(read(gradleConsumer.resolve("module-service/build.gradle"))).contains("api libs.lib.a");
+        assertThat(catalogVersion(gradleConsumer, "com.example:lib-a")).isEqualTo("1.0.7-SNAPSHOT");
     }
 
     // ── release ──────────────────────────────────────────────────────────────
@@ -206,7 +210,7 @@ class GradleMigrationFunctionalTest {
 
         assertThat(versionUpdater.getRootVersion(libA)).isEqualTo("1.0.1-SNAPSHOT");
         assertThat(versionUpdater.getRootVersion(consumer)).isEqualTo("2.0.1-SNAPSHOT");
-        assertThat(read(consumer.resolve("build.gradle"))).contains("api 'com.example:lib-a:1.0.0'");
+        assertThat(catalogVersion(consumer, "com.example:lib-a")).isEqualTo("1.0.0");
         assertThat(state.getCompletedVersionsByRepo(repos)).containsEntry(libA, "1.0.0").containsEntry(consumer, "2.0.0");
         try (Git g = Git.open(libA.toFile())) {
             assertThat(g.getRepository().resolve("refs/tags/1.0.0")).isNotNull();
@@ -301,5 +305,11 @@ class GradleMigrationFunctionalTest {
         ReflectionTestUtils.setField(s, "dryMode", true);
         ReflectionTestUtils.setField(s, "defaultBuildService", BuildServiceType.DUMMY);
         return s;
+    }
+
+    private static String catalogVersion(Path repo, String key) {
+        VersionCatalog catalog = VersionCatalog.read(repo);
+        return catalog.libraries.values().stream().filter(l -> l.key().equals(key))
+                .map(catalog::versionOf).findFirst().orElse(null);
     }
 }

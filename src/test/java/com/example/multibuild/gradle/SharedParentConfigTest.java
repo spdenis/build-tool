@@ -18,7 +18,7 @@ class SharedParentConfigTest {
     @TempDir
     Path repo;
 
-    private final MavenToGradleConverter converter = new MavenToGradleConverter();
+    private final MavenToGradleConverter converter = com.example.multibuild.testutil.Converters.rootScriptLayout();
 
     private void parentWithModules() {
         write(repo.resolve("pom.xml"), """

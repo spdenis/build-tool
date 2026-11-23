@@ -121,7 +121,7 @@ class BuildSystemDispatchTest {
         ProjectDependencyUpdater deps = new ProjectDependencyUpdater(new DependencyVersionUpdater(),
                 new GradleDependencyUpdater());
         assertThat(deps.update(List.of(repo), Map.of("com.example:lib-a", "9.9.9"))).containsExactly(repo);
-        assertThat(read(repo.resolve("build.gradle"))).contains("com.example:lib-a:9.9.9");
+        assertThat(read(repo.resolve("gradle/libs.versions.toml"))).contains("9.9.9");
         assertThat(read(repo.resolve("pom.xml"))).contains("<version>9.9.9</version>");
 
         MavenParserImpl maven = new MavenParserImpl();
@@ -129,7 +129,7 @@ class BuildSystemDispatchTest {
         // Gradle has priority: the dispatcher parses the Gradle build
         ProjectParserDispatcher parser = new ProjectParserDispatcher(maven, new GradleParser());
         assertThat(parser.parse(repo).getModules().get(0).getDirectory()).isEqualTo(repo);
-        write(repo.resolve("build.gradle"), read(repo.resolve("build.gradle")).replace("9.9.9", "7.7.7"));
+        write(repo.resolve("gradle/libs.versions.toml"), read(repo.resolve("gradle/libs.versions.toml")).replace("9.9.9", "7.7.7"));
         assertThat(parser.parse(repo).getModules().get(0).getDependencies())
                 .anyMatch(d -> d.getArtifact().toString().equals("com.example:lib-a:7.7.7"));
     }

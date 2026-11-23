@@ -77,9 +77,47 @@ public class GradleDependencyUpdater implements DependencyUpdater {
             }
         }
 
-        boolean changed = !edits.isEmpty() || !propertyEdits.isEmpty();
+        // literal versions in convention plugins (build-logic / buildSrc)
+        for (GradleScript convention : ConventionPlugins.load(repoRoot).byId.values()) {
+            for (DependencyRef ref : GradleDeclarations.dependencies(convention, null)) {
+                String newVersion = versionByKey.get(ref.key());
+                if (newVersion == null || !ref.hasVersion() || ref.isReference() || newVersion.equals(ref.version())) continue;
+                log.info("  {} {} -> {} ({})", ref.key(), ref.version(), newVersion, convention.file.getFileName());
+                edits.replace(convention, ref.versionStart(), ref.versionEnd(), newVersion);
+            }
+        }
+        boolean catalogChanged = updateCatalog(repoRoot, versionByKey);
+
+        boolean changed = !edits.isEmpty() || !propertyEdits.isEmpty() || catalogChanged;
         edits.write();
         propertyEdits.forEach((file, props) -> props.forEach((k, v) -> GradleProperties.set(file, k, v)));
         return changed;
+    }
+
+    // gradle/libs.versions.toml: a library's literal version, or the [versions] entry it references
+    // (rewritten once even when several libraries share it).
+    private boolean updateCatalog(Path repoRoot, Map<String, String> versionByKey) {
+        VersionCatalog catalog = VersionCatalog.read(repoRoot);
+        if (catalog == null) return false;
+        String text = catalog.text;
+        for (Map.Entry<String, String> e : versionByKey.entrySet()) {
+            VersionCatalog current = VersionCatalog.parse(text);
+            for (VersionCatalog.Library lib : current.libraries.values()) {
+                if (!lib.key().equals(e.getKey())) continue;
+                String old = current.versionOf(lib);
+                if (old != null && !old.equals(e.getValue())) {
+                    log.info("  {} {} -> {} ({}{})", lib.key(), old, e.getValue(), VersionCatalog.FILE,
+                            lib.versionRef() != null ? " [versions] " + lib.versionRef() : "");
+                }
+            }
+            text = current.withVersion(e.getKey(), e.getValue());
+        }
+        if (text.equals(catalog.text)) return false;
+        try {
+            java.nio.file.Files.writeString(catalog.file, text, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException ex) {
+            throw new java.io.UncheckedIOException("Cannot write " + catalog.file, ex);
+        }
+        return true;
     }
 }

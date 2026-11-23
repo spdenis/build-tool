@@ -20,6 +20,10 @@ import java.util.Set;
 
 // Parses a Gradle build (Groovy or Kotlin DSL) into the artifacts it publishes and their dependencies.
 //
+// Dependencies are read from the project's script, the root script's shared blocks and the convention plugins
+// (build-logic/ or buildSrc/ precompiled script plugins) the project applies, transitively. Version catalog
+// references (libs.x.y, findLibrary("x-y")) are resolved through gradle/libs.versions.toml.
+//
 // Coordinates: group/version come from the project's build script, the root script's
 // allprojects/subprojects blocks, or gradle.properties (project dir, then root). The artifactId is the
 // publication's artifactId / archivesName when set, otherwise the project name.
@@ -40,6 +44,8 @@ public class GradleParser implements ProjectParser {
     public RepositoryProject parse(Path repoDir) {
         GradleBuild build = GradleBuild.load(repoDir);
         GradleScript rootScript = GradleScript.read(build.rootProject().buildFile());
+        VersionCatalog catalog = VersionCatalog.read(repoDir);
+        ConventionPlugins conventions = ConventionPlugins.load(repoDir);
 
         // Configuration the root script applies to other projects.
         List<int[]> subBlocks = rootScript != null ? rootScript.blocks("subprojects") : List.of();
@@ -60,11 +66,11 @@ public class GradleParser implements ProjectParser {
         if (rootScript != null) {
             if (!subBlocks.isEmpty()) {
                 subPlugins.addAll(GradleDeclarations.plugins(rootScript, subBlocks));
-                subDeps.addAll(GradleDeclarations.dependencies(rootScript, subBlocks));
+                subDeps.addAll(dependencies(rootScript, subBlocks, catalog));
             }
             if (!allBlocks.isEmpty()) {
                 allPlugins.addAll(GradleDeclarations.plugins(rootScript, allBlocks));
-                allDeps.addAll(GradleDeclarations.dependencies(rootScript, allBlocks));
+                allDeps.addAll(dependencies(rootScript, allBlocks, catalog));
             }
             sharedGroup = GradleDeclarations.group(rootScript, sharedBlocks.isEmpty() ? List.of() : sharedBlocks);
             sharedVersion = GradleDeclarations.version(rootScript, sharedBlocks.isEmpty() ? List.of() : sharedBlocks);
@@ -83,12 +89,18 @@ public class GradleParser implements ProjectParser {
             for (GradleScript.TargetedBlock block : configureBlocks) {
                 if (!block.paths().contains(project.path())) continue;
                 plugins.addAll(GradleDeclarations.plugins(rootScript, List.of(block.range())));
-                deps.addAll(GradleDeclarations.dependencies(rootScript, List.of(block.range())));
+                deps.addAll(dependencies(rootScript, List.of(block.range()), catalog));
             }
             if (script != null) {
                 plugins.addAll(GradleDeclarations.plugins(script, own));
-                deps.addAll(GradleDeclarations.dependencies(script, own));
+                deps.addAll(dependencies(script, own, catalog));
             }
+
+            // convention plugins (build-logic / buildSrc) the project applies, with the plugins they apply
+            for (GradleScript convention : conventions.reachable(plugins)) {
+                deps.addAll(dependencies(convention, null, catalog));
+            }
+            plugins = conventions.pluginsOf(plugins);
 
             if (!isModule(build, project, plugins, deps)) continue;
 
@@ -116,6 +128,13 @@ public class GradleParser implements ProjectParser {
                     dependencies, project.dir(), repoDir));
         }
         return new RepositoryProject(repoDir.getFileName().toString(), repoDir, modules, List.of());
+    }
+
+    // String coordinates plus version catalog references.
+    private static List<DependencyRef> dependencies(GradleScript script, List<int[]> include, VersionCatalog catalog) {
+        List<DependencyRef> result = new ArrayList<>(GradleDeclarations.dependencies(script, include));
+        result.addAll(GradleDeclarations.catalogDependencies(script, include, catalog));
+        return result;
     }
 
     private static boolean isModule(GradleBuild build, GradleBuild.Project project,

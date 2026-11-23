@@ -77,6 +77,35 @@ final class GradleDeclarations {
         return result;
     }
 
+    private static final Pattern CATALOG_ACCESSOR = Pattern.compile(
+            "\\blibs\\.((?:[A-Za-z][\\w]*)(?:\\.[A-Za-z0-9]\\w*)*)");
+    private static final Pattern FIND_LIBRARY = Pattern.compile(
+            "\\bfindLibrary\\(\\s*[\"']([^\"'\\n]+)[\"']\\s*\\)");
+
+    // Version catalog references inside `dependencies { }` blocks — libs.spring.context,
+    // libs.jackson.asProvider(), libs.findLibrary("spring-context") — resolved through the catalog. The
+    // version is the catalog's (no position: catalog versions are edited in the TOML file).
+    static List<DependencyRef> catalogDependencies(GradleScript script, List<int[]> include, VersionCatalog catalog) {
+        List<DependencyRef> result = new ArrayList<>();
+        if (catalog == null) return result;
+        List<int[]> depBlocks = script.blocks("dependencies");
+        List<int[]> buildscript = script.blocks("buildscript");
+        for (Pattern p : List.of(CATALOG_ACCESSOR, FIND_LIBRARY)) {
+            Matcher m = p.matcher(script.text);
+            while (m.find()) {
+                int pos = m.start();
+                if (!script.isCode(pos) || !GradleScript.within(depBlocks, pos) || GradleScript.within(buildscript, pos)) continue;
+                if (include != null && !GradleScript.within(include, pos)) continue;
+                String alias = m.group(1).replaceFirst("\\.(?:asProvider|get)$", "");
+                if (p == CATALOG_ACCESSOR && alias.matches("(?:versions|plugins|bundles|findLibrary|findVersion)\\b.*")) continue;
+                VersionCatalog.Library lib = catalog.byAccessor(alias);
+                if (lib == null) continue;
+                result.add(new DependencyRef(lib.group(), lib.artifact(), catalog.versionOf(lib), -1, -1));
+            }
+        }
+        return result;
+    }
+
     private static boolean accept(GradleScript script, int quotePos, List<int[]> depBlocks,
                                   List<int[]> buildscript, List<int[]> include) {
         return script.isStringStart(quotePos)

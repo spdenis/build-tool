@@ -33,7 +33,7 @@ class KotlinPropertyDeclarationTest {
     Path tempDir;
 
     private Path repo;
-    private final MavenToGradleConverter converter = new MavenToGradleConverter();
+    private final MavenToGradleConverter converter = com.example.multibuild.testutil.Converters.rootScriptLayout();
 
     @BeforeEach
     void setUp() {

@@ -26,7 +26,7 @@ class MavenToGradleConverterTest {
     @TempDir
     Path tempDir;
 
-    private final MavenToGradleConverter converter = new MavenToGradleConverter();
+    private final MavenToGradleConverter converter = com.example.multibuild.testutil.Converters.rootScriptLayout();
     private final GradleParser gradleParser = new GradleParser();
 
     static Stream<Arguments> fixturesAndDsls() {

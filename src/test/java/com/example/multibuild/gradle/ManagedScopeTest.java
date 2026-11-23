@@ -22,7 +22,7 @@ class ManagedScopeTest {
 
     private Path repo;
     private Path m2;
-    private final MavenToGradleConverter converter = new MavenToGradleConverter();
+    private final MavenToGradleConverter converter = com.example.multibuild.testutil.Converters.rootScriptLayout();
 
     @BeforeEach
     void setUp() {
