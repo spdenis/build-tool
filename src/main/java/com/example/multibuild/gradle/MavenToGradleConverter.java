@@ -39,6 +39,13 @@ import java.util.stream.Stream;
 //                                      plus the parent's build plugins (MavenPluginTranslator)
 //     <p>.<feature>-conventions        per third-party Gradle plugin a module uses (spring-boot, shadow, ...)
 //   <module>/build.gradle.kts   plugins { id("<p>.<parent>-conventions") } + its own dependencies (libs.x)
+// <parent> in another repository of the workspace (sibling in the clone directory), see ParentBuildLogic:
+//   parent repo  the inherited pom gets a convention ("// maven-parent: g:a") and build-logic is published
+//                with the modules (`publish` / `publishToMavenLocal` of the root include it), same group and
+//                version; its conventions use literal coordinates since other repos' catalogs lack its aliases
+//   child repo   build-logic depends on the convention's plugin marker at the parent's version (one [versions]
+//                entry shared with platform(parent)) and its conventions build on the parent's convention;
+//                the base / publishing conventions come from the parent repo too
 // Dependency semantics (scopes, managed scopes, exclusions, processors) are the same in both layouts.
 //
 // Root-script layout (migrate.gradle.layout=root-script; Groovy shown; Kotlin DSL is equivalent):
@@ -179,13 +186,26 @@ public class MavenToGradleConverter {
     }
 
     public Conversion convert(Path repoRoot, GradleDsl dsl) {
+        return convert(repoRoot, dsl, List.of());
+    }
+
+    // `workspace`: the other repositories of the estate (siblings in the clone directory). A repo whose poms
+    // are the <parent> of poms in another workspace repo publishes its build-logic; a repo whose <parent> is
+    // such a pom applies that published convention plugin instead of generating its own conventions.
+    public Conversion convert(Path repoRoot, GradleDsl dsl, List<Path> workspace) {
+        return convert(repoRoot, dsl, workspace, new HashSet<>());
+    }
+
+    Conversion convert(Path repoRoot, GradleDsl dsl, List<Path> workspace, Set<Path> visiting) {
         Path rootPom = repoRoot.resolve("pom.xml");
         if (!Files.isRegularFile(rootPom)) {
             throw new IllegalArgumentException("No pom.xml in " + repoRoot);
         }
         Path local = localRepository == null || localRepository.isBlank()
                 ? defaultLocalRepository() : Path.of(localRepository);
-        return new Run(repoRoot, dsl, local, options()).convert(rootPom);
+        Run run = new Run(repoRoot, dsl, local, options());
+        run.parentLogic = new ParentBuildLogic(this, repoRoot, workspace, visiting);
+        return run.convert(rootPom);
     }
 
     // Writes the generated files and deletes the Maven build files.
@@ -363,6 +383,12 @@ public class MavenToGradleConverter {
         final Map<String, MavenPluginTranslator.ThirdParty> buildLogicPlugins = new LinkedHashMap<>();
         final Set<String> lombokAliases = new LinkedHashSet<>();
         final Set<String> lombokScopeWarnings = new HashSet<>();
+        // cross-repo parents: conventions published for other repos / applied from another repo's build-logic
+        ParentBuildLogic parentLogic;
+        final Set<Shared> exportedShared = Collections.newSetFromMap(new IdentityHashMap<>());
+        // published conventions use literal coordinates: the consuming repo's catalog does not have our aliases
+        boolean literalConventions;
+        final Map<String, ParentBuildLogic.Imported> appliedImports = new LinkedHashMap<>();
 
         Run(Path repoRoot, GradleDsl dsl, Path localRepo, Options opts) {
             this.opts = opts;
@@ -427,6 +453,12 @@ public class MavenToGradleConverter {
             usedConventionIds.add(baseId());
             usedConventionIds.add(publishingId());
             usedConventionIds.add(lombokId());
+            for (Pom p : poms) {
+                ParentBuildLogic.Imported imp = importedFor(p);
+                if (imp == null) continue;
+                usedConventionIds.addAll(imp.pluginIds());
+                applyImport(p, imp);
+            }
             List<Pom> built = single ? List.of(root) : modules;
             if (!single) {
                 planSharing(modules);
@@ -439,18 +471,35 @@ public class MavenToGradleConverter {
                     }
                 }
             }
+            planExports();
             Map<Path, String> scripts = new LinkedHashMap<>();
             for (Pom m : built) scripts.put(m.dir.resolve(dsl.buildFile()), moduleScript(m, single));
             if (!single) scripts.put(repoRoot.resolve(dsl.buildFile()), "// " + HEADER + "\n\n"
                     + "// The build is configured by the convention plugins in build-logic/ and the versions in\n"
                     + "// gradle/libs.versions.toml; each module applies its convention in its own build script.\n");
             for (Shared sh : sharing) scripts.put(conventionFile(conventionIds.get(sh)), conventionScript(sh));
-            scripts.put(conventionFile(publishingId()), publishingConvention(root, built));
-            scripts.put(conventionFile(baseId()), baseConvention(built));
+            // with a parent in another repo the modules build on that repo's conventions: the base and
+            // publishing conventions are only generated when something here still applies them
+            boolean baseUsed = appliedImports.isEmpty() || scripts.values().stream().anyMatch(t -> t.contains(plugin(baseId())));
+            boolean publishingUsed = baseUsed || scripts.values().stream().anyMatch(t -> t.contains(plugin(publishingId())));
+            if (publishingUsed) scripts.put(conventionFile(publishingId()), publishingConvention(root, built));
+            else warnImportedPublishing(built);
+            if (baseUsed) scripts.put(conventionFile(baseId()), baseConvention(built));
             if (lombokApplied) scripts.put(conventionFile(lombokId()), lombokConvention(built));
             features.forEach((id, script) -> scripts.put(conventionFile(id), script));
-            scripts.put(repoRoot.resolve("build-logic").resolve(dsl.buildFile()), buildLogicScript());
-            scripts.put(repoRoot.resolve("build-logic").resolve(dsl.settingsFile()), buildLogicSettings());
+            for (String id : List.of(baseId(), publishingId(), lombokId())) {
+                if (scripts.containsKey(conventionFile(id)) && appliedImports.values().stream().anyMatch(i -> i.pluginIds().contains(id))) {
+                    warnings.add("convention plugin " + id + " is also published by " + appliedImports.values().stream()
+                            .filter(i -> i.pluginIds().contains(id)).findFirst().orElseThrow().repo().getFileName()
+                            + " — set migrate.gradle.conventions.prefix so the ids of the two builds differ");
+                }
+            }
+            scripts.put(repoRoot.resolve("build-logic").resolve(dsl.buildFile()), buildLogicScript(root));
+            scripts.put(repoRoot.resolve("build-logic").resolve(dsl.settingsFile()), buildLogicSettings(root));
+            if (!exportedShared.isEmpty()) {
+                Path rootBuild = repoRoot.resolve(dsl.buildFile());
+                scripts.put(rootBuild, scripts.get(rootBuild) + publishBuildLogicWiring(root));
+            }
             scripts.put(repoRoot.resolve(dsl.settingsFile()), conventionSettings(root, single ? List.of() : modules));
             scripts.forEach((path, text) -> writes.put(path, resolveLibraryTokens(text)));
             writes.put(repoRoot.resolve(VersionCatalog.FILE), catalog.render(HEADER));
@@ -497,7 +546,9 @@ public class MavenToGradleConverter {
         // Does a module need to apply the Lombok convention itself (not through a parent's convention)?
         boolean appliesLombok(Pom pom) {
             if (opts.lombokEverywhere() || !usesLombok(pom)) return false;
-            return sharedFor(pom).stream().noneMatch(lombokShared::contains);
+            if (sharedFor(pom).stream().anyMatch(lombokShared::contains)) return false;
+            ParentBuildLogic.Imported imp = sharedFor(pom).isEmpty() ? importedFor(pom) : null;
+            return imp == null || !imp.appliesLombok();
         }
 
         String uniqueId(String name) {
@@ -517,7 +568,150 @@ public class MavenToGradleConverter {
             for (Shared sh : sharedFor(pom)) {
                 if (nearest == null || inheritsFrom(sh.parent, nearest.parent)) nearest = sh;
             }
-            return nearest != null ? conventionIds.get(nearest) : baseId();
+            return nearest != null ? conventionIds.get(nearest) : baseOf(pom);
+        }
+
+        // ── parents in other repositories ────────────────────────────────
+
+        // The convention published by another workspace repo for the pom's (external) <parent>, or null.
+        ParentBuildLogic.Imported importedFor(Pom pom) {
+            if (parentLogic == null || !opts.conventions()) return null;
+            Parent ext = pom.externalParent();
+            if (ext == null || ext.getGroupId() == null || ext.getArtifactId() == null) return null;
+            return parentLogic.importedFor(ext.getGroupId() + ":" + ext.getArtifactId(), dsl);
+        }
+
+        // The convention a module (or parent convention) without an in-repo parent convention builds on.
+        String baseOf(Pom pom) {
+            ParentBuildLogic.Imported imp = importedFor(pom);
+            if (imp == null) return baseId();
+            applyImport(pom, imp);
+            return imp.pluginId();
+        }
+
+        String publishingOf(Pom pom) {
+            ParentBuildLogic.Imported imp = importedFor(pom);
+            if (imp == null || imp.publishingId() == null) return publishingId();
+            applyImport(pom, imp);
+            return imp.publishingId();
+        }
+
+        // Lombok convention for a module / parent convention: the parent repo's when it has one.
+        String lombokOf(Pom pom) {
+            ParentBuildLogic.Imported imp = importedFor(pom);
+            if (imp != null && imp.lombokId() != null) {
+                applyImport(pom, imp);
+                return imp.lombokId();
+            }
+            lombokApplied = true;
+            return lombokId();
+        }
+
+        final Map<String, String> importRefs = new LinkedHashMap<>();       // parent key → [versions] name
+
+        // The parent repo's build-logic goes on this build-logic's classpath (through its plugin marker),
+        // at the version of the <parent>, which the platform(parent) dependency shares in the catalog.
+        void applyImport(Pom pom, ParentBuildLogic.Imported imp) {
+            appliedImports.putIfAbsent(imp.parentKey(), imp);
+            importRef(pom, pom.externalParent());
+        }
+
+        String importRef(Pom ctx, Parent ext) {
+            String key = ext.getGroupId() + ":" + ext.getArtifactId();
+            String ref = importRefs.get(key);
+            if (ref != null) return ref;
+            String version = ext.getVersion() == null ? null : resolve(ctx, ext.getVersion());
+            if (version == null) {
+                warnings.add(ctx.relativePath(repoRoot) + ": version of parent " + key + " could not be resolved — set it in "
+                        + VersionCatalog.FILE);
+                version = "TODO";
+            }
+            ref = catalog.version(VersionCatalog.Builder.sanitize(ext.getArtifactId()), version);
+            importRefs.put(key, ref);
+            return ref;
+        }
+
+        // The poms of this repo that are the <parent> of poms in other workspace repos get a convention
+        // plugin (an existing parent convention, or one holding what the pom passes on to its children) and
+        // build-logic is published, so those repos can apply it.
+        void planExports() {
+            if (parentLogic == null) return;
+            Set<String> consumed = parentLogic.consumedParents();
+            Set<String> consumedIds = parentLogic.consumedPluginIds();
+            for (Pom p : poms) {
+                if (p.kind() != Kind.PLATFORM && p.kind() != Kind.AGGREGATOR) continue;
+                String expectedId = prefix + "." + VersionCatalog.Builder.sanitize(p.artifactId()) + "-conventions";
+                if (!consumed.contains(p.key()) && !consumedIds.contains(expectedId)) continue;
+                Shared sh = sharing.stream().filter(x -> x.parent == p && x.kind == Kind.LIBRARY).findFirst().orElse(null);
+                if (sh == null) {
+                    sh = exportShared(p);
+                    sharing.add(sh);
+                    conventionIds.put(sh, uniqueId(p.artifactId()));
+                }
+                exportedShared.add(sh);
+            }
+            literalConventions = !exportedShared.isEmpty();
+        }
+
+        // What a parent pom passes on to children in other repos: dependencies, dependencyManagement (a BOM
+        // reaches them as platform(parent) instead), Java version, encoding, JUnit platform, build plugins.
+        Shared exportShared(Pom p) {
+            Shared sh = new Shared(p, List.of(), Kind.LIBRARY, true, false);
+            boolean outer = sharing.stream().anyMatch(o -> o.kind == Kind.LIBRARY && inheritsFrom(p, o.parent));
+            String where = p.relativePath(repoRoot);
+            for (org.apache.maven.model.Dependency d : outer ? p.model.getDependencies() : p.dependencies()) {
+                if (exportable(p, d, where)) sh.deps.add(d);
+            }
+            if (p.kind() != Kind.PLATFORM) {
+                List<org.apache.maven.model.Dependency> managed = outer
+                        ? (p.model.getDependencyManagement() != null ? p.model.getDependencyManagement().getDependencies() : List.of())
+                        : p.managed();
+                for (org.apache.maven.model.Dependency d : managed) if (exportable(p, d, where)) sh.managed.add(d);
+            }
+            sh.shared.addAll(sh.deps);
+            sh.shared.addAll(sh.managed);
+            sh.externalPlatform = !outer && p.parent == null && p.model.getParent() != null;
+            sh.java = javaVersion(p);
+            sh.encoding = resolve(p, p.properties().get("project.build.sourceEncoding"));
+            sh.junit = usesJUnitPlatform(p, p.dependencies());
+            if (!opts.lombokEverywhere() && declaresLombok(p)) lombokShared.add(sh);
+            return sh;
+        }
+
+        boolean exportable(Pom p, org.apache.maven.model.Dependency d, String where) {
+            String key = resolve(p, d.getGroupId()) + ":" + resolve(p, d.getArtifactId());
+            if (!internalByKey.containsKey(key)) return true;
+            warnings.add(where + ": " + key + " (a module of this repo) is not passed on to the children of "
+                    + p.key() + " in other repos — they declare it themselves");
+            return false;
+        }
+
+        void warnImportedPublishing(List<Pom> built) {
+            for (Pom m : built) {
+                if (m.distribution() == null) continue;
+                ParentBuildLogic.Imported imp = importedFor(m);
+                warnings.add(m.relativePath(repoRoot) + ": distributionManagement " + urls(m.distribution())
+                        + " is not used — the modules publish through " + (imp != null ? imp.publishingId() + " of "
+                        + imp.repo().getFileName() : "the parent repo's publishing convention"));
+                return;
+            }
+        }
+
+        // `publish` / `publishToMavenLocal` of the root also publish build-logic (the convention plugins
+        // other repos apply), like `mvn deploy` / `mvn install` publish a parent pom.
+        String publishBuildLogicWiring(Pom root) {
+            Script s = new Script();
+            s.blank();
+            s.line("// the convention plugins are published with the modules: other repositories apply them");
+            if (kts) {
+                s.openLine("listOf(\"publish\", \"publishToMavenLocal\").forEach { name ->");
+                s.line("tasks.maybeCreate(name).dependsOn(gradle.includedBuild(" + str("build-logic") + ").task(\":$name\"))");
+            } else {
+                s.openLine("['publish', 'publishToMavenLocal'].each { name ->");
+                s.line("tasks.maybeCreate(name).dependsOn(gradle.includedBuild(" + str("build-logic") + ").task(\":$name\"))");
+            }
+            s.close();
+            return "\n" + s;
         }
 
         // The convention a parent's convention builds on: the enclosing parent's, else the base.
@@ -527,7 +721,7 @@ public class MavenToGradleConverter {
                 if (o == sh || o.kind != sh.kind || !inheritsFrom(sh.parent, o.parent)) continue;
                 if (outer == null || inheritsFrom(o.parent, outer.parent)) outer = o;
             }
-            return outer != null ? conventionIds.get(outer) : baseId();
+            return outer != null ? conventionIds.get(outer) : baseOf(sh.parent);
         }
 
         static final String LIB_TOKEN = "\u0001lib:";
@@ -549,6 +743,7 @@ public class MavenToGradleConverter {
         // Script reference to a catalog library: type-safe accessor in build scripts, findLibrary in
         // precompiled convention plugins (which have no generated catalog accessors).
         String libraryRef(String alias) {
+            if (sharedContext && literalConventions) return str(catalog.coordinates(alias));
             return (sharedContext ? FIND_TOKEN : LIB_TOKEN) + alias + "\u0001";
         }
 
@@ -593,6 +788,17 @@ public class MavenToGradleConverter {
             s.open("pluginManagement");
             s.line("// convention plugins of this build: build-logic/src/main/" + (kts ? "kotlin" : "groovy"));
             s.line(kts ? "includeBuild(\"build-logic\")" : "includeBuild 'build-logic'");
+            if (!appliedImports.isEmpty() || !opts.pluginRepository().isBlank()) {
+                // where the dependencies of build-logic (Gradle plugins, parent repos' conventions) resolve from
+                s.open("repositories");
+                if (!appliedImports.isEmpty()) s.line("mavenLocal()");
+                if (opts.pluginRepository().isBlank()) s.line("gradlePluginPortal()");
+                else s.line("maven { url = uri(" + str(opts.pluginRepository()) + ") }");
+                if (!appliedImports.isEmpty()) {
+                    for (String url : pomRepositoryUrls()) s.line("maven { url = uri(" + str(url) + ") }");
+                }
+                s.close();
+            }
             s.close();
             s.blank();
             s.open("dependencyResolutionManagement");
@@ -608,7 +814,13 @@ public class MavenToGradleConverter {
             return s.toString();
         }
 
-        String buildLogicSettings() {
+        // Root project name of build-logic: the artifactId of its jar when it is published (the included build
+        // itself is still addressed by its directory name, gradle.includedBuild("build-logic")).
+        String buildLogicName(Pom root) {
+            return exportedShared.isEmpty() ? "build-logic" : root.artifactId() + "-build-logic";
+        }
+
+        String buildLogicSettings(Pom root) {
             Script s = new Script();
             s.line("// " + HEADER);
             s.blank();
@@ -622,11 +834,19 @@ public class MavenToGradleConverter {
             }
             s.open("dependencyResolutionManagement");
             s.open("repositories");
+            if (!appliedImports.isEmpty()) {
+                // the build-logic of the parent repos: mavenLocal() after a local build of the parent repo,
+                // otherwise the repositories its modules are published to
+                s.line("mavenLocal()");
+            }
             if (opts.pluginRepository().isBlank()) {
                 s.line("gradlePluginPortal()");
                 s.line("mavenCentral()");
             } else {
                 s.line("maven { url = uri(" + str(opts.pluginRepository()) + ") }");
+            }
+            if (!appliedImports.isEmpty()) {
+                for (String url : pomRepositoryUrls()) s.line("maven { url = uri(" + str(url) + ") }");
             }
             s.close();
             s.line("// the main build's catalog, so plugin versions are kept in one place");
@@ -637,31 +857,80 @@ public class MavenToGradleConverter {
             s.close();
             s.close();
             s.blank();
-            s.line("rootProject.name = " + str("build-logic"));
+            s.line("rootProject.name = " + str(buildLogicName(root)));
             return s.toString();
         }
 
-        String buildLogicScript() {
+        String buildLogicScript(Pom root) {
+            boolean published = !exportedShared.isEmpty();
             Script s = new Script();
             s.line("// " + HEADER);
             s.blank();
+            if (published && kts) {
+                // `java` is the java extension inside the script, so java.util.Properties needs an import
+                s.line("import java.util.Properties");
+                s.blank();
+            }
             s.open("plugins");
             s.line(kts ? "`kotlin-dsl`" : "id 'groovy-gradle-plugin'");
+            if (published) s.line(kts ? "`maven-publish`" : "id 'maven-publish'");
             s.close();
-            if (!buildLogicPlugins.isEmpty()) {
+            if (published) {
+                s.blank();
+                s.line("// Published with the modules (one plugin marker per convention), so the children of this repo's");
+                s.line("// parent poms in other repositories apply these conventions. Same group and version as the modules.");
+                if (kts) {
+                    s.line("val repoProperties = Properties()");
+                    s.line("file(\"../gradle.properties\").inputStream().use { repoProperties.load(it) }");
+                    s.line("group = repoProperties.getProperty(\"group\")");
+                    s.line("version = repoProperties.getProperty(\"version\")");
+                } else {
+                    s.line("def repoProperties = new Properties()");
+                    s.line("file('../gradle.properties').withInputStream { repoProperties.load(it) }");
+                    s.line("group = repoProperties.getProperty('group')");
+                    s.line("version = repoProperties.getProperty('version')");
+                }
+                DistributionManagement dm = root.model.getDistributionManagement();
+                if (dm == null) dm = poms.stream().map(Pom::distribution).filter(Objects::nonNull).findFirst().orElse(null);
+                if (dm != null && (dm.getRepository() != null || dm.getSnapshotRepository() != null)) {
+                    s.blank();
+                    s.open("publishing");
+                    publishRepositories(s, dm);
+                    s.close();
+                }
+            }
+            if (!buildLogicPlugins.isEmpty() || !appliedImports.isEmpty()) {
                 s.blank();
                 s.open("dependencies");
-                s.line("// Gradle plugins applied by the convention plugins");
                 boolean saved = sharedContext;
                 sharedContext = false;
+                if (!buildLogicPlugins.isEmpty()) s.line("// Gradle plugins applied by the convention plugins");
                 for (MavenPluginTranslator.ThirdParty tp : buildLogicPlugins.values()) {
                     String alias = pluginLibrary(tp);
+                    s.line(call("implementation", LIB_TOKEN + alias + "\u0001"));
+                }
+                if (!appliedImports.isEmpty()) {
+                    s.line("// convention plugins of the parent poms in other repositories (their build-logic, by plugin marker)");
+                }
+                for (ParentBuildLogic.Imported imp : appliedImports.values()) {
+                    String alias = catalog.library(imp.markerGroup(), imp.markerArtifact(), null, importRefs.get(imp.parentKey()));
                     s.line(call("implementation", LIB_TOKEN + alias + "\u0001"));
                 }
                 sharedContext = saved;
                 s.close();
             }
             return s.toString();
+        }
+
+        Set<String> pomRepositoryUrls() {
+            Set<String> urls = new LinkedHashSet<>();
+            for (Pom p : poms) {
+                for (Repository r : p.model.getRepositories()) {
+                    String url = r.getUrl() == null ? null : r.getUrl().replaceAll("/+$", "");
+                    if (url != null && !CENTRAL_URLS.contains(url)) urls.add(url);
+                }
+            }
+            return urls;
         }
 
         String pluginLibrary(MavenPluginTranslator.ThirdParty tp) {
@@ -681,7 +950,7 @@ public class MavenToGradleConverter {
             s.open("plugins");
             for (String id : pluginIds) s.line(plugin(id));
             s.close();
-            if (!catalogHandle) return;
+            if (!catalogHandle || literalConventions) return;
             s.blank();
             s.line(kts ? "val libs = the<VersionCatalogsExtension>().named(\"libs\")"
                     : "def libs = extensions.getByType(VersionCatalogsExtension).named('libs')");
@@ -823,15 +1092,17 @@ public class MavenToGradleConverter {
             List<String> ids = new ArrayList<>();
             ids.add(outerConvention(sh));
             if (sh.kind == Kind.WAR) ids.add("war");
-            if (lombokShared.contains(sh)) {
-                ids.add(lombokId());
-                lombokApplied = true;
-            }
+            if (lombokShared.contains(sh)) ids.add(lombokOf(sh.parent));
             ids.addAll(plugins.corePlugins);
             ids.addAll(plugins.thirdParty.keySet());
             Script s = new Script();
-            conventionHeader(s, "Shared configuration of the modules inheriting " + sh.parent.relativePath(repoRoot)
-                    + " (" + sh.parent.key() + (sh.perKind ? ", " + (sh.kind == Kind.WAR ? "war" : "jar") + " modules" : "") + ")", ids);
+            String comment = "Shared configuration of the modules inheriting " + sh.parent.relativePath(repoRoot)
+                    + " (" + sh.parent.key() + (sh.perKind ? ", " + (sh.kind == Kind.WAR ? "war" : "jar") + " modules" : "") + ")";
+            if (exportedShared.contains(sh)) {
+                comment += "\n// Published with build-logic and applied by the children of this pom in other repositories."
+                        + "\n" + ParentBuildLogic.MARKER + sh.parent.key();
+            }
+            conventionHeader(s, comment, ids);
             if (sh.java != null) {
                 s.blank();
                 javaBlock(s, sh.java);
@@ -1517,14 +1788,11 @@ public class MavenToGradleConverter {
                 s.open("plugins");
                 if (kind == Kind.PLATFORM) {
                     s.line(plugin("java-platform"));
-                    s.line(plugin(publishingId()));
+                    s.line(plugin(publishingOf(pom)));
                 } else {
-                    s.line(plugin(single ? baseId() : conventionOf(pom)));
+                    s.line(plugin(single ? baseOf(pom) : conventionOf(pom)));
                     if (kind == Kind.WAR) s.line(plugin("war"));
-                    if (appliesLombok(pom)) {
-                        s.line(plugin(lombokId()));
-                        lombokApplied = true;
-                    }
+                    if (appliesLombok(pom)) s.line(plugin(lombokOf(pom)));
                     for (String id : ownPlugins.corePlugins) s.line(plugin(id));
                     for (String id : ownPlugins.thirdParty.keySet()) s.line(plugin(featureConvention(id)));
                 }
@@ -1699,7 +1967,10 @@ public class MavenToGradleConverter {
                             + " — consider the 'org.springframework.boot' Gradle plugin";
                     if (warnings.stream().noneMatch(w -> w.endsWith(msg))) warnings.add(where + ": " + msg);
                 }
-                deps.add(call(apiConfig, "platform(" + externalNotation(ctx, parent.getGroupId(), artifact, parent.getVersion()) + ")"));
+                String notation = importRefs.containsKey(key)
+                        ? libraryRef(catalog.library(parent.getGroupId(), artifact, null, importRefs.get(key)))
+                        : externalNotation(ctx, parent.getGroupId(), artifact, parent.getVersion());
+                deps.add(call(apiConfig, "platform(" + notation + ")"));
             }
 
             for (org.apache.maven.model.Dependency d : managed) {
@@ -1819,7 +2090,11 @@ public class MavenToGradleConverter {
             String version = d.getVersion();
             // managed in this repo: the same catalog entry as the dependencyManagement declaration
             if (version == null) version = declaredManagedVersion(ctx, group + ":" + artifact);
-            String ref = libraryRef(catalogLibrary(ctx, group, artifact, version));
+            String alias = catalogLibrary(ctx, group, artifact, version);
+            if (classifier != null && sharedContext && literalConventions) {
+                return str(catalog.coordinates(alias) + (catalog.hasVersion(alias) ? ":" + classifier : ""));
+            }
+            String ref = libraryRef(alias);
             return classifier == null ? ref : "variantOf(" + ref + ") { classifier(" + str(classifier) + ") }";
         }
 

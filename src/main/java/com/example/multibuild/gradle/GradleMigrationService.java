@@ -77,6 +77,18 @@ public class GradleMigrationService {
         return GradleDsl.parse(dsl);
     }
 
+    // The other repositories next to this one (the clone directory): cross-repo <parent> poms are looked up there.
+    static List<Path> workspace(Path repoDir) {
+        Path self = repoDir.toAbsolutePath().normalize();
+        Path dir = self.getParent();
+        if (dir == null) return List.of();
+        try (java.util.stream.Stream<Path> siblings = java.nio.file.Files.list(dir)) {
+            return siblings.filter(java.nio.file.Files::isDirectory).filter(p -> !p.equals(self)).sorted().toList();
+        } catch (java.io.IOException e) {
+            return List.of();
+        }
+    }
+
     // commit=false converts the working tree only (skip.git=true).
     public Result migrate(Path repoDir, RepoConfig config, boolean commit) {
         String name = repoDir.getFileName().toString();
@@ -94,7 +106,7 @@ public class GradleMigrationService {
         RepositoryProject before = mavenParser.parse(repoDir);
         MavenToGradleConverter.Conversion conversion;
         try {
-            conversion = converter.convert(repoDir, dsl());
+            conversion = converter.convert(repoDir, dsl(), workspace(repoDir));
         } catch (RuntimeException e) {
             log.error("  [{}] conversion failed", name, e);
             return new Result(repoDir, Status.FAILED, List.of(), List.of(e.getMessage()));
@@ -198,7 +210,7 @@ public class GradleMigrationService {
         List<String> warnings = new ArrayList<>();
         List<Path> files;
         try {
-            MavenToGradleConverter.Conversion conversion = converter.convert(repoDir, dsl());
+            MavenToGradleConverter.Conversion conversion = converter.convert(repoDir, dsl(), workspace(repoDir));
             for (String p : verify(mavenParser.parse(repoDir), gradleParser.parse(repoDir), conversion)) {
                 warnings.add("kept Maven build differed from the Gradle build (" + p + ") — removed anyway, Gradle is authoritative");
             }

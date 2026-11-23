@@ -276,6 +276,13 @@ public final class VersionCatalog {
             return l[3] != null ? versionValues.get(l[3]) : l[2];
         }
 
+        // "group:artifact[:version]" of an alias, for scripts that cannot use the catalog.
+        String coordinates(String alias) {
+            String[] l = libs.get(alias);
+            String version = versionOf(alias);
+            return l[0] + ":" + l[1] + (version != null ? ":" + version : "");
+        }
+
         boolean isEmpty() {
             return libs.isEmpty() && versionValues.isEmpty();
         }
