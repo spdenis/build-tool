@@ -237,6 +237,23 @@ public final class VersionCatalog {
             return alias;
         }
 
+        // A versionless library under `preferred` (an alias of another catalog), unless that alias is taken.
+        String libraryAs(String preferred, String group, String artifact) {
+            String spec = group + ":" + artifact + "|null|null";
+            String known = aliasBySpec.get(spec);
+            if (known != null) return known;
+            if (libs.keySet().stream().noneMatch(a -> normalize(a).equals(normalize(preferred)))) {
+                libs.put(preferred, new String[]{group, artifact, null, null});
+                aliasBySpec.put(spec, preferred);
+                return preferred;
+            }
+            return library(group, artifact, null, null);
+        }
+
+        String versionValue(String name) {
+            return versionValues.get(name);
+        }
+
         private static List<String> aliasCandidates(String group, String artifact, String version) {
             List<String> result = new ArrayList<>();
             String[] groupParts = group.split("\\.");

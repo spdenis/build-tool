@@ -86,11 +86,65 @@ public class GradleDependencyUpdater implements DependencyUpdater {
                 edits.replace(convention, ref.versionStart(), ref.versionEnd(), newVersion);
             }
         }
+        boolean settingsChanged = updateCatalogImports(repoRoot, versionByKey);
         boolean catalogChanged = updateCatalog(repoRoot, versionByKey);
 
-        boolean changed = !edits.isEmpty() || !propertyEdits.isEmpty() || catalogChanged;
+        boolean changed = !edits.isEmpty() || !propertyEdits.isEmpty() || catalogChanged || settingsChanged;
         edits.write();
         propertyEdits.forEach((file, props) -> props.forEach((k, v) -> GradleProperties.set(file, k, v)));
+        return changed;
+    }
+
+    private static final java.util.regex.Pattern CATALOG_IMPORT = java.util.regex.Pattern.compile(
+            "\\bfrom\\(\\s*[\"']([^:\"'\\s]+):([^:\"'\\s]+):([^:\"'\\s]+)[\"']\\s*\\)");
+
+    // Version catalogs imported in settings (from("g:a:v"), a parent repo's published catalog). The catalog
+    // is published with the parent repo's modules, so it follows them: its own key when it is in scope, else
+    // the version of a library of the same group and current version in gradle/libs.versions.toml (the
+    // parent pom, platform(parent)).
+    private boolean updateCatalogImports(Path repoRoot, Map<String, String> versionByKey) {
+        VersionCatalog catalog = VersionCatalog.read(repoRoot);
+        boolean changed = false;
+        for (String name : List.of("settings.gradle.kts", "settings.gradle")) {
+            Path file = repoRoot.resolve(name);
+            if (!java.nio.file.Files.isRegularFile(file)) continue;
+            String text;
+            try {
+                text = java.nio.file.Files.readString(file);
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException("Cannot read " + file, e);
+            }
+            java.util.regex.Matcher m = CATALOG_IMPORT.matcher(text);
+            StringBuilder sb = new StringBuilder();
+            while (m.find()) {
+                String group = m.group(1);
+                String old = m.group(3);
+                String next = versionByKey.get(group + ":" + m.group(2));
+                if (next == null && catalog != null) {
+                    for (VersionCatalog.Library lib : catalog.libraries.values()) {
+                        if (lib.group().equals(group) && old.equals(catalog.versionOf(lib)) && versionByKey.containsKey(lib.key())) {
+                            next = versionByKey.get(lib.key());
+                            break;
+                        }
+                    }
+                }
+                String replacement = m.group();
+                if (next != null && !next.equals(old)) {
+                    log.info("  {}:{} {} -> {} ({})", group, m.group(2), old, next, name);
+                    replacement = replacement.substring(0, m.start(3) - m.start()) + next + replacement.substring(m.end(3) - m.start());
+                    changed = true;
+                }
+                m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(replacement));
+            }
+            m.appendTail(sb);
+            if (!sb.toString().equals(text)) {
+                try {
+                    java.nio.file.Files.writeString(file, sb.toString());
+                } catch (java.io.IOException e) {
+                    throw new java.io.UncheckedIOException("Cannot write " + file, e);
+                }
+            }
+        }
         return changed;
     }
 

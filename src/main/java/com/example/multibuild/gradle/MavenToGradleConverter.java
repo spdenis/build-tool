@@ -114,10 +114,10 @@ public class MavenToGradleConverter {
     //   substitutions: external keys replaced by an equivalent (e.g. spring-boot-starter-parent → spring-boot-dependencies)
     public record Conversion(Path repoRoot, GradleDsl dsl, Map<Path, String> writes, List<Path> deletes,
                              List<String> warnings, Set<String> internalKeys, Set<String> droppedKeys,
-                             Map<String, String> substitutions) {
+                             Map<String, String> substitutions, List<ParentBuildLogic.Imported> imports) {
         // Same conversion that leaves the Maven build in place (migrate.keep.maven=true).
         public Conversion keepingMaven() {
-            return new Conversion(repoRoot, dsl, writes, List.of(), warnings, internalKeys, droppedKeys, substitutions);
+            return new Conversion(repoRoot, dsl, writes, List.of(), warnings, internalKeys, droppedKeys, substitutions, imports);
         }
     }
 
@@ -389,6 +389,8 @@ public class MavenToGradleConverter {
         // published conventions use literal coordinates: the consuming repo's catalog does not have our aliases
         boolean literalConventions;
         final Map<String, ParentBuildLogic.Imported> appliedImports = new LinkedHashMap<>();
+        // versionless aliases whose version comes from a parent repo's catalog
+        final Set<String> inheritedAliases = new HashSet<>();
 
         Run(Path repoRoot, GradleDsl dsl, Path localRepo, Options opts) {
             this.opts = opts;
@@ -439,8 +441,9 @@ public class MavenToGradleConverter {
 
             Set<String> internalKeys = new LinkedHashSet<>();
             for (Pom p : poms) internalKeys.add(p.key());
+            if (parentLogic != null) parentLogic.warnings.stream().distinct().forEach(warnings::add);
             return new Conversion(repoRoot, dsl, writes, deletes, List.copyOf(warnings),
-                    internalKeys, droppedKeys, substitutions);
+                    internalKeys, droppedKeys, substitutions, List.copyOf(appliedImports.values()));
         }
 
         // ── build-logic layout ───────────────────────────────────────────────
@@ -612,8 +615,80 @@ public class MavenToGradleConverter {
         // The parent repo's build-logic goes on this build-logic's classpath (through its plugin marker),
         // at the version of the <parent>, which the platform(parent) dependency shares in the catalog.
         void applyImport(Pom pom, ParentBuildLogic.Imported imp) {
-            appliedImports.putIfAbsent(imp.parentKey(), imp);
+            boolean first = appliedImports.putIfAbsent(imp.parentKey(), imp) == null;
             importRef(pom, pom.externalParent());
+            if (!first || imp.catalog() == null) return;
+            // the parent's conventions resolve `libs` in this build: its aliases they look up are declared
+            // here too, without a version (the parent catalog's constraints give it)
+            for (String a : imp.aliases()) {
+                VersionCatalog.Library lib = imp.catalog().byAccessor(a);
+                if (lib == null) {
+                    warnings.add("convention " + imp.pluginId() + " looks up library '" + a + "', which the catalog of "
+                            + imp.repo().getFileName() + " does not declare — add it to " + VersionCatalog.FILE);
+                    continue;
+                }
+                String alias = catalog.libraryAs(lib.alias(), lib.group(), lib.artifact());
+                inheritedAliases.add(alias);
+                if (LOMBOK.equals(lib.key())) lombokAliases.add(alias);
+            }
+            for (String v : imp.versionNames()) {
+                VersionCatalog.Version version = imp.catalog().versions.get(v);
+                if (version == null) continue;
+                catalog.version(v, version.value());
+                warnings.add("convention " + imp.pluginId() + " looks up version '" + v + "': copied from the catalog of "
+                        + imp.repo().getFileName() + " to " + VersionCatalog.FILE + " — keep both in sync");
+            }
+        }
+
+        boolean isImportedPlugin(String id) {
+            return appliedImports.values().stream().anyMatch(i -> i.pluginIds().contains(id));
+        }
+
+        // Name of the imported catalog of a parent repo in this build (settings versionCatalogs).
+        String parentCatalogName(ParentBuildLogic.Imported imp) {
+            int i = 1;
+            for (ParentBuildLogic.Imported other : appliedImports.values()) {
+                if (other.catalogCoordinates() == null) continue;
+                if (other == imp) return i == 1 ? "parentLibs" : "parentLibs" + i;
+                i++;
+            }
+            return "parentLibs";
+        }
+
+        // The imported parent convention among plugin ids applied by a script, or null.
+        ParentBuildLogic.Imported importApplied(Collection<String> ids) {
+            for (ParentBuildLogic.Imported imp : appliedImports.values()) {
+                if (ids.contains(imp.pluginId()) && imp.catalogCoordinates() != null) return imp;
+            }
+            return null;
+        }
+
+        // Every library of the parent repo's catalog constrains the module's versions: what the catalog
+        // declares without a version (third-party libraries) gets the parent's, like the dependencyManagement a
+        // Maven child inherits. The constraints are published with the module (dependencyManagement in its pom).
+        void parentCatalogConstraints(Script s, ParentBuildLogic.Imported imp) {
+            s.blank();
+            s.line("// Versions of the parent repo's catalog (" + imp.catalogCoordinates() + "): the libraries of");
+            s.line("// gradle/libs.versions.toml declared without a version get them, like Maven's inherited dependencyManagement.");
+            String name = parentCatalogName(imp);
+            if (kts) {
+                s.line("val parentCatalog = the<VersionCatalogsExtension>().named(" + str(name) + ")");
+                s.open("configurations.matching { it.name in setOf(\"implementation\", \"annotationProcessor\", \"testAnnotationProcessor\") }.configureEach");
+                s.line("val configuration = name");
+                s.openLine("parentCatalog.libraryAliases.forEach { alias ->");
+                s.line("val library = parentCatalog.findLibrary(alias).get().get()");
+                s.line("val version = library.versionConstraint.requiredVersion");
+                s.line("if (version.isNotEmpty()) project.dependencies.constraints.add(configuration, \"${library.module}:$version\")");
+            } else {
+                s.line("def parentCatalog = extensions.getByType(VersionCatalogsExtension).named(" + str(name) + ")");
+                s.openLine("configurations.matching { it.name in ['implementation', 'annotationProcessor', 'testAnnotationProcessor'] }.configureEach { configuration ->");
+                s.openLine("parentCatalog.libraryAliases.each { alias ->");
+                s.line("def library = parentCatalog.findLibrary(alias).get().get()");
+                s.line("def version = library.versionConstraint.requiredVersion");
+                s.line("if (version) project.dependencies.constraints.add(configuration.name, \"${library.module}:${version}\")");
+            }
+            s.close();
+            s.close();
         }
 
         String importRef(Pom ctx, Parent ext) {
@@ -755,6 +830,30 @@ public class MavenToGradleConverter {
 
         // Catalog library for g:a with the Maven version expression `version` (literal, ${prop} or null).
         String catalogLibrary(Pom ctx, String group, String artifact, String version) {
+            return catalogLibrary(ctx, group, artifact, version, true);
+        }
+
+        // inherit: a third-party library of the parent repo's catalog is declared without a version (the parent
+        // catalog's constraints give it) unless the pom sets a different one. Not for build-logic's plugins.
+        String catalogLibrary(Pom ctx, String group, String artifact, String version, boolean inherit) {
+            ParentBuildLogic.Imported imp = inherit ? importedFor(ctx) : null;
+            VersionCatalog.Library inherited = imp != null && imp.catalog() != null && imp.catalogCoordinates() != null
+                    ? imp.catalog().libraries.values().stream().filter(l -> l.key().equals(group + ":" + artifact)).findFirst().orElse(null)
+                    : null;
+            if (inherited != null) {
+                String own = version == null || version.isBlank() ? null : resolve(ctx, version);
+                String parentVersion = imp.catalog().versionOf(inherited);
+                if (own == null || own.equals(parentVersion)) {
+                    applyImport(ctx, imp);
+                    String alias = catalog.libraryAs(inherited.alias(), group, artifact);
+                    inheritedAliases.add(alias);
+                    if (LOMBOK.equals(group + ":" + artifact)) lombokAliases.add(alias);
+                    return alias;
+                }
+                warnings.add(ctx.relativePath(repoRoot) + ": " + group + ":" + artifact + " " + own + " differs from "
+                        + parentVersion + " in the catalog of " + imp.repo().getFileName() + " — kept; Gradle resolves the "
+                        + "higher of the two (use a strict version to force " + own + ")");
+            }
             String literal = null;
             String ref = null;
             if (version != null && !version.isBlank()) {
@@ -803,6 +902,20 @@ public class MavenToGradleConverter {
             s.blank();
             s.open("dependencyResolutionManagement");
             repositories(s);
+            List<ParentBuildLogic.Imported> catalogs = appliedImports.values().stream()
+                    .filter(i -> i.catalogCoordinates() != null).toList();
+            if (!catalogs.isEmpty()) {
+                s.line("// the version catalog of the parent repo, published with its build-logic: versions of the third-party");
+                s.line("// libraries (gradle/libs.versions.toml declares them without one); bumped with the parent version");
+                s.open("versionCatalogs");
+                for (ParentBuildLogic.Imported imp : catalogs) {
+                    String version = catalog.versionValue(importRefs.get(imp.parentKey()));
+                    s.open(kts ? "create(" + str(parentCatalogName(imp)) + ")" : parentCatalogName(imp));
+                    s.line("from(" + str(imp.catalogCoordinates() + ":" + version) + ")");
+                    s.close();
+                }
+                s.close();
+            }
             s.close();
             s.blank();
             s.line("rootProject.name = " + str(root.artifactId()));
@@ -873,12 +986,16 @@ public class MavenToGradleConverter {
             }
             s.open("plugins");
             s.line(kts ? "`kotlin-dsl`" : "id 'groovy-gradle-plugin'");
-            if (published) s.line(kts ? "`maven-publish`" : "id 'maven-publish'");
+            if (published) {
+                s.line(kts ? "`maven-publish`" : "id 'maven-publish'");
+                s.line(kts ? "`version-catalog`" : "id 'version-catalog'");
+            }
             s.close();
             if (published) {
                 s.blank();
-                s.line("// Published with the modules (one plugin marker per convention), so the children of this repo's");
-                s.line("// parent poms in other repositories apply these conventions. Same group and version as the modules.");
+                s.line("// Published with the modules (one plugin marker per convention, and gradle/libs.versions.toml as a");
+                s.line("// version catalog), so the children of this repo's parent poms in other repositories apply these");
+                s.line("// conventions and take their versions from this catalog. Same group and version as the modules.");
                 if (kts) {
                     s.line("val repoProperties = Properties()");
                     s.line("file(\"../gradle.properties\").inputStream().use { repoProperties.load(it) }");
@@ -890,14 +1007,24 @@ public class MavenToGradleConverter {
                     s.line("group = repoProperties.getProperty('group')");
                     s.line("version = repoProperties.getProperty('version')");
                 }
+                s.blank();
+                s.open("catalog");
+                s.open("versionCatalog");
+                s.line(kts ? "from(files(\"../gradle/libs.versions.toml\"))" : "from(files('../gradle/libs.versions.toml'))");
+                s.close();
+                s.close();
                 DistributionManagement dm = root.model.getDistributionManagement();
                 if (dm == null) dm = poms.stream().map(Pom::distribution).filter(Objects::nonNull).findFirst().orElse(null);
-                if (dm != null && (dm.getRepository() != null || dm.getSnapshotRepository() != null)) {
-                    s.blank();
-                    s.open("publishing");
-                    publishRepositories(s, dm);
-                    s.close();
-                }
+                s.blank();
+                s.open("publishing");
+                s.open("publications");
+                s.open(kts ? "create<MavenPublication>(\"catalog\")" : "catalog(MavenPublication)");
+                s.line("artifactId = " + str(root.artifactId() + ParentBuildLogic.CATALOG_SUFFIX));
+                s.line(kts ? "from(components[\"versionCatalog\"])" : "from components.versionCatalog");
+                s.close();
+                s.close();
+                if (dm != null && (dm.getRepository() != null || dm.getSnapshotRepository() != null)) publishRepositories(s, dm);
+                s.close();
             }
             if (!buildLogicPlugins.isEmpty() || !appliedImports.isEmpty()) {
                 s.blank();
@@ -935,7 +1062,7 @@ public class MavenToGradleConverter {
 
         String pluginLibrary(MavenPluginTranslator.ThirdParty tp) {
             Pom ctx = buildLogicPluginContext.getOrDefault(tp.pluginId(), poms.get(0));
-            return catalogLibrary(ctx, tp.group(), tp.artifact(), tp.version());
+            return catalogLibrary(ctx, tp.group(), tp.artifact(), tp.version(), false);
         }
 
         // Script header of a convention plugin: plugins block and the catalog handle.
@@ -947,9 +1074,18 @@ public class MavenToGradleConverter {
             s.line("// " + HEADER);
             s.line("// " + comment);
             s.blank();
+            // Kotlin: a parent repo's convention is applied in the body, not in plugins { }: kotlin-dsl applies the
+            // plugins { } of a precompiled script to a bare project to generate accessors, and a convention
+            // looking up the catalog of the build applying it fails there
+            List<String> imported = kts ? pluginIds.stream().filter(this::isImportedPlugin).toList() : List.of();
             s.open("plugins");
-            for (String id : pluginIds) s.line(plugin(id));
+            for (String id : pluginIds) if (!imported.contains(id)) s.line(plugin(id));
             s.close();
+            if (!imported.isEmpty()) {
+                s.blank();
+                s.line("// the parent repo's convention (its build-logic is a dependency of this build-logic)");
+                for (String id : imported) s.line("apply(plugin = " + str(id) + ")");
+            }
             if (!catalogHandle || literalConventions) return;
             s.blank();
             s.line(kts ? "val libs = the<VersionCatalogsExtension>().named(\"libs\")"
@@ -983,7 +1119,8 @@ public class MavenToGradleConverter {
         }
 
         void lombokDependencies(Script s, List<Pom> built) {
-            String alias = lombokAliases.stream().filter(catalog::hasVersion).findFirst().orElse(null);
+            String alias = lombokAliases.stream().filter(a -> catalog.hasVersion(a) || inheritedAliases.contains(a))
+                    .findFirst().orElse(null);
             if (alias == null) {
                 org.apache.maven.model.Dependency probe = new org.apache.maven.model.Dependency();
                 probe.setGroupId("org.projectlombok");
@@ -1108,6 +1245,8 @@ public class MavenToGradleConverter {
                 javaBlock(s, sh.java);
             }
             dependenciesBlock(s, deps, constraints);
+            ParentBuildLogic.Imported parentCatalog = importApplied(List.of(ids.get(0)));
+            if (parentCatalog != null) parentCatalogConstraints(s, parentCatalog);
             if (sh.implicitProcessing) {
                 s.blank();
                 s.line("// annotation processors are discovered on the compile classpath, like maven-compiler-plugin does");
@@ -1843,6 +1982,10 @@ public class MavenToGradleConverter {
             }
 
             dependenciesBlock(s, deps, constraints);
+            if (opts.conventions() && kind != Kind.PLATFORM) {
+                ParentBuildLogic.Imported parentCatalog = importApplied(List.of(single ? baseOf(pom) : conventionOf(pom)));
+                if (parentCatalog != null) parentCatalogConstraints(s, parentCatalog);
+            }
             if (processing != null && processing.implicit() && (top == null || !top.implicitProcessing)) {
                 s.blank();
                 s.line("// annotation processors are discovered on the compile classpath, like maven-compiler-plugin does");

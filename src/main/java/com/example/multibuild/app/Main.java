@@ -109,6 +109,13 @@ public class Main implements CommandLineRunner {
     @Value("${migrate.target:}")
     private String migrateTarget;
 
+    // migrate-gradle: comma-separated repo names already migrated to Gradle (maybe edited by hand since). They
+    // are cloned / updated on the migration branch so the repos being migrated build on their convention plugins
+    // and version catalog, but never reset nor migrated again — not even with migrate.reset=true. The only change
+    // they may get: the publication of their build-logic and catalog, when repos inheriting their poms need it.
+    @Value("${migrate.reference:}")
+    private String migrateReference;
+
     // migrate-gradle: start over — delete migrate.branch (locally and on origin, closing its PR) and migrate
     // again from the source branch. Refused for branches with non-migration commits unless reset.force.
     @Value("${migrate.reset:false}")
@@ -580,11 +587,24 @@ public class Main implements CommandLineRunner {
             return;
         }
 
-        List<RepoConfig> repoEntries = loadRepos(reposFile);
+        List<RepoConfig> listed = loadRepos(reposFile);
+        Set<String> references = names(migrateReference);
+        List<String> unknownReferences = references.stream()
+                .filter(r -> listed.stream().noneMatch(e -> repoName(e.getUrl()).equals(r))).toList();
+        if (!unknownReferences.isEmpty()) {
+            System.err.println("[ERROR] migrate.reference repo(s) not in " + reposFile + ": " + String.join(", ", unknownReferences));
+            System.exit(1);
+        }
+        List<String> both = names(migrateTarget).stream().filter(references::contains).toList();
+        if (!both.isEmpty()) {
+            System.err.println("[ERROR] repo(s) in both migrate.target and migrate.reference: " + String.join(", ", both)
+                    + " — a reference repo is already migrated and is never migrated (nor reset) again");
+            System.exit(1);
+        }
+        List<RepoConfig> referenceEntries = listed.stream().filter(e -> references.contains(repoName(e.getUrl()))).toList();
+        List<RepoConfig> repoEntries = listed.stream().filter(e -> !references.contains(repoName(e.getUrl()))).toList();
         if (!migrateTarget.isBlank()) {
-            Set<String> wanted = Arrays.stream(migrateTarget.split(","))
-                    .map(String::trim).filter(t -> !t.isEmpty())
-                    .collect(Collectors.toCollection(LinkedHashSet::new));
+            Set<String> wanted = names(migrateTarget);
             List<RepoConfig> selected = repoEntries.stream()
                     .filter(e -> wanted.contains(repoName(e.getUrl())))
                     .toList();
@@ -596,20 +616,23 @@ public class Main implements CommandLineRunner {
             }
             repoEntries = selected;
         }
+        List<RepoConfig> allEntries = new ArrayList<>(referenceEntries);
+        allEntries.addAll(repoEntries);
         Path workDir = Paths.get(cloneDir);
         Files.createDirectories(workDir);
 
-        log.info("── Migrate to Gradle: {} repo(s)  branch={}  dsl={}  dryMode={}  skipGit={}{} ──",
-                repoEntries.size(), skipGit ? "(local)" : branch,
+        log.info("── Migrate to Gradle: {} repo(s){}  branch={}  dsl={}  dryMode={}  skipGit={}{} ──",
+                repoEntries.size(), references.isEmpty() ? "" : "  reference: " + String.join(",", references),
+                skipGit ? "(local)" : branch,
                 gradleMigrationService.dsl().name().toLowerCase(), dryMode, skipGit,
                 migrateReset ? "  RESET" + (migrateResetForce ? " (forced)" : "") : "");
         boolean useIntegrationFlow = migrateBranch.isBlank();
         Map<Path, GradleMigrationService.ResetResult> resets = new java.util.concurrent.ConcurrentHashMap<>();
         CloneResult cloned = skipGit
-                ? useLocalRepos(repoEntries, workDir)
-                : cloneRepos(repoEntries, workDir, (repoDir, entry) -> {
+                ? useLocalRepos(allEntries, workDir)
+                : cloneRepos(allEntries, workDir, (repoDir, entry) -> {
                     String source = resolveSourceBranch(repoDir, entry.getEffectiveSourceBranch(defaultSourceBranch));
-                    if (migrateReset) {
+                    if (migrateReset && !referenceEntries.contains(entry)) {
                         resets.put(repoDir, gradleMigrationService.reset(repoDir, branch, source, migrateResetForce, entry));
                     } else if (useIntegrationFlow) {
                         branchService.apply(repoDir, source, entry);
@@ -620,6 +643,11 @@ public class Main implements CommandLineRunner {
 
         List<GradleMigrationService.Result> results = new ArrayList<>();
         for (Path repoDir : cloned.paths()) {
+            RepoConfig entry = cloned.configByPath().get(repoDir);
+            if (referenceEntries.contains(entry)) {
+                results.add(gradleMigrationService.reference(repoDir, entry, !skipGit, branch));
+                continue;
+            }
             GradleMigrationService.ResetResult reset = resets.get(repoDir);
             if (reset != null && !reset.ok()) {
                 log.error("  [{}] reset refused: {}", repoDir.getFileName(), reset.message());
@@ -651,6 +679,12 @@ public class Main implements CommandLineRunner {
         log.info("══ Migration complete ══════════════════════════════════");
     }
 
+    private static Set<String> names(String commaSeparated) {
+        return Arrays.stream(commaSeparated.split(","))
+                .map(String::trim).filter(t -> !t.isEmpty())
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+    }
+
     private static String repoName(String url) {
         return url.substring(url.lastIndexOf('/') + 1).replace(".git", "");
     }
@@ -665,7 +699,7 @@ public class Main implements CommandLineRunner {
                 + " [--analyze.format=ascii|plantuml] [--analyze.output=<file>]");
         System.err.println("       java -jar multibuild.jar migrate-gradle  repos.json"
                 + "  [--migrate.branch=<branch>] [--migrate.target=<repo,...>] [--migrate.gradle.dsl=groovy|kotlin]"
-                + " [--migrate.keep.maven=true] [--migrate.reset=true [--migrate.reset.force=true]]");
+                + " [--migrate.reference=<repo,...>] [--migrate.keep.maven=true] [--migrate.reset=true [--migrate.reset.force=true]]");
     }
 
     private record CloneResult(List<Path> paths, Map<Path, RepoConfig> configByPath) {}

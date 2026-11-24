@@ -37,7 +37,7 @@ public class GradleMigrationService {
 
     private static final Logger log = LoggerFactory.getLogger(GradleMigrationService.class);
 
-    public enum Status { MIGRATED, MAVEN_REMOVED, WRAPPER_ADDED, ALREADY_GRADLE, NO_BUILD, FAILED }
+    public enum Status { MIGRATED, MAVEN_REMOVED, WRAPPER_ADDED, BUILD_LOGIC_PUBLISHED, REFERENCE, ALREADY_GRADLE, NO_BUILD, FAILED }
 
     public record Result(Path repo, Status status, List<String> warnings, List<String> errors) {
         public String repoName() { return repo.getFileName().toString(); }
@@ -138,6 +138,13 @@ public class GradleMigrationService {
         }
 
         if (commit) commitAndPush(repoDir, config, "chore: migrate build from Maven to Gradle");
+
+        // the parent repos already on Gradle (migrated earlier): make them publish their build-logic and catalog
+        Map<Path, Map<String, String>> parents = new LinkedHashMap<>();
+        for (ParentBuildLogic.Imported imp : conversion.imports()) {
+            if (imp.onDisk()) parents.computeIfAbsent(imp.repo(), r -> new LinkedHashMap<>()).put(imp.parentKey(), imp.pluginId());
+        }
+        parents.forEach((parent, conventions) -> exportBuildLogic(parent, conventions, commit, name));
         return new Result(repoDir, Status.MIGRATED, warnings, List.of());
     }
 
@@ -172,12 +179,66 @@ public class GradleMigrationService {
             }
         }
 
+        if (publishForInheritingRepos(repoDir, commit) && status == Status.ALREADY_GRADLE) status = Status.BUILD_LOGIC_PUBLISHED;
+
         if (status == Status.ALREADY_GRADLE && warnings.isEmpty()) {
             log.info("  [{}] already built with Gradle — skipping", name);
         }
         warnings.forEach(w -> log.warn("  [{}] {}", name, w));
         if (commit && status != Status.ALREADY_GRADLE) push(repoDir, config);
         return new Result(repoDir, status, warnings, List.of());
+    }
+
+    // A repo already migrated (migrate.reference): used as it is by the repos being migrated — no reset, no
+    // wrapper, no removal of kept poms. It only gets the publication of its build-logic and catalog when repos
+    // inheriting its poms need it. Fails when the branch has no Gradle build (it was not migrated).
+    public Result reference(Path repoDir, RepoConfig config, boolean commit, String branch) {
+        String name = repoDir.getFileName().toString();
+        if (BuildSystem.detect(repoDir) != BuildSystem.GRADLE) {
+            String error = "migrate.reference: no Gradle build" + (branch == null || branch.isBlank() ? "" : " on branch " + branch)
+                    + " — the repo is not migrated yet; migrate it (migrate.target) or check out the branch holding its migration";
+            log.error("  [{}] {}", name, error);
+            return new Result(repoDir, Status.FAILED, List.of(), List.of(error));
+        }
+        boolean published = publishForInheritingRepos(repoDir, commit);
+        log.info("  [{}] already migrated (migrate.reference) — used by the repos being migrated{}", name,
+                published ? "; its build-logic and catalog are now published" : "");
+        return new Result(repoDir, published ? Status.BUILD_LOGIC_PUBLISHED : Status.REFERENCE, List.of(), List.of());
+    }
+
+    // Repos inheriting this repo's poms (still on Maven, or migrated against it): publish build-logic + catalog.
+    private boolean publishForInheritingRepos(Path repoDir, boolean commit) {
+        List<Path> others = workspace(repoDir);
+        Map<String, String> conventions = ParentBuildLogic.conventionsFor(repoDir, ParentBuildLogic.consumedParents(others));
+        Set<String> consumedIds = ParentBuildLogic.consumedPluginIds(others);
+        boolean consumedById = ConventionPlugins.load(repoDir).byId.keySet().stream().anyMatch(consumedIds::contains);
+        if (conventions.isEmpty() && !consumedById) return false;
+        return exportBuildLogic(repoDir, conventions, commit, null);
+    }
+
+    // An existing Gradle build whose poms other repos inherit: adds the publication of its build-logic and
+    // version catalog (BuildLogicExport, additive) and commits it in that repo. `requestedBy`: the repo being
+    // migrated that needs it (null when the parent repo itself is migrated). Returns true when it changed.
+    private boolean exportBuildLogic(Path parent, Map<String, String> conventionByKey, boolean commit, String requestedBy) {
+        String name = parent.getFileName().toString();
+        BuildLogicExport.Result export = BuildLogicExport.export(parent, conventionByKey);
+        export.warnings().forEach(w -> log.warn("  [{}] {}", name, w));
+        if (export.isEmpty()) return false;
+        try {
+            for (Map.Entry<Path, String> e : export.writes().entrySet()) {
+                Files.createDirectories(e.getKey().getParent());
+                Files.writeString(e.getKey(), e.getValue());
+            }
+        } catch (IOException e) {
+            log.error("  [{}] cannot write the build-logic publication: {}", name, e.getMessage());
+            return false;
+        }
+        log.info("  [{}] build-logic and version catalog are now published with the modules{} — publish this repo "
+                + "before building the repositories that inherit it: {}", name,
+                requestedBy != null ? " (needed by " + requestedBy + ")" : "",
+                export.writes().keySet().stream().map(p -> parent.relativize(p).toString()).toList());
+        if (commit) commitAndPush(parent, null, "chore: publish build-logic and version catalog for other repositories");
+        return true;
     }
 
     // migrate.keep.maven=true on a repo whose branch history already contains the migration without poms
@@ -261,7 +322,8 @@ public class GradleMigrationService {
     // reset without losing anybody's work.
     static final List<String> MIGRATION_COMMITS = List.of(
             "chore: migrate build from Maven to Gradle", "chore: add Gradle wrapper",
-            "chore: remove Maven build (migration to Gradle completed)");
+            "chore: remove Maven build (migration to Gradle completed)",
+            "chore: publish build-logic and version catalog for other repositories");
 
     public record ResetResult(boolean ok, String message) {}
 
