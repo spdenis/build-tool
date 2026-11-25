@@ -186,10 +186,11 @@ public class MavenToGradleConverter {
     // are the <parent> of poms in another workspace repo publishes its build-logic; a repo whose <parent> is
     // such a pom applies that published convention plugin instead of generating its own conventions.
     public Conversion convert(Path repoRoot, GradleDsl dsl, List<Path> workspace) {
-        return convert(repoRoot, dsl, workspace, new HashSet<>());
+        return convert(repoRoot, dsl, workspace, new HashSet<>(), new ParentBuildLogic.Cache());
     }
 
-    Conversion convert(Path repoRoot, GradleDsl dsl, List<Path> workspace, Set<Path> visiting) {
+    // `visiting`: the repos whose in-memory conversion led here (no cycles); `cache`: shared with them.
+    Conversion convert(Path repoRoot, GradleDsl dsl, List<Path> workspace, Set<Path> visiting, ParentBuildLogic.Cache cache) {
         Path rootPom = repoRoot.resolve("pom.xml");
         if (!Files.isRegularFile(rootPom)) {
             throw new IllegalArgumentException("No pom.xml in " + repoRoot);
@@ -197,7 +198,7 @@ public class MavenToGradleConverter {
         Path local = localRepository == null || localRepository.isBlank()
                 ? defaultLocalRepository() : Path.of(localRepository);
         Run run = new Run(repoRoot, dsl, local, options());
-        run.parentLogic = new ParentBuildLogic(this, repoRoot, workspace, visiting);
+        run.parentLogic = new ParentBuildLogic(this, repoRoot, workspace, visiting, cache);
         return run.convert(rootPom);
     }
 

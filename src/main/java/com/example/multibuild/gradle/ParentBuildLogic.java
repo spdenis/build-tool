@@ -62,41 +62,65 @@ final class ParentBuildLogic {
     private record RepoInfo(Path repo, Map<String, String> conventions, String catalogText, String rootName,
                             String group, Map<String, Path> moduleDirs, boolean onDisk) {}
 
+    // What the workspace offers, shared by a conversion and the in-memory conversions of the repos it inherits
+    // from (and theirs): the poms of each repo are read once and each repo is looked at (converted) once.
+    static final class Cache {
+        private final Map<Path, List<Model>> models = new HashMap<>();
+        private final Map<Path, RepoInfo> infos = new HashMap<>();
+
+        List<Model> models(Path repo) {
+            return models.computeIfAbsent(repo, r -> poms(r).stream().map(ParentBuildLogic::read).filter(Objects::nonNull).toList());
+        }
+
+        // groupId:artifactId of the poms of the repo
+        Set<String> keys(Path repo) {
+            Set<String> keys = new LinkedHashSet<>();
+            for (Model m : models(repo)) {
+                String group = m.getGroupId() != null ? m.getGroupId() : m.getParent() != null ? m.getParent().getGroupId() : null;
+                if (group != null && m.getArtifactId() != null) keys.add(group + ":" + m.getArtifactId());
+            }
+            return keys;
+        }
+    }
+
     private final MavenToGradleConverter converter;
     private final Path repoRoot;
     private final List<Path> others;
     private final Set<Path> visiting;
+    private final Cache cache;
     private Set<String> consumed;
     private Set<String> consumedIds;
-    private Map<Path, RepoInfo> infos;
     private final Map<String, Optional<Imported>> imports = new HashMap<>();
     final List<String> warnings = new ArrayList<>();
 
-    ParentBuildLogic(MavenToGradleConverter converter, Path repoRoot, List<Path> workspace, Set<Path> visiting) {
+    ParentBuildLogic(MavenToGradleConverter converter, Path repoRoot, List<Path> workspace, Set<Path> visiting, Cache cache) {
         this.converter = converter;
         this.repoRoot = repoRoot.toAbsolutePath().normalize();
         this.others = workspace.stream().map(p -> p.toAbsolutePath().normalize())
                 .filter(p -> !p.equals(this.repoRoot) && Files.isDirectory(p)).distinct().toList();
         this.visiting = new HashSet<>(visiting);
         this.visiting.add(this.repoRoot);
+        this.cache = cache;
     }
 
     // groupId:artifactId of every pom the poms of the other repos declare as <parent>.
     Set<String> consumedParents() {
         if (consumed != null) return consumed;
-        consumed = consumedParents(others);
+        consumed = new LinkedHashSet<>();
+        for (Path repo : others) consumed.addAll(parents(cache.models(repo)));
         return consumed;
     }
 
     static Set<String> consumedParents(List<Path> repos) {
         Set<String> result = new LinkedHashSet<>();
-        for (Path repo : repos) {
-            for (Path pom : poms(repo)) {
-                Model model = read(pom);
-                if (model != null && model.getParent() != null) {
-                    result.add(model.getParent().getGroupId() + ":" + model.getParent().getArtifactId());
-                }
-            }
+        for (Path repo : repos) result.addAll(parents(poms(repo).stream().map(ParentBuildLogic::read).filter(Objects::nonNull).toList()));
+        return result;
+    }
+
+    private static Set<String> parents(List<Model> models) {
+        Set<String> result = new LinkedHashSet<>();
+        for (Model model : models) {
+            if (model.getParent() != null) result.add(model.getParent().getGroupId() + ":" + model.getParent().getArtifactId());
         }
         return result;
     }
@@ -130,14 +154,22 @@ final class ParentBuildLogic {
     }
 
     private Imported find(String key, GradleDsl dsl) {
-        if (infos == null) {
-            infos = new LinkedHashMap<>();
-            for (Path repo : others) {
-                if (!visiting.contains(repo)) infos.put(repo, info(repo, dsl));
+        // the repos that can stand for the pom: Gradle builds (read from disk: a marker or their modules tell),
+        // and the Maven repo holding the pom (converted in memory) — not every Maven repo of the workspace,
+        // whose conversions would look up their own parents in turn
+        List<RepoInfo> infos = new ArrayList<>();
+        for (Path repo : others) {
+            if (visiting.contains(repo)) continue;
+            if (isMaven(repo) && !cache.keys(repo).contains(key)) continue;
+            RepoInfo info = cache.infos.get(repo);
+            if (info == null) {
+                info = info(repo, dsl);
+                cache.infos.put(repo, info);
             }
+            infos.add(info);
         }
         // a convention marked for the pom wins, in any repo
-        for (RepoInfo info : infos.values()) {
+        for (RepoInfo info : infos) {
             for (Map.Entry<String, String> e : info.conventions.entrySet()) {
                 for (String line : e.getValue().split("\n")) {
                     if (line.startsWith(MARKER) && line.substring(MARKER.length()).trim().equals(key)) {
@@ -147,7 +179,7 @@ final class ParentBuildLogic {
             }
         }
         // an existing Gradle build producing the pom's coordinates
-        for (RepoInfo info : infos.values()) {
+        for (RepoInfo info : infos) {
             if (!info.onDisk || info.conventions.isEmpty()) continue;
             String id = chooseConvention(info, key);
             if (id != null) {
@@ -247,14 +279,19 @@ final class ParentBuildLogic {
         return seen;
     }
 
+    // A repo still built by Maven (converted in memory to find its conventions).
+    private static boolean isMaven(Path repo) {
+        return Files.isRegularFile(repo.resolve("pom.xml")) && !Files.isDirectory(repo.resolve("build-logic/src/main"));
+    }
+
     // The repo as converted in memory from its poms, else its Gradle build on disk.
     private RepoInfo info(Path repo, GradleDsl dsl) {
         Path src = repo.resolve("build-logic/src/main");
-        if (Files.isRegularFile(repo.resolve("pom.xml")) && !Files.isDirectory(src)) {
+        if (isMaven(repo)) {
             try {
                 List<Path> workspace = new ArrayList<>(others);
                 workspace.add(repoRoot);
-                MavenToGradleConverter.Conversion c = converter.convert(repo, dsl, workspace, visiting);
+                MavenToGradleConverter.Conversion c = converter.convert(repo, dsl, workspace, visiting, cache);
                 Map<String, String> conventions = new LinkedHashMap<>();
                 c.writes().forEach((path, text) -> {
                     String id = conventionId(src, path);

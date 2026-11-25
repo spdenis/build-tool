@@ -365,4 +365,48 @@ class CrossRepoParentTest {
                 .contains("id 'parent.bom-conventions'", "api platform(libs.findLibrary('bom').get())");
         assertThat(read(single.resolve("build.gradle"))).contains("id 'single.single-conventions'").doesNotContain("platform(");
     }
+
+    // A large workspace: each repo is converted in memory at most once, and only when it holds a parent pom of
+    // the repo being migrated (it used to convert every other repo at every level: exponential).
+    @Test
+    @org.junit.jupiter.api.Timeout(60)
+    void largeWorkspace_convertsOnlyTheParentChain_once() throws IOException {
+        Path ws = tempDir.resolve("big");
+        int chain = 10;
+        for (int i = 0; i < chain; i++) {
+            String parentRef = i + 1 < chain
+                    ? "<parent><groupId>com.chain</groupId><artifactId>p" + (i + 1) + "</artifactId><version>1.0</version></parent>"
+                    : "<parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>3.2.3</version></parent>";
+            write(ws.resolve("chain" + i + "/pom.xml"), "<project><modelVersion>4.0.0</modelVersion>" + parentRef
+                    + "<groupId>com.chain</groupId><artifactId>p" + i + "</artifactId><version>1.0</version><packaging>pom</packaging>"
+                    + "<dependencyManagement><dependencies><dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId>"
+                    + "<version>33.2.1-jre</version></dependency></dependencies></dependencyManagement></project>");
+        }
+        for (int i = 0; i < 10; i++) {
+            write(ws.resolve("other" + i + "/pom.xml"), "<project><modelVersion>4.0.0</modelVersion>"
+                    + "<parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>3.2.3</version></parent>"
+                    + "<groupId>com.other</groupId><artifactId>o" + i + "</artifactId><version>1.0</version></project>");
+        }
+        write(ws.resolve("app/pom.xml"), "<project><modelVersion>4.0.0</modelVersion>"
+                + "<parent><groupId>com.chain</groupId><artifactId>p0</artifactId><version>1.0</version></parent>"
+                + "<groupId>com.app</groupId><artifactId>app</artifactId><version>1.0</version></project>");
+        java.util.concurrent.atomic.AtomicInteger conversions = new java.util.concurrent.atomic.AtomicInteger();
+        MavenToGradleConverter counting = new MavenToGradleConverter() {
+            @Override
+            Conversion convert(Path repoRoot, GradleDsl dsl, List<Path> workspace, java.util.Set<Path> visiting,
+                               ParentBuildLogic.Cache cache) {
+                conversions.incrementAndGet();
+                return super.convert(repoRoot, dsl, workspace, visiting, cache);
+            }
+        };
+        ReflectionTestUtils.setField(counting, "localRepository", tempDir.resolve("m2").toString());
+
+        MavenToGradleConverter.Conversion c = counting.convert(ws.resolve("app"), GradleDsl.KOTLIN,
+                GradleMigrationService.workspace(ws.resolve("app")));
+
+        // the app, then each pom of the chain once (its parent is in the next repo)
+        assertThat(conversions.get()).isEqualTo(1 + chain);
+        assertThat(c.writes().get(ws.resolve("app/build-logic/src/main/kotlin/app.app-conventions.gradle.kts")))
+                .contains("apply(plugin = \"chain.p0-conventions\")");
+    }
 }
