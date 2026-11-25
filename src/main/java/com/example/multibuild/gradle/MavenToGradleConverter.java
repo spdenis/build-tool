@@ -460,6 +460,9 @@ public class MavenToGradleConverter {
                 applyImport(p, imp);
             }
             List<Pom> built = single ? List.of(root) : modules;
+            // a single-module repo whose parent pom is in another repo: like a module, it applies a convention
+            // of this build-logic, which builds on the parent's (its platform and catalog versions)
+            if (single && root.kind() != Kind.PLATFORM && importedFor(root) != null) singleConvention = uniqueId(root.artifactId());
             if (!single) {
                 planSharing(modules);
                 for (Shared sh : sharing) conventionIds.put(sh, uniqueId(sh.parent.artifactId()
@@ -473,6 +476,7 @@ public class MavenToGradleConverter {
             }
             planExports();
             Map<Path, String> scripts = new LinkedHashMap<>();
+            if (singleConvention != null) scripts.put(conventionFile(singleConvention), singleConventionScript(root));
             for (Pom m : built) scripts.put(m.dir.resolve(dsl.buildFile()), moduleScript(m, single));
             if (!single) scripts.put(repoRoot.resolve(dsl.buildFile()), "// " + HEADER + "\n\n"
                     + "// The build is configured by the convention plugins in build-logic/ and the versions in\n"
@@ -503,6 +507,27 @@ public class MavenToGradleConverter {
             scripts.put(repoRoot.resolve(dsl.settingsFile()), conventionSettings(root, single ? List.of() : modules));
             scripts.forEach((path, text) -> writes.put(path, resolveLibraryTokens(text)));
             writes.put(repoRoot.resolve(VersionCatalog.FILE), catalog.render(HEADER));
+        }
+
+        // Convention of a single-module repo with its parent pom in another repo (null otherwise).
+        String singleConvention;
+
+        String singleConventionScript(Pom root) {
+            String parentId = baseOf(root);         // registers the import (catalog ref of the parent version)
+            sharedContext = true;
+            Set<String> usedProps = new LinkedHashSet<>();
+            List<String> deps = new ArrayList<>();
+            List<String> constraints = new ArrayList<>();
+            render(root, root.kind(), root.externalParent(), List.of(), List.of(), null, deps, constraints, usedProps);
+            Script s = new Script();
+            Parent ext = root.externalParent();
+            conventionHeader(s, "Configuration inherited from the parent pom " + ext.getGroupId() + ":" + ext.getArtifactId()
+                    + " (another repository): its convention, managed versions and catalog", List.of(parentId));
+            dependenciesBlock(s, deps, constraints);
+            ParentBuildLogic.Imported parentCatalog = importApplied(List.of(parentId));
+            if (parentCatalog != null) parentCatalogConstraints(s, parentCatalog);
+            sharedContext = false;
+            return s.toString();
         }
 
         String defaultPrefix(Pom root) {
@@ -1874,7 +1899,7 @@ public class MavenToGradleConverter {
                     s.line(plugin("java-platform"));
                     s.line(plugin(publishingOf(pom)));
                 } else {
-                    s.line(plugin(single ? baseOf(pom) : conventionOf(pom)));
+                    s.line(plugin(single ? (singleConvention != null ? singleConvention : baseOf(pom)) : conventionOf(pom)));
                     if (kind == Kind.WAR) s.line(plugin("war"));
                     if (appliesLombok(pom)) s.line(plugin(lombokOf(pom)));
                     for (String id : ownPlugins.corePlugins) s.line(plugin(id));
@@ -1922,7 +1947,7 @@ public class MavenToGradleConverter {
             }
 
             dependenciesBlock(s, deps, constraints);
-            if (opts.conventions() && kind != Kind.PLATFORM) {
+            if (opts.conventions() && kind != Kind.PLATFORM && !(single && singleConvention != null)) {
                 ParentBuildLogic.Imported parentCatalog = importApplied(List.of(single ? baseOf(pom) : conventionOf(pom)));
                 if (parentCatalog != null) parentCatalogConstraints(s, parentCatalog);
             }
@@ -2022,6 +2047,7 @@ public class MavenToGradleConverter {
                                     Set<String> usedProps) {
             Shared top = topSharedFor(pom);
             Parent parent = top != null && top.externalPlatform ? null : pom.externalParent();
+            if (singleConvention != null) parent = null;      // the parent's platform is in the single module's convention
             List<org.apache.maven.model.Dependency> managed = pom.managed().stream().filter(d -> !isShared(pom, d)).toList();
             List<org.apache.maven.model.Dependency> own = pom.dependencies().stream().filter(d -> !isShared(pom, d)).toList();
             render(pom, kind, parent, managed, own, pom, deps, constraints, usedProps);

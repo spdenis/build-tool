@@ -307,4 +307,62 @@ class CrossRepoParentTest {
         assertThat(c.writes()).containsKey(child.resolve("build-logic/src/main/kotlin/module1.java-conventions.gradle.kts"));
         assertThat(c.writes().get(child.resolve("build-logic/build.gradle.kts"))).doesNotContain("gradle.plugin");
     }
+
+    // A repo with one artifact (sources in the root, built by the root pom) inheriting the parent's pom: its
+    // build-logic gets a convention applying the parent's convention, platform and catalog versions.
+    @Test
+    void singleModuleChild_getsAConventionBuildingOnTheParents() throws IOException {
+        Path single = tempDir.resolve("ws/single");
+        write(single.resolve("pom.xml"), """
+                <project><modelVersion>4.0.0</modelVersion>
+                  <parent><groupId>com.dummy.parent</groupId><artifactId>bom</artifactId><version>1.0.1-SNAPSHOT</version></parent>
+                  <groupId>com.dummy.single</groupId><artifactId>single</artifactId><version>1.0.0-SNAPSHOT</version>
+                  <dependencies>
+                    <dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId></dependency>
+                    <dependency><groupId>org.projectlombok</groupId><artifactId>lombok</artifactId><scope>provided</scope></dependency>
+                  </dependencies>
+                </project>""");
+        write(single.resolve("src/main/java/com/dummy/single/Single.java"), """
+                package com.dummy.single;
+                @lombok.Value public class Single {
+                    String name;
+                    public String upper() { return org.apache.commons.lang3.StringUtils.upperCase(name) + com.google.common.base.Strings.repeat("!", 1); }
+                }""");
+        migrate(parent, GradleDsl.KOTLIN);
+        migrate(single, GradleDsl.KOTLIN);
+        FileSystemUtils.deleteRecursively(child);
+        dump("single-module-kotlin");
+
+        String convention = read(single.resolve("build-logic/src/main/kotlin/single.single-conventions.gradle.kts"));
+        assertThat(convention).contains("apply(plugin = \"parent.bom-conventions\")",
+                "\"api\"(platform(libs.findLibrary(\"bom\").get()))", "named(\"parentLibs\")");
+        assertThat(read(single.resolve("build.gradle.kts")))
+                .contains("id(\"single.single-conventions\")", "api(libs.guava)")
+                .doesNotContain("parent.bom-conventions", "platform(", "parentLibs");
+        assertThat(read(single.resolve("build-logic/build.gradle.kts")))
+                .contains("implementation(libs.parent.bom.conventions.gradle.plugin)");
+        assertThat(read(single.resolve("gradle/libs.versions.toml"))).contains("guava = { module = \"com.google.guava:guava\" }");
+    }
+
+    @Test
+    void singleModuleChild_groovy() throws IOException {
+        Path single = tempDir.resolve("ws/single");
+        write(single.resolve("pom.xml"), """
+                <project><modelVersion>4.0.0</modelVersion>
+                  <parent><groupId>com.dummy.parent</groupId><artifactId>bom</artifactId><version>1.0.1-SNAPSHOT</version></parent>
+                  <groupId>com.dummy.single</groupId><artifactId>single</artifactId><version>1.0.0-SNAPSHOT</version>
+                  <dependencies><dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId></dependency></dependencies>
+                </project>""");
+        write(single.resolve("src/main/java/com/dummy/single/Single.java"), """
+                package com.dummy.single;
+                public class Single { String s = com.google.common.base.Strings.repeat("!", 1); }""");
+        migrate(parent, GradleDsl.GROOVY);
+        migrate(single, GradleDsl.GROOVY);
+        FileSystemUtils.deleteRecursively(child);
+        dump("single-module-groovy");
+
+        assertThat(read(single.resolve("build-logic/src/main/groovy/single.single-conventions.gradle")))
+                .contains("id 'parent.bom-conventions'", "api platform(libs.findLibrary('bom').get())");
+        assertThat(read(single.resolve("build.gradle"))).contains("id 'single.single-conventions'").doesNotContain("platform(");
+    }
 }
