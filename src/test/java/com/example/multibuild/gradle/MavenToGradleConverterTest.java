@@ -65,7 +65,8 @@ class MavenToGradleConverterTest {
                 .containsEntry("group", "com.example")
                 .containsEntry("version", "1.0.0-SNAPSHOT");
         assertThat(read(repo.resolve("build.gradle")))
-                .contains("id 'java-library'", "id 'maven-publish'", "mavenLocal()", "from components.java");
+                .contains("id 'java-library'", "id 'maven-publish'", "from components.java")
+                .doesNotContain("repositories");
         assertThat(read(repo.resolve(".gitignore")))
                 .contains(".gradle/", "build/", "!gradle/wrapper/gradle-wrapper.jar");
     }
@@ -79,7 +80,7 @@ class MavenToGradleConverterTest {
         assertThat(repo.resolve("module-core/pom.xml")).doesNotExist();
         assertThat(read(repo.resolve("settings.gradle")))
                 .contains("rootProject.name = 'multi-parent'", "include 'module-core'", "include 'module-service'");
-        assertThat(read(repo.resolve("build.gradle"))).contains("allprojects {").doesNotContain("plugins");
+        assertThat(read(repo.resolve("build.gradle"))).doesNotContain("plugins", "repositories");
         assertThat(read(repo.resolve("module-service/build.gradle")))
                 .contains("api 'com.example:lib-a:1.0.0-SNAPSHOT'");
     }
@@ -236,7 +237,8 @@ class MavenToGradleConverterTest {
                         "providedCompile 'jakarta.servlet:jakarta.servlet-api:6.0.0'",
                         "publishing.publications.maven.artifactId = 'rich-web'")
                 .doesNotContain("junit-bom");
-        assertThat(read(repo.resolve("build.gradle"))).contains("maven { url = uri('https://nexus.acme.com/maven') }");
+        // resolution repositories come from the environment: pom <repositories> are only reported
+        assertThat(read(repo.resolve("build.gradle"))).doesNotContain("nexus.acme.com/maven", "mavenCentral()");
         assertThat(GradleProperties.read(repo.resolve("gradle.properties")))
                 .containsEntry("group", "com.acme")
                 .containsEntry("version", "5.1.0-SNAPSHOT")
@@ -244,6 +246,7 @@ class MavenToGradleConverterTest {
 
         assertThat(conversion.warnings())
                 .anyMatch(w -> w.contains("exec-maven-plugin"))
+                .anyMatch(w -> w.contains("pom <repositories> not migrated") && w.contains("https://nexus.acme.com/maven"))
                 .anyMatch(w -> w.contains("system-scoped dependency com.sun:tools"))
                 .anyMatch(w -> w.contains("acmeReleasesUsername"));
         assertThat(conversion.droppedKeys()).containsExactly("com.sun:tools");

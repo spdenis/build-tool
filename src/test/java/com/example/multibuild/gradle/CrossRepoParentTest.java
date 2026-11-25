@@ -132,7 +132,8 @@ class CrossRepoParentTest {
                 .contains("id(\"module1.main1-conventions\")", "id(\"module1.lombok-conventions\")", "api(libs.guava)");
         assertThat(read(child.resolve("build-logic/build.gradle.kts")))
                 .contains("implementation(libs.parent.bom.conventions.gradle.plugin)");
-        assertThat(read(child.resolve("build-logic/settings.gradle.kts"))).contains("mavenLocal()");
+        assertThat(read(child.resolve("build-logic/settings.gradle.kts"))).doesNotContain("repositories");
+        assertThat(read(child.resolve("settings.gradle.kts"))).doesNotContain("repositories");
         // the parent version is one [versions] entry: bumping the parent also bumps its build-logic
         assertThat(read(child.resolve("gradle/libs.versions.toml"))).contains("bom = \"1.0.1-SNAPSHOT\"",
                 "bom = { module = \"com.dummy.parent:bom\", version.ref = \"bom\" }",

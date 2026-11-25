@@ -180,10 +180,11 @@ class BuildLogicLayoutTest {
         multiModuleRepo();
         migrate(GradleDsl.KOTLIN, "kotlin");
 
-        // settings: convention plugins from the included build-logic build, repositories in one place
+        // settings: convention plugins from the included build-logic build; no repositories (from the environment)
         assertThat(file("settings.gradle.kts")).contains(
-                "pluginManagement {", "includeBuild(\"build-logic\")", "dependencyResolutionManagement {",
-                "mavenCentral()", "rootProject.name = \"shop-parent\"", "include(\"core\")");
+                "pluginManagement {", "includeBuild(\"build-logic\")", "rootProject.name = \"shop-parent\"", "include(\"core\")")
+                .doesNotContain("repositories", "dependencyResolutionManagement");
+        assertThat(file("build-logic/settings.gradle.kts")).contains("versionCatalogs").doesNotContain("repositories");
 
         // rule 1: the parent's managed versions (and their properties) form the version catalog
         String toml = file("gradle/libs.versions.toml");
@@ -311,7 +312,6 @@ class BuildLogicLayoutTest {
     @Test
     void lombokWithoutVersion_getsTheConfiguredDefault_andConventionPrefixIsConfigurable() throws IOException {
         ReflectionTestUtils.setField(converter, "conventionPrefix", "corp");
-        ReflectionTestUtils.setField(converter, "pluginRepository", "https://artifactory.acme.com/gradle-plugins");
         write(repo.resolve("pom.xml"), """
                 <project><modelVersion>4.0.0</modelVersion>
                   <groupId>org.example</groupId><artifactId>tool</artifactId><version>2.0</version>
@@ -323,8 +323,6 @@ class BuildLogicLayoutTest {
 
         assertThat(file("build.gradle.kts")).contains("id(\"corp.java-conventions\")", "id(\"corp.lombok-conventions\")");
         assertThat(file("gradle/libs.versions.toml")).contains("lombok = { module = \"org.projectlombok:lombok\", version = \"1.18.48\" }");
-        assertThat(file("build-logic/settings.gradle.kts")).contains(
-                "maven { url = uri(\"https://artifactory.acme.com/gradle-plugins\") }").doesNotContain("gradlePluginPortal()");
     }
 
     // Third-party and core quality/packaging plugins in one module (built with a real Gradle via the dump).

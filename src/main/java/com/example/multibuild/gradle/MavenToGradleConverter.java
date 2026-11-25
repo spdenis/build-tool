@@ -152,19 +152,12 @@ public class MavenToGradleConverter {
     @org.springframework.beans.factory.annotation.Value("${migrate.gradle.lombok.scope:used}")
     private String lombokScope = "used";
 
-    // Repository build-logic resolves Gradle plugins from (e.g. an Artifactory remote of the Gradle plugin
-    // portal); blank = gradlePluginPortal() + mavenCentral().
-    @org.springframework.beans.factory.annotation.Value("${migrate.gradle.plugin.repository:}")
-    private String pluginRepository = "";
-
-    record Options(boolean conventions, String prefix, String lombokVersion, String pluginRepository,
-                   boolean lombokEverywhere) {}
+    record Options(boolean conventions, String prefix, String lombokVersion, boolean lombokEverywhere) {}
 
     private Options options() {
         boolean conventions = !"root-script".equalsIgnoreCase(layout == null ? "" : layout.trim());
         return new Options(conventions, conventionPrefix == null ? "" : conventionPrefix.trim(),
                 lombokVersion == null || lombokVersion.isBlank() ? "1.18.48" : lombokVersion.trim(),
-                pluginRepository == null ? "" : pluginRepository.trim(),
                 "all".equalsIgnoreCase(lombokScope == null ? "" : lombokScope.trim()));
     }
 
@@ -414,6 +407,10 @@ public class MavenToGradleConverter {
             else warnings.add("pom.xml: no version — set 'version' in gradle.properties");
 
             reportUnconverted();
+            if (!pomRepositoryUrls().isEmpty()) {
+                warnings.add("pom <repositories> not migrated (the build declares no repositories; they come from the "
+                        + "environment — init script / settings plugin): " + String.join(", ", pomRepositoryUrls()));
+            }
 
             Map<Path, String> writes = new LinkedHashMap<>();
             boolean single = root.kind() != Kind.AGGREGATOR;
@@ -887,24 +884,13 @@ public class MavenToGradleConverter {
             s.open("pluginManagement");
             s.line("// convention plugins of this build: build-logic/src/main/" + (kts ? "kotlin" : "groovy"));
             s.line(kts ? "includeBuild(\"build-logic\")" : "includeBuild 'build-logic'");
-            if (!appliedImports.isEmpty() || !opts.pluginRepository().isBlank()) {
-                // where the dependencies of build-logic (Gradle plugins, parent repos' conventions) resolve from
-                s.open("repositories");
-                if (!appliedImports.isEmpty()) s.line("mavenLocal()");
-                if (opts.pluginRepository().isBlank()) s.line("gradlePluginPortal()");
-                else s.line("maven { url = uri(" + str(opts.pluginRepository()) + ") }");
-                if (!appliedImports.isEmpty()) {
-                    for (String url : pomRepositoryUrls()) s.line("maven { url = uri(" + str(url) + ") }");
-                }
-                s.close();
-            }
             s.close();
-            s.blank();
-            s.open("dependencyResolutionManagement");
-            repositories(s);
+            // no repositories: they come from the environment (init script / settings plugin of the estate)
             List<ParentBuildLogic.Imported> catalogs = appliedImports.values().stream()
                     .filter(i -> i.catalogCoordinates() != null).toList();
             if (!catalogs.isEmpty()) {
+                s.blank();
+                s.open("dependencyResolutionManagement");
                 s.line("// the version catalog of the parent repo, published with its build-logic: versions of the third-party");
                 s.line("// libraries (gradle/libs.versions.toml declares them without one); bumped with the parent version");
                 s.open("versionCatalogs");
@@ -915,8 +901,8 @@ public class MavenToGradleConverter {
                     s.close();
                 }
                 s.close();
+                s.close();
             }
-            s.close();
             s.blank();
             s.line("rootProject.name = " + str(root.artifactId()));
             if (!modules.isEmpty()) s.blank();
@@ -937,31 +923,7 @@ public class MavenToGradleConverter {
             Script s = new Script();
             s.line("// " + HEADER);
             s.blank();
-            if (!opts.pluginRepository().isBlank()) {
-                s.open("pluginManagement");
-                s.open("repositories");
-                s.line("maven { url = uri(" + str(opts.pluginRepository()) + ") }");
-                s.close();
-                s.close();
-                s.blank();
-            }
             s.open("dependencyResolutionManagement");
-            s.open("repositories");
-            if (!appliedImports.isEmpty()) {
-                // the build-logic of the parent repos: mavenLocal() after a local build of the parent repo,
-                // otherwise the repositories its modules are published to
-                s.line("mavenLocal()");
-            }
-            if (opts.pluginRepository().isBlank()) {
-                s.line("gradlePluginPortal()");
-                s.line("mavenCentral()");
-            } else {
-                s.line("maven { url = uri(" + str(opts.pluginRepository()) + ") }");
-            }
-            if (!appliedImports.isEmpty()) {
-                for (String url : pomRepositoryUrls()) s.line("maven { url = uri(" + str(url) + ") }");
-            }
-            s.close();
             s.line("// the main build's catalog, so plugin versions are kept in one place");
             s.open("versionCatalogs");
             s.open(kts ? "create(\"libs\")" : "libs");
@@ -1707,12 +1669,10 @@ public class MavenToGradleConverter {
         String rootScript(List<Pom> modules) {
             Script s = new Script();
             s.line("// " + HEADER);
-            s.blank();
-            s.open("allprojects");
-            repositories(s);
-            s.close();
+            boolean first = true;
             for (Shared shared : sharing) {
-                s.blank();
+                if (!first) s.blank();
+                first = false;
                 sharedBlock(s, shared, modules);
             }
             return s.toString();
@@ -1889,21 +1849,6 @@ public class MavenToGradleConverter {
             s.close();
         }
 
-        void repositories(Script s) {
-            s.open("repositories");
-            s.line("mavenLocal()");
-            s.line("mavenCentral()");
-            Set<String> urls = new LinkedHashSet<>();
-            for (Pom p : poms) {
-                for (Repository r : p.model.getRepositories()) {
-                    String url = r.getUrl() == null ? null : r.getUrl().replaceAll("/+$", "");
-                    if (url != null && !CENTRAL_URLS.contains(url)) urls.add(url);
-                }
-            }
-            for (String url : urls) s.line("maven { url = uri(" + str(url) + ") }");
-            s.close();
-        }
-
         // ── module script ────────────────────────────────────────────────────
 
         String moduleScript(Pom pom, boolean single) {
@@ -1974,11 +1919,6 @@ public class MavenToGradleConverter {
                 s.open("javaPlatform");
                 s.line("allowDependencies()");
                 s.close();
-            }
-
-            if (single && !opts.conventions()) {
-                s.blank();
-                repositories(s);
             }
 
             dependenciesBlock(s, deps, constraints);
