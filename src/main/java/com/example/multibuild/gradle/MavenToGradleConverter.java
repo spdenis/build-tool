@@ -112,12 +112,15 @@ public class MavenToGradleConverter {
     //   internalKeys:  groupId:artifactId of every pom in the repo (modules, aggregators, parents)
     //   droppedKeys:   external dependencies intentionally not carried over (reported in warnings)
     //   substitutions: external keys replaced by an equivalent (e.g. spring-boot-starter-parent → spring-boot-dependencies)
+    //   inheritedKeys: external dependencies the conventions of a parent repo provide (e.g. Lombok through the
+    //                  parent's lombok convention): they are not in this repo's build files
     public record Conversion(Path repoRoot, GradleDsl dsl, Map<Path, String> writes, List<Path> deletes,
                              List<String> warnings, Set<String> internalKeys, Set<String> droppedKeys,
-                             Map<String, String> substitutions, List<ParentBuildLogic.Imported> imports) {
+                             Map<String, String> substitutions, List<ParentBuildLogic.Imported> imports,
+                             Set<String> inheritedKeys) {
         // Same conversion that leaves the Maven build in place (migrate.keep.maven=true).
         public Conversion keepingMaven() {
-            return new Conversion(repoRoot, dsl, writes, List.of(), warnings, internalKeys, droppedKeys, substitutions, imports);
+            return new Conversion(repoRoot, dsl, writes, List.of(), warnings, internalKeys, droppedKeys, substitutions, imports, inheritedKeys);
         }
     }
 
@@ -352,6 +355,7 @@ public class MavenToGradleConverter {
         final List<Pom> poms = new ArrayList<>();
         final List<String> warnings = new ArrayList<>();
         final Set<String> droppedKeys = new LinkedHashSet<>();
+        final Set<String> inheritedKeys = new LinkedHashSet<>();
         final Map<String, String> substitutions = new LinkedHashMap<>();
         final Map<String, String> gradleProps = new LinkedHashMap<>();
         Map<String, Pom> internalByKey = new LinkedHashMap<>();
@@ -441,7 +445,7 @@ public class MavenToGradleConverter {
             for (Pom p : poms) internalKeys.add(p.key());
             if (parentLogic != null) parentLogic.warnings.stream().distinct().forEach(warnings::add);
             return new Conversion(repoRoot, dsl, writes, deletes, List.copyOf(warnings),
-                    internalKeys, droppedKeys, substitutions, List.copyOf(appliedImports.values()));
+                    internalKeys, droppedKeys, substitutions, List.copyOf(appliedImports.values()), Set.copyOf(inheritedKeys));
         }
 
         // ── build-logic layout ───────────────────────────────────────────────
@@ -492,6 +496,7 @@ public class MavenToGradleConverter {
             if (baseUsed) scripts.put(conventionFile(baseId()), baseConvention(built));
             if (lombokApplied) scripts.put(conventionFile(lombokId()), lombokConvention(built));
             features.forEach((id, script) -> scripts.put(conventionFile(id), script));
+            wrappers.forEach((id, imported) -> scripts.put(conventionFile(id), wrapperConvention(imported)));
             for (String id : List.of(baseId(), publishingId(), lombokId())) {
                 if (scripts.containsKey(conventionFile(id)) && appliedImports.values().stream().anyMatch(i -> i.pluginIds().contains(id))) {
                     warnings.add("convention plugin " + id + " is also published by " + appliedImports.values().stream()
@@ -574,7 +579,9 @@ public class MavenToGradleConverter {
             if (opts.lombokEverywhere() || !usesLombok(pom)) return false;
             if (sharedFor(pom).stream().anyMatch(lombokShared::contains)) return false;
             ParentBuildLogic.Imported imp = sharedFor(pom).isEmpty() ? importedFor(pom) : null;
-            return imp == null || !imp.appliesLombok();
+            if (imp == null || !imp.appliesLombok()) return true;
+            inheritedKeys.add(LOMBOK);                 // the parent repo's convention applies it
+            return false;
         }
 
         String uniqueId(String name) {
@@ -627,6 +634,7 @@ public class MavenToGradleConverter {
             ParentBuildLogic.Imported imp = importedFor(pom);
             if (imp != null && imp.lombokId() != null) {
                 applyImport(pom, imp);
+                inheritedKeys.add(LOMBOK);             // in the parent repo's build-logic
                 return imp.lombokId();
             }
             lombokApplied = true;
@@ -661,6 +669,29 @@ public class MavenToGradleConverter {
                 warnings.add("convention " + imp.pluginId() + " looks up version '" + v + "': copied from the catalog of "
                         + imp.repo().getFileName() + " to " + VersionCatalog.FILE + " — keep both in sync");
             }
+        }
+
+        // Local convention of this build-logic applying a parent repo's plugin, by that plugin's id.
+        final Map<String, String> wrappers = new LinkedHashMap<>();       // local id → imported id
+
+        // The plugin a module script applies: a parent repo's plugin only through a convention of this
+        // build-logic, since the projects only see the plugins the included build-logic defines (the parent's
+        // jar is a dependency of build-logic: its plugins are found from build-logic's own conventions).
+        String local(String id) {
+            if (!isImportedPlugin(id)) return id;
+            for (Map.Entry<String, String> e : wrappers.entrySet()) if (e.getValue().equals(id)) return e.getKey();
+            String local = uniqueId(id.replace('.', '-'));
+            wrappers.put(local, id);
+            return local;
+        }
+
+        String wrapperConvention(String imported) {
+            Script s = new Script();
+            ParentBuildLogic.Imported imp = appliedImports.values().stream()
+                    .filter(i -> i.pluginIds().contains(imported)).findFirst().orElseThrow();
+            conventionHeader(s, "The convention " + imported + " of " + imp.repo().getFileName()
+                    + " (a parent repo: its build-logic is a dependency of this build-logic)", List.of(imported), false);
+            return s.toString();
         }
 
         boolean isImportedPlugin(String id) {
@@ -1898,11 +1929,11 @@ public class MavenToGradleConverter {
                 s.open("plugins");
                 if (kind == Kind.PLATFORM) {
                     s.line(plugin("java-platform"));
-                    s.line(plugin(publishingOf(pom)));
+                    s.line(plugin(local(publishingOf(pom))));
                 } else {
-                    s.line(plugin(single ? (singleConvention != null ? singleConvention : baseOf(pom)) : conventionOf(pom)));
+                    s.line(plugin(local(single ? (singleConvention != null ? singleConvention : baseOf(pom)) : conventionOf(pom))));
                     if (kind == Kind.WAR) s.line(plugin("war"));
-                    if (appliesLombok(pom)) s.line(plugin(lombokOf(pom)));
+                    if (appliesLombok(pom)) s.line(plugin(local(lombokOf(pom))));
                     for (String id : ownPlugins.corePlugins) s.line(plugin(id));
                     for (String id : ownPlugins.thirdParty.keySet()) s.line(plugin(featureConvention(id)));
                 }

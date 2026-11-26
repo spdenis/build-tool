@@ -206,7 +206,7 @@ class CrossRepoParentTest {
         // the root repo gets the publication of its build-logic and catalog, without losing the hand edits
         BuildLogicExport.Result export = BuildLogicExport.export(parent, java.util.Map.of("com.dummy.parent:bom", "parent.java-conventions"));
         converter.apply(new MavenToGradleConverter.Conversion(parent, GradleDsl.KOTLIN, export.writes(), List.of(), List.of(),
-                java.util.Set.of(), java.util.Set.of(), java.util.Map.of(), List.of()));
+                java.util.Set.of(), java.util.Set.of(), java.util.Map.of(), List.of(), java.util.Set.of()));
         assertThat(export.warnings()).isEmpty();
         assertThat(read(parent.resolve("build-logic/build.gradle.kts"))).contains("`maven-publish`", "`version-catalog`",
                 "import java.util.Properties", "artifactId = \"parent-catalog\"", "from(components[\"versionCatalog\"])",
@@ -234,7 +234,7 @@ class CrossRepoParentTest {
 
         BuildLogicExport.Result export = BuildLogicExport.export(parent, java.util.Map.of("com.dummy.parent:bom", "parent.java-conventions"));
         converter.apply(new MavenToGradleConverter.Conversion(parent, GradleDsl.GROOVY, export.writes(), List.of(), List.of(),
-                java.util.Set.of(), java.util.Set.of(), java.util.Map.of(), List.of()));
+                java.util.Set.of(), java.util.Set.of(), java.util.Map.of(), List.of(), java.util.Set.of()));
         assertThat(read(parent.resolve("build-logic/build.gradle"))).contains("id 'maven-publish'", "id 'version-catalog'",
                 "catalog(MavenPublication) {", "artifactId = 'parent-catalog'", "from components.versionCatalog");
         assertThat(read(parent.resolve("build.gradle"))).contains("gradle.includedBuild('build-logic')");
@@ -408,5 +408,46 @@ class CrossRepoParentTest {
         assertThat(conversions.get()).isEqualTo(1 + chain);
         assertThat(c.writes().get(ws.resolve("app/build-logic/src/main/kotlin/app.app-conventions.gradle.kts")))
                 .contains("apply(plugin = \"chain.p0-conventions\")");
+    }
+
+    // The parent repo has a Lombok convention: a child module declaring Lombok applies it, so Lombok is in the
+    // parent's build-logic, not in this repo — the migration must not report it missing.
+    @Test
+    void lombokFromTheParentReposConvention_isNotReportedMissing() throws IOException {
+        write(parent.resolve("pom.xml"), read(parent.resolve("pom.xml")).replace("<module>bom</module>",
+                "<module>bom</module><module>util</module>"));
+        write(parent.resolve("util/pom.xml"), """
+                <project><modelVersion>4.0.0</modelVersion>
+                  <parent><groupId>com.dummy.parent</groupId><artifactId>parent</artifactId><version>1.0.1-SNAPSHOT</version></parent>
+                  <artifactId>util</artifactId>
+                  <dependencies>
+                    <dependency><groupId>org.projectlombok</groupId><artifactId>lombok</artifactId><version>1.18.46</version><scope>provided</scope></dependency>
+                  </dependencies>
+                </project>""");
+        migrate(parent, GradleDsl.KOTLIN);
+        assertThat(parent.resolve("build-logic/src/main/kotlin/parent.lombok-conventions.gradle.kts")).exists();
+
+        migrate(child, GradleDsl.KOTLIN);      // verifies: no "dependency missing in Gradle build: org.projectlombok:lombok"
+        dump("lombok-from-parent");
+        // a module script only sees the plugins build-logic defines: a local convention applies the parent's
+        assertThat(read(child.resolve("artifact1/build.gradle.kts")))
+                .contains("id(\"module1.parent-lombok-conventions\")").doesNotContain("id(\"parent.lombok-conventions\")");
+        assertThat(read(child.resolve("build-logic/src/main/kotlin/module1.parent-lombok-conventions.gradle.kts")))
+                .contains("apply(plugin = \"parent.lombok-conventions\")");
+    }
+
+    // The parent pom itself depends on Lombok: the parent's convention applies it for every child.
+    @Test
+    void lombokAppliedByTheParentsConvention_isNotReportedMissing() throws IOException {
+        write(parent.resolve("bom/pom.xml"), read(parent.resolve("bom/pom.xml")).replace("</dependencyManagement>", """
+                </dependencyManagement>
+                  <dependencies>
+                    <dependency><groupId>org.projectlombok</groupId><artifactId>lombok</artifactId><scope>provided</scope></dependency>
+                  </dependencies>"""));
+        migrate(parent, GradleDsl.KOTLIN);     // verifies: bom's Lombok is in its (published) convention
+        assertThat(read(parent.resolve("build-logic/src/main/kotlin/parent.bom-conventions.gradle.kts")))
+                .contains("parent.lombok-conventions");
+        migrate(child, GradleDsl.KOTLIN);
+        dump("lombok-parent-applies");
     }
 }

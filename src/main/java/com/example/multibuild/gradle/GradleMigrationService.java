@@ -419,8 +419,12 @@ public class GradleMigrationService {
 
         Set<String> internal = new HashSet<>(conversion.internalKeys());
         Set<String> gradleDeps = externalDependencyKeys(gradle.getModules(), List.of(), internal);
+        // a parent pom's dependencies are in its convention, which its children (maybe in other repos) apply
+        if (gradle.getRepoRoot() != null) gradleDeps.addAll(GradleParser.conventionDependencyKeys(gradle.getRepoRoot()));
         for (String key : externalDependencyKeys(maven.getModules(), maven.getAggregatorParents(), internal)) {
             if (conversion.droppedKeys().contains(key)) continue;
+            // provided by a parent repo's convention plugin (its build-logic is a dependency of this build-logic)
+            if (conversion.inheritedKeys().contains(key)) continue;
             // The Maven parser keeps placeholders such as ${project.groupId} unresolved; such keys never
             // match an artifact of another repo, so they cannot affect the graph.
             if (key.contains("${")) continue;

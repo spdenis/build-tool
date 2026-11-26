@@ -131,6 +131,17 @@ public class GradleParser implements ProjectParser {
     }
 
     // String coordinates plus version catalog references.
+    // groupId:artifactId of the dependencies declared by any convention plugin of the build, also those no
+    // project of it applies (e.g. the convention of a parent pom, published for the repos inheriting it).
+    static Set<String> conventionDependencyKeys(Path repoDir) {
+        VersionCatalog catalog = VersionCatalog.read(repoDir);
+        Set<String> keys = new LinkedHashSet<>();
+        for (GradleScript convention : ConventionPlugins.load(repoDir).byId.values()) {
+            for (DependencyRef ref : dependencies(convention, null, catalog)) keys.add(ref.group() + ":" + ref.artifact());
+        }
+        return keys;
+    }
+
     private static List<DependencyRef> dependencies(GradleScript script, List<int[]> include, VersionCatalog catalog) {
         List<DependencyRef> result = new ArrayList<>(GradleDeclarations.dependencies(script, include));
         result.addAll(GradleDeclarations.catalogDependencies(script, include, catalog));
